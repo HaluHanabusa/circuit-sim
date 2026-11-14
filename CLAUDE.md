@@ -19,6 +19,7 @@
 | verifier | 独立検証（実装者と別に受け入れ基準を確かめる） | `tests/acceptance/` `docs/verification/` |
 | code-reviewer | 差分のレビュー（読み取り専用） | なし |
 | release-manager | 配布、利用者向け文書、ライセンス確認 | `README.md` `CHANGELOG.md` `docs/user/` |
+| tooling-engineer | 開発の道具（確認スクリプト、ハーネス、自動テスト、OSの違いへの対応） | `scripts/` `.github/` |
 
 ## 進め方
 

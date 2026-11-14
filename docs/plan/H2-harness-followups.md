@@ -1,12 +1,12 @@
 ---
 id: H2
-owner: solver-engineer
+owner: tooling-engineer
 needs_ux: false
 ---
 
 # H2: 開発ハーネスの残課題
 
-依存: H1（完了） ／ 並行する作業単位が増える前に行う。担当は見出しの都合で solver-engineer と書いているが、実際は「ハーネスの修正担当」として起動する。
+依存: H1（完了） ／ 並行する作業単位が増える前に行う。担当は tooling-engineer。
 
 ## 範囲
 
