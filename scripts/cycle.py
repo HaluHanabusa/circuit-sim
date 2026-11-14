@@ -155,10 +155,8 @@ STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGBREAK")
 # 自動確認のスクリプト。作業ツリーの直下から見た場所（git の中の名前と同じく、区切りは /）
 CHECK_SCRIPT = "scripts/check.py"
 
-# Windows で起動できるファイルの拡張子。このうち起動用のファイル（claude.cmd など）は cmd.exe を通る。
-# そこで別の意味になる文字は渡せない。
+# Windows の起動用のファイル（claude.cmd など）は cmd.exe を通る。そこで別の意味になる文字は渡せない。
 BATCH_SUFFIXES = (".cmd", ".bat")
-LAUNCH_SUFFIXES = (".exe", ".com", *BATCH_SUFFIXES)
 BATCH_UNSAFE = "%^&|<>\r\n"
 
 # Windows では、他のプロセスが開いているファイルの置き換えと、置き換えの最中のファイルの読み取りが、
@@ -197,14 +195,11 @@ def stop_signals() -> list[signal.Signals]:
 def find_command(name: str) -> str | None:
     """コマンドの実体の場所。見つからなければ None。端末でその名前を打ったときと同じ順（PATH の順）で探す。
 
-    Windows では claude.exe や claude.cmd のように拡張子が付く。拡張子の無い同名のファイル
-    （npm が一緒に置く、シェル用の起動スクリプト）は起動できないので、拡張子を付けて探し直す。
+    Windows では claude.exe や claude.cmd のように拡張子が付くので、名前だけでは起動できない。
+    shutil.which が、PATHEXT の拡張子を付けて探す。npm が一緒に置く、拡張子の無いシェル用のファイルを
+    拾わないことは、試験で確かめている（拾った場合は、起動できないというエラーになる）。
     """
-    found = shutil.which(name)
-    if WINDOWS and found and not found.lower().endswith(LAUNCH_SUFFIXES):
-        candidates = (shutil.which(name + suffix) for suffix in LAUNCH_SUFFIXES)
-        found = next((path for path in candidates if path), None)
-    return found
+    return shutil.which(name)
 
 
 def launchable(cmd: list[str]) -> list[str]:
