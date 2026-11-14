@@ -119,17 +119,30 @@ def test_ccm_inductor_ripple(ccm):
     assert i.mean() == pytest.approx(last_periods(ccm, "v(out)").mean() / R_CCM, rel=1e-3)
 
 
-def test_duty_is_rounded_to_grid():
-    """デューティは 1 / 分割数 の単位に丸められる。期待値は丸めた後の値で合う。"""
+def test_duty_is_rounded_to_grid_without_carry():
+    """余りを持ち越さない設定では、デューティは 1 / 分割数 の単位に丸められる。期待値は丸めた後の値で合う。"""
     duty = 0.333                                  # 200分割では 66.6 → 67 ステップ
     assert rounded_duty(duty) == pytest.approx(0.335)
-    res = simulate(buck(R_CCM), T_CCM, gates=pwm(duty))
+    res = simulate(buck(R_CCM), T_CCM, gates=pwm(duty, carry_remainder=False))
     assert last_intervals(res, "gate(q1)", 1).sum() == 67
     measured = last_periods(res, "v(out)").mean()
     # オン抵抗による降下は 0.02% 程度。丸める前（7.992 V）と後（8.04 V）の差 0.6% を
     # 見分けるために、入力電圧の 0.1% で比べる
     assert abs(measured - 0.335 * VIN) < 1e-3 * VIN
     assert abs(measured - 0.333 * VIN) > 1e-3 * VIN
+
+
+def test_duty_remainder_is_carried_to_next_period():
+    """既定では丸めの余りを次の周期に持ち越す。数周期の平均は、丸める前のデューティになる。"""
+    duty = 0.333                                  # 200分割では 66.6 ステップ: 67 と 66 が 3 対 2 で並ぶ
+    res = simulate(buck(R_CCM), T_CCM, gates=pwm(duty))
+    on_steps = last_intervals(res, "gate(q1)", 100).reshape(100, N).sum(axis=1)
+    assert set(on_steps.tolist()) == {66.0, 67.0}
+    assert on_steps.sum() == pytest.approx(66.6 * 100, abs=0.5)       # 100周期の合計のずれは半ステップ以内
+    measured = last_periods(res, "v(out)", 100).mean()
+    # 上と同じ理由で入力電圧の 0.1%。丸めた後のデューティ（0.335）とは合わない
+    assert abs(measured - 0.333 * VIN) < 1e-3 * VIN
+    assert abs(measured - 0.335 * VIN) > 1e-3 * VIN
 
 
 # ---------------------------------------------------------- 基準3〜4: 不連続導通
@@ -162,7 +175,7 @@ def off_interval_residual(res, periods: int) -> tuple[float, float]:
     """スイッチもダイオードもオフの区間に残る振れ: |v(sw) - v(out)| と |i(L1)| の最大値。
 
     区間は理論から決める（エンジンの記録を使わない）: オフになるのは周期の頭から
-    (D + D2) 周期が経った後。そこから2点（後退オイラーで減衰させる2ステップぶん）を除く。
+    (D + D2) 周期が経った後。そこから2点（切り替え直後に減衰させるステップぶん）を除く。
     この区間ではインダクタに電圧がかからないので、v(sw) = v(out)、電流はほぼ0のはず。
     """
     _, _, d2 = dcm_theory()
@@ -180,8 +193,8 @@ def test_dcm_no_ringing_while_switch_and_diode_are_off(dcm):
     """基準4（後半）: スイッチもダイオードもオフの区間で振動が残らない。
 
     許容差: v(sw) - v(out) は入力電圧の 1%（0.24 V）以内、電流はピークの 0.1% 以内。
-    根拠: 後退オイラー1ステップで硬い成分は 1 / (1 + h·r_off / (2L)) = 1/533 になる。
-    2ステップ後の残りは最大でも Vout / 533 = 35 mV で、1% は十分に緩い。
+    根拠: ダイオードが切れるステップの後退オイラーで硬い成分は 1 / (1 + h·r_off / (2L)) = 1/533 に
+    なり、続く減衰ステップで消える。残るとしても Vout / 533 = 35 mV より小さく、1% は十分に緩い。
     """
     _, i_peak, _ = dcm_theory()
     dv, di = off_interval_residual(dcm, WINDOW)
@@ -190,11 +203,101 @@ def test_dcm_no_ringing_while_switch_and_diode_are_off(dcm):
 
 
 def test_ringing_check_detects_insufficient_damping():
-    """後退オイラーが1ステップだけだと振動が残り、上の基準で落ちる（試験の実効性の確認）。"""
+    """減衰ステップを入れない（後退オイラー1ステップだけ）と振動が残り、上の基準で落ちる（試験の実効性の確認）。"""
     v_out, _, _ = dcm_theory()
-    res = simulate(buck(R_DCM, ic_c=v_out), 200 * TS, gates=pwm(), damping_steps=1)
+    res = simulate(buck(R_DCM, ic_c=v_out), 200 * TS, gates=pwm(), damping_steps=0)
     dv, _ = off_interval_residual(res, 100)
     assert dv > 0.01 * VIN
+
+
+@pytest.mark.parametrize("inductance", [47e-6, 470e-6, 2.5e-3, 10e-3])
+def test_no_ringing_for_larger_inductance(inductance):
+    """基準15: L を 47 µH 〜 10 mH に変えても、両方オフの区間の |v(sw) - v(out)| が Vin の 0.5% 以内。
+
+    L が大きいと硬さ h·r_off / (2L) が 532 → 2.5 と小さくなり、後退オイラーだけでは減衰が足りない。
+    不連続導通を保つために、負荷を L に比例させる（K = 2L / (R·Ts) を基準回路と同じにする）。
+    出力は理論値から始め、400周期のうち最後の300周期を見る。区間の決め方は基準4と同じ
+    （理論でダイオードが切れる時刻から2点を除く）。L = 10 mH では r_off と L の時定数（20 ns）が
+    刻み（50 ns）に近く、切れた直後の数点は回路そのものの応答が残る。
+    """
+    load = R_DCM * inductance / L
+    d = rounded_duty(DUTY)
+    k_dcm = 2.0 * inductance / (load * TS)
+    v_out = VIN * 2.0 / (1.0 + math.sqrt(1.0 + 4.0 * k_dcm / d**2))
+    d2 = d * (VIN - v_out) / v_out
+    net = Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=DC(value=VIN)),
+        Component(id="S1", type="S", nodes=("in", "sw"), gate="q1"),
+        Component(id="D1", type="D", nodes=("0", "sw")),
+        Component(id="L1", type="L", nodes=("sw", "out"), value=inductance),
+        Component(id="C1", type="C", nodes=("out", "0"), value=C, ic=v_out),
+        Component(id="R1", type="R", nodes=("out", "0"), value=load),
+    ])
+
+    def residual(res) -> float:
+        n = len(res.t) - 1
+        k = np.arange(n - 300 * N + 1, n + 1)
+        phase = k % N
+        inside = (phase >= round(d * N) + math.ceil(d2 * N) + 2) | (phase == 0)
+        return float(np.abs(res["v(sw)"][k] - res["v(out)"][k])[inside].max())
+
+    res = simulate(net, 400 * TS, gates=pwm())
+    assert last_periods(res, "v(out)").mean() == pytest.approx(v_out, rel=0.02)     # 不連続導通のまま
+    assert residual(res) < 0.005 * VIN
+    if inductance <= 2.5e-3:
+        # 減衰ステップを入れないと、この基準で落ちる（L = 10 mH は台形則だけでも減衰が速い）
+        assert residual(simulate(net, 400 * TS, gates=pwm(), damping_steps=0)) > 0.005 * VIN
+
+
+class IntegralVoltageControl:
+    """積分主体の電圧制御（基準16用）。積分器はデューティの見込み値（目標 / Vin）から始める。
+
+    ゲイン: 積分 26 [1/(V·s)] で開ループの交差は約 100 Hz（LC の共振 2.3 kHz より十分低い）、
+    比例 0.005 [1/V]。
+    """
+
+    period = TS
+    inputs = ("v(out)",)
+    outputs = ("duty",)
+
+    def __init__(self, target: float):
+        self.target = target
+
+    def reset(self):
+        self.integral = self.target / VIN
+        return [self.integral]
+
+    def step(self, t, measured):
+        error = self.target - measured[0]
+        self.integral = min(max(self.integral + 26.0 * TS * error, 0.0), 1.0)
+        return [min(max(self.integral + 0.005 * error, 0.0), 1.0)]
+
+
+def period_average_swing(res, window: float) -> float:
+    """最後の window 秒の、出力電圧の周期平均の振れ幅（最大 − 最小）。"""
+    averages = res["v(out)"][1:].reshape(-1, N).mean(axis=1)
+    return float(np.ptp(averages[-round(window / TS):]))
+
+
+@pytest.mark.parametrize("target", [12.03, 12.06])
+def test_closed_loop_is_not_disturbed_by_duty_resolution(target):
+    """基準16: 積分主体の電圧制御で、最後の 15 ms の出力の周期平均の振れ幅が目標の 0.5% 以内。
+
+    1周期200分割ではデューティの刻みが 0.5%（出力で 0.12 V）。目標 12.03 V と 12.06 V はその間にある。
+    丸めの余りを次の周期に持ち越すので、積分器が隣り合う2つの値を行き来しない。
+    """
+    res = simulate(buck(R_CCM), 40e-3, gates=pwm("duty"), controllers=[IntegralVoltageControl(target)])
+    assert period_average_swing(res, 15e-3) < 0.005 * target
+    averages = res["v(out)"][1:].reshape(-1, N).mean(axis=1)
+    assert averages[-1500:].mean() == pytest.approx(target, rel=1e-3)        # 目標に合っている
+
+
+def test_duty_resolution_check_detects_plain_rounding():
+    """余りを持ち越さないと、同じ制御で出力が目標の 4% 以上振れ、上の基準で落ちる（試験の実効性の確認）。"""
+    target = 12.03
+    gates = pwm("duty", carry_remainder=False)
+    res = simulate(buck(R_CCM), 25e-3, gates=gates, controllers=[IntegralVoltageControl(target)])
+    assert period_average_swing(res, 15e-3) > 0.005 * target
 
 
 # ------------------------------------------------------------- 基準5: 半波整流
@@ -311,7 +414,7 @@ def test_power_balance_ccm(ccm):
 def test_second_order_convergence_with_switching():
     """収束次数: 刻みを半分にすると誤差が約 1/4 になる（切り替えが格子点に乗る連続導通の場合）。
 
-    切り替え直後の後退オイラーは1次精度だが、1周期に入る回数が刻みによらず一定なので、
+    状態が変わるステップの後退オイラーは1次精度だが、1周期に入る回数が刻みによらず一定なので、
     全体では2次のまま。起動からの40周期を、1周期1600分割の結果と、周期の頭と中央の点で比べる。
     """
     periods = 40
@@ -401,6 +504,23 @@ def test_command_takes_effect_at_next_control_period():
     i = res["i(L1)"]
     assert np.argmax(i[5 * N: 6 * N + 1]) == 100
     assert np.argmax(i[6 * N: 7 * N + 1]) == 50
+
+
+def test_duty_is_latched_at_the_start_of_each_carrier_period():
+    """デューティは搬送波の周期の頭で取り込む。周期の途中で指令が変わっても、その周期は変えない。
+
+    制御周期を搬送波の半分にして、周期の中央で指令を 0.8 → 0.2 に変える。
+    """
+    class HalfPeriod(FixedDuty):
+        def step(self, t, measured):
+            return [0.2 if t >= 2 * TS - 0.5 * H else 0.8]     # t = 2 Ts の測定から 0.2。反映は 2.5 Ts
+
+    ctrl = HalfPeriod(0.8, period=TS / 2)
+    res = simulate(buck(R_CCM), 6 * TS, gates=pwm("duty"), controllers=[ctrl])
+    cmd = res["cmd(duty)"]
+    assert cmd[2 * N + N // 2 - 1] == 0.8 and cmd[2 * N + N // 2] == 0.2        # 指令は周期2の中央で変わる
+    on_steps = [int(res["gate(q1)"][p * N: (p + 1) * N].sum()) for p in range(6)]
+    assert on_steps == [160, 160, 160, 40, 40, 40]                              # ゲートは周期3の頭から
 
 
 def test_initial_command_and_slow_control_period():
@@ -535,8 +655,8 @@ def test_input_errors_are_explained():
         simulate(net, 1e-4, 3e-8, gates=pwm())                 # 10 µs / 30 ns は整数でない
     with pytest.raises(ValueError, match="どちらか一方"):
         simulate(net, 1e-4, 5e-8, gates=pwm(), steps_per_period=200)
-    with pytest.raises(ValueError, match="1 以上"):
-        simulate(net, 1e-4, gates=pwm(), damping_steps=0)
+    with pytest.raises(ValueError, match="0 以上"):
+        simulate(net, 1e-4, gates=pwm(), damping_steps=-1)
     with pytest.raises(ValueError, match="デューティ指令 'duty' を出す制御器が無い"):
         simulate(net, 1e-4, gates=pwm("duty"))
     with pytest.raises(ValueError, match="制御周期"):

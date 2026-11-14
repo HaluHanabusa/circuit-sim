@@ -1,8 +1,9 @@
 """ネットリストを時間応答に変換する入口。
 
-スイッチの無い回路は台形則だけで進める（E0 と同じ計算）。
+基本は台形則。計算の先頭と不連続点の直後だけ、刻みより速い成分を消す減衰ステップで進める。
 スイッチ（S）やダイオード（D）を含む回路は、回路状態ごとの行列を使い回しながら進め、
 制御周期ごとに核から戻って制御器を呼ぶ。
+大きすぎる計算は配列を確保する前に断り、刻みが粗いときなどは結果の notes で知らせる。
 """
 from __future__ import annotations
 
@@ -20,7 +21,11 @@ from .ir import DC, Netlist, Sine, Step
 from .mna import CircuitError, System, build_system, describe_state, state_conductance
 
 DEFAULT_STEPS_PER_PERIOD = 200   # 搬送波1周期の分割数の既定値
-DEFAULT_DAMPING_STEPS = 2        # 切り替え直後に後退オイラーで進めるステップ数の既定値
+DEFAULT_DAMPING_STEPS = 2        # 計算の先頭と不連続点の直後に入れる減衰ステップの数の既定値
+MAX_STEPS = 20_000_000           # ステップ数の上限の既定値（スコープが扱う点数の目安と同じ 2000万）
+MAX_RESULT_BYTES = 2 * 2**30     # 結果の配列の大きさの上限 [バイト]（未知数の多い回路のため）
+MIN_POINTS_PER_PERIOD = 10       # 正弦波や回路の振動の1周期に、これより点が少ないと注意を出す
+MAX_STEP_PER_TIME_CONSTANT = 2.0  # 刻みが回路の時定数のこの倍数を超えると注意を出す（台形則が振動し始める境）
 DIODE_ON_VOLTAGE = 1e-9          # オフのダイオードをオンにする順方向電圧 [V]（丸め誤差での反転を防ぐ）
 SIMULTANEOUS_FLIPS = 4           # ダイオードの状態決定で、違反したものを同時に反転する回数
 _GRID_TOL = 1e-6                 # 周期が時間刻みの整数倍かどうかの判定（ステップ数に対する相対値）
@@ -88,12 +93,16 @@ class Result:
 
 
 def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
-    """電源を時間格子上の配列にする。戻り値: u_start, u_end, event"""
+    """電源を時間格子上の配列にする。戻り値: u_start, u_end, event, u_last
+
+    u_last は、最後の格子点でちょうど電源がステップするときの、ステップした後の値（無ければ None）。
+    """
     m = len(system.sources)
     t = h * np.arange(n_steps + 1)
     u_start = np.zeros((n_steps, m))
     u_end = np.zeros((n_steps, m))
     event = np.zeros(n_steps, dtype=bool)
+    last_step: dict[int, float] = {}       # 最後の格子点でステップする電源の、ステップした後の値
 
     for j, cid in enumerate(system.sources):
         w = system.netlist.component(cid).waveform
@@ -106,6 +115,13 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
             )
             u_start[:, j] = y[:-1]
             u_end[:, j] = y[1:]
+            points = 1.0 / (w.frequency * h)
+            if points < MIN_POINTS_PER_PERIOD:
+                notes.append(
+                    f"{cid}: 正弦波の1周期（{1.0 / w.frequency:.6g} s）に時間刻みが {points:.3g} 点しか無い。"
+                    "波形が折り返して、別の周波数や振幅に見える。"
+                    f"h を {1.0 / (20 * w.frequency):.3g} s 以下（1周期 20 点以上）にする"
+                )
         elif isinstance(w, Step):
             ks = int(round(w.t_step / h))
             if abs(ks * h - w.t_step) > 1e-9 * h:
@@ -115,9 +131,133 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
             u_end[:, j] = np.where(k + 1 > ks, w.final, w.initial)      # t[k+1] の左側の値
             if 0 < ks < n_steps and w.final != w.initial:
                 event[ks] = True
+            if ks == n_steps and w.final != w.initial:
+                last_step[j] = w.final
         else:  # pragma: no cover
             raise CircuitError(f"{cid}: 未対応の波形 {type(w).__name__}")
-    return u_start, u_end, event
+    u_last = None
+    if last_step:
+        u_last = u_end[-1].copy()          # ほかの電源は、最後の区間の終わりの値のまま
+        for j, value in last_step.items():
+            u_last[j] = value
+    return u_start, u_end, event, u_last
+
+
+def _count_steps(t_end: float, h: float, max_steps: int | None, notes: list[str]) -> int:
+    """ステップ数。配列を確保する前に、大きすぎる計算を理由つきで断る。"""
+    limit = MAX_STEPS if max_steps is None else max_steps
+    ratio = t_end / h
+    if not math.isfinite(ratio) or ratio > limit + 0.5:
+        raise ValueError(
+            f"ステップ数が約 {ratio:.3g}（t_end / h = {t_end:.6g} s / {h:.6g} s）になり、"
+            f"上限の {limit} を超える。"
+            "時間刻み h を大きくするか、計算時間 t_end を短くする。"
+            "この大きさが本当に必要なら simulate(..., max_steps=...) で上限を上げる"
+            "（記憶量は、1ステップあたり 8 バイト × 未知数の数の数倍）"
+        )
+    n_steps = int(round(ratio))
+    if n_steps < 1:
+        raise ValueError("t_end が h より短い")
+    if abs(ratio - n_steps) > 1e-6:
+        notes.append(
+            f"計算時間 t_end={t_end:.6g} s は時間刻み h={h:.6g} s の整数倍でないので、"
+            f"{n_steps * h:.6g} s（{n_steps} ステップ）で終える"
+        )
+    return n_steps
+
+
+def _check_result_size(n_steps: int, n_unknowns: int, max_steps: int | None) -> None:
+    """未知数の多い回路で、結果の配列が大きくなりすぎないか（上限を自分で指定したときは見ない）。"""
+    size = (n_steps + 1) * n_unknowns * 8
+    if max_steps is None and size > MAX_RESULT_BYTES:
+        raise ValueError(
+            f"結果の配列が約 {size / 2**30:.1f} GB（{n_steps} ステップ × 未知数 {n_unknowns} 個）になり、"
+            f"上限の {MAX_RESULT_BYTES / 2**30:.0f} GB を超える。h を大きくするか t_end を短くする。"
+            "この大きさが本当に必要なら simulate(..., max_steps=...) でステップ数の上限を指定する"
+        )
+
+
+def _has_unresolved_rate(rates: np.ndarray, h: float) -> bool:
+    """刻みより速い成分があるか（台形則だけで進めると、その成分が符号を変えながら残る）。"""
+    rates = rates[np.isfinite(rates)]
+    return bool(rates.size) and float(np.abs(rates).max()) * h > MAX_STEP_PER_TIME_CONSTANT
+
+
+def _resolution_notes(rates: np.ndarray, h: float, notes: list[str]) -> None:
+    """時間刻みが回路の速い成分を解像していなければ、何に対して粗いかを注意に書く。"""
+    rates = rates[np.isfinite(rates)]
+    decaying = rates[np.abs(rates.imag) <= np.abs(rates.real)]
+    ringing = rates[np.abs(rates.imag) > np.abs(rates.real)]
+    if decaying.size:
+        fastest = float(np.abs(decaying).max())
+        if fastest * h > MAX_STEP_PER_TIME_CONSTANT:
+            tau = 1.0 / fastest
+            notes.append(
+                f"時間刻み h={h:.6g} s は、回路の最も速い時定数 {tau:.3g} s の {h / tau:.3g} 倍で、"
+                "この成分の変化は波形に現れない（計算の先頭と電源のステップ直後は、"
+                "数値振動が出ないように減衰させている）。"
+                f"この成分を見るには h を {tau / 10:.3g} s 以下にする"
+            )
+    if ringing.size:
+        omega = float(np.abs(ringing.imag).max())
+        points = 2.0 * math.pi / (omega * h)
+        if points < MIN_POINTS_PER_PERIOD:
+            period = 2.0 * math.pi / omega
+            notes.append(
+                f"時間刻み h={h:.6g} s では、回路の振動（周期 {period:.3g} s）の"
+                f"1周期が {points:.3g} 点しか無い。"
+                "振動の周波数と減衰が正しく出ない。"
+                f"h を {period / 20:.3g} s 以下（1周期 20 点以上）にする"
+            )
+
+
+def _initial_value_notes(system: System, x0: np.ndarray, notes: list[str]) -> None:
+    """与えた初期値（ic）と、実際に始めた値が食い違っていれば注意に書く。"""
+    netlist = system.netlist
+    floor = 1e-9 * max(float(np.abs(x0).max(initial=0.0)), max(abs(c.ic) for c in netlist.components))
+
+    def at(node: str) -> float:
+        return 0.0 if node == netlist.ground else float(x0[system.unknowns.index(f"v({node})")])
+
+    for c in netlist.components:
+        if c.type == "C":
+            actual, unit = at(c.nodes[0]) - at(c.nodes[1]), "V"
+        elif c.type == "L":
+            actual, unit = float(x0[system.unknowns.index(f"i({c.id})")]), "A"
+        else:
+            continue
+        if abs(actual - c.ic) > 1e-6 * max(abs(actual), abs(c.ic)) + floor:
+            notes.append(
+                f"{c.id}: 初期値 ic={c.ic:.6g} {unit} は回路のつなぎ方と矛盾するので、"
+                f"{actual:.6g} {unit} から始めた"
+                "（コンデンサの並列や電圧源との直結、インダクタの直列などで、初期値どうしが食い違っている）"
+            )
+
+
+def _explain_unsolvable(system: System, exc: CircuitError, state: str | None = None) -> CircuitError:
+    """解けない回路のエラーに、手がかり（決まらない変数、インダクタだけの節点）を添える。"""
+    netlist = system.netlist
+    parts = [str(exc)]
+    names = [system.unknowns[i] for i in getattr(exc, "undetermined", [])]
+    if names:
+        parts.append(f"決まらない変数: {', '.join(names)}")
+    for node in netlist.nodes():
+        attached = [c for c in netlist.components if node in c.nodes]
+        if all(c.type in ("L", "I") for c in attached) and any(c.type == "L" for c in attached):
+            ids = ", ".join(c.id for c in attached)
+            with_source = any(c.type == "I" for c in attached)
+            kind = "電流源とインダクタの直列" if with_source else "インダクタどうしの直列"
+            parts.append(
+                f"節点 '{node}' には {ids} しかつながっていない（{kind}）。"
+                "直列のインダクタは1つにまとめる（値は和）"
+            )
+    text = "。".join(parts)
+    if state is not None:
+        text = (
+            f"回路状態（{state}）で: {text}。"
+            "オフ抵抗 r_off が極端に大きいと、オフのときに節点が浮いたのと同じになって解けない"
+        )
+    return CircuitError(text)
 
 
 def simulate(
@@ -129,48 +269,75 @@ def simulate(
     controllers: Sequence[Controller] = (),
     steps_per_period: int | None = None,
     damping_steps: int = DEFAULT_DAMPING_STEPS,
+    max_steps: int | None = None,
 ) -> Result:
     """ネットリストを固定刻みで計算する。
 
-    スイッチ（S）もダイオード（D）も無く、gates と controllers も渡さない場合は、
-    台形則だけで進める（E0 と同じ計算）。h は必須。
+    基本は台形則。計算の先頭と不連続点（電源のステップ、スイッチやダイオードの切り替え）の
+    直後だけ、刻みより速い成分を消す減衰ステップで進める。
+    刻みが回路の速い成分や電源の周期を解像していないときは、結果の notes に注意が入る。
 
-    スイッチやダイオードを含む場合:
+      h             : 時間刻み。スイッチの無い回路では必須。
+      damping_steps : 計算の先頭と不連続点の直後に入れる減衰ステップの数（既定 2。0 なら入れない）。
+                      スイッチの無い回路では、刻みより速い成分があるときだけ入れる。
+                      スイッチを含む回路では、状態が変わったステップを後退オイラーで進め、その後に入れる。
+      max_steps     : ステップ数の上限（既定 2000万）。超える計算は、配列を確保する前に断る。
+
+    スイッチ（S）やダイオード（D）を含む場合:
       gates            : ゲート信号（PWM）。S の gate から名前で参照する。
       controllers      : 制御器。制御周期ごとに測定して演算し、指令は次の制御周期の頭から使う。
-      h                : 時間刻み。省略すると、最も速い搬送波の周期を steps_per_period で割った値。
+      h                : 省略すると、最も速い搬送波の周期を steps_per_period で割った値。
       steps_per_period : 搬送波1周期の分割数（既定 200）。h と同時には指定しない。
-      damping_steps    : 切り替え直後に後退オイラーで進めるステップ数（1以上。既定 2）。
     """
-    if not (t_end > 0) or (h is not None and not (h > 0)):
-        raise ValueError("t_end と h は正の値が必要")
+    if not (t_end > 0 and math.isfinite(t_end)) or (h is not None and not (h > 0 and math.isfinite(h))):
+        raise ValueError("t_end と h は正の有限値が必要")
+    if damping_steps < 0:
+        raise ValueError("damping_steps は 0 以上にする")
 
     switching = any(c.type in ("S", "D") for c in netlist.components)
     if switching or gates or controllers:
-        return _simulate_switched(netlist, t_end, h, gates, controllers, steps_per_period, damping_steps)
+        return _simulate_switched(
+            netlist, t_end, h, gates, controllers, steps_per_period, damping_steps, max_steps
+        )
 
     if h is None:
         raise ValueError("スイッチの無い回路では時間刻み h が必要")
     if steps_per_period is not None:
         raise ValueError("steps_per_period を使えるのは、ゲート信号（gates）を渡すときだけ")
-    return _simulate_linear(netlist, t_end, h)
+    return _simulate_linear(netlist, t_end, h, damping_steps, max_steps)
 
 
-def _simulate_linear(netlist: Netlist, t_end: float, h: float) -> Result:
-    """スイッチの無い回路（E0 と同じ計算）。"""
-    n_steps = int(round(t_end / h))
-    if n_steps < 1:
-        raise ValueError("t_end が h より短い")
+def _simulate_linear(
+    netlist: Netlist, t_end: float, h: float, damping_steps: int, max_steps: int | None
+) -> Result:
+    """スイッチの無い回路。"""
+    notes: list[str] = []
+    n_steps = _count_steps(t_end, h, max_steps, notes)
 
     system = build_system(netlist)
-    notes: list[str] = []
-    u_start, u_end, event = _sample_sources(system, n_steps, h, notes)
+    _check_result_size(n_steps, len(system.unknowns), max_steps)
+    u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
 
-    ops = kernel.prepare(system.E, system.G, system.B, h)
+    try:
+        ops = kernel.prepare(system.E, system.G, system.B, h)
+    except CircuitError as exc:
+        raise _explain_unsolvable(system, exc) from exc
     x0 = ops.Rex @ system.ex0 + ops.Ru @ u_start[0]
+    _initial_value_notes(system, x0, notes)
+    rates = kernel.natural_rates(system.G, ops.Rex)
+    _resolution_notes(rates, h, notes)
+    # 減衰ステップは、刻みより速い成分があるときだけ入れる。刻みが回路を解像していれば台形則だけで
+    # 進め、2次精度をそのまま保つ（減衰ステップが要るのは、台形則が振動する成分があるときだけ）。
+    n_damp = damping_steps if _has_unresolved_rate(rates, h) else 0
 
     out = np.empty((n_steps + 1, len(system.unknowns)))
-    kernel.run(ops.P, ops.Q, ops.Rx, ops.Ru, x0, u_start, u_end, event, out)
+    kernel.run(
+        ops.P, ops.Q, ops.Rx, ops.Ru, x0, u_start, u_end, event, out,
+        ops.Pd, ops.Qd_start, ops.Qd_end, n_damp,
+    )
+    if u_last is not None:
+        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+        out[n_steps] = ops.Rx @ out[n_steps] + ops.Ru @ u_last
 
     return Result(
         t=h * np.arange(n_steps + 1),
@@ -199,7 +366,7 @@ def _whole_steps(period: float, h: float, what: str) -> int:
 class _StateTable:
     """回路状態ごとの行列。出会った状態だけ一度計算して、核に渡せる配列に並べて持つ。"""
 
-    _ARRAYS = ("code", "P", "Q", "Pb", "Qb", "Rx", "Ru")
+    _ARRAYS = ("code", "P", "Q", "Pb", "Qb", "Pd", "Qd_start", "Qd_end", "Rx", "Ru")
 
     def __init__(self, system: System, h: float):
         self.system = system
@@ -214,6 +381,9 @@ class _StateTable:
         self.Q = np.zeros((capacity, n, m))
         self.Pb = np.zeros((capacity, n, n))
         self.Qb = np.zeros((capacity, n, m))
+        self.Pd = np.zeros((capacity, n, n))
+        self.Qd_start = np.zeros((capacity, n, m))
+        self.Qd_end = np.zeros((capacity, n, m))
         self.Rx = np.zeros((capacity, n, n))
         self.Ru = np.zeros((capacity, n, m))
 
@@ -234,16 +404,14 @@ class _StateTable:
                 backward_euler=True,
             )
         except CircuitError as exc:
-            raise CircuitError(
-                f"回路状態（{describe_state(self.system, code)}）で: {exc}。"
-                "オフ抵抗 r_off が極端に大きいと、オフのときに節点が浮いたのと同じになって解けない"
-            ) from exc
+            raise _explain_unsolvable(self.system, exc, describe_state(self.system, code)) from exc
         if self.count == self.code.shape[0]:
             self._grow()
         s = self.count
         self.code[s] = code
         self.P[s], self.Q[s] = ops.P, ops.Q
         self.Pb[s], self.Qb[s] = ops.Pb, ops.Qb
+        self.Pd[s], self.Qd_start[s], self.Qd_end[s] = ops.Pd, ops.Qd_start, ops.Qd_end
         self.Rx[s], self.Ru[s] = ops.Rx, ops.Ru
         self.rex.append(ops.Rex)
         self.index[code] = s
@@ -298,11 +466,8 @@ def _simulate_switched(
     controllers: Sequence[Controller],
     steps_per_period: int | None,
     damping_steps: int,
+    max_steps: int | None,
 ) -> Result:
-    if damping_steps < 1:
-        raise ValueError(
-            "damping_steps は 1 以上にする（台形則だけでは、オフ抵抗を通るインダクタ電流が減衰しない）"
-        )
     notes: list[str] = []
 
     # --- ゲート信号と時間刻み -------------------------------------------------
@@ -324,9 +489,7 @@ def _simulate_switched(
         h = 1.0 / (max(g.frequency for g in gates) * n_div)
     elif steps_per_period is not None:
         raise ValueError("h と steps_per_period は、どちらか一方だけを指定する")
-    n_steps = int(round(t_end / h))
-    if n_steps < 1:
-        raise ValueError("t_end が h より短い")
+    n_steps = _count_steps(t_end, h, max_steps, notes)
     gate_steps = [_whole_steps(1.0 / g.frequency, h, f"ゲート信号 '{g.name}' の周期") for g in gates]
     for g, n_div in zip(gates, gate_steps, strict=True):
         if n_div < 2:
@@ -337,7 +500,8 @@ def _simulate_switched(
     n = len(system.unknowns)
     n_sw, n_dev = system.n_switches, len(system.devices)
     switch_gate = [gate_names.index(netlist.component(cid).gate) for cid in system.devices[:n_sw]]
-    u_start, u_end, event = _sample_sources(system, n_steps, h, notes)
+    _check_result_size(n_steps, n, max_steps)
+    u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
     u_mid = 0.5 * (u_start + u_end)
 
     # --- 制御器と指令 ---------------------------------------------------------
@@ -396,38 +560,55 @@ def _simulate_switched(
     gate_out = np.zeros((n_steps + 1, len(gates)), dtype=bool)
     cmd_out = np.zeros((n_steps + 1, len(cmd_names)))
 
+    latched = np.zeros(len(gates), dtype=np.int64)     # いまの搬送波の周期のオンのステップ数
+    carried = np.zeros(len(gates))                      # 次の周期に持ち越す丸めの余り
+
     def fill(k0: int, k1: int) -> None:
-        """区間 [k0, k1) のゲート信号・指令・スイッチのビットを、いまの指令で埋める。"""
+        """区間 [k0, k1) のゲート信号・指令・スイッチのビットを、いまの指令で埋める。
+
+        デューティは搬送波の周期の頭で取り込む。区間の途中から始まる周期は、取り込み済みの値を使う。
+        """
         k = np.arange(k0, k1)
         cmd_out[k0:k1] = active
         for g, (pwm, n_div) in enumerate(zip(gates, gate_steps, strict=True)):
             duty = pwm.duty if gate_cmd[g] < 0 else float(active[gate_cmd[g]])
-            gate_out[k0:k1, g] = pwm.pattern(k, n_div, duty)
+            first = -(-k0 // n_div)                     # この区間の中で始まる最初の周期の番号
+            n_periods = max(0, -(-k1 // n_div) - first)
+            counts, carried[g] = pwm.on_counts(duty, n_div, n_periods, float(carried[g]))
+            index = k // n_div - first                  # 負なら、区間の前に始まった周期
+            n_on = np.where(index >= 0, counts[np.maximum(index, 0)] if n_periods else 0, latched[g])
+            if n_periods:
+                latched[g] = counts[-1]
+            gate_out[k0:k1, g] = pwm.pattern(k, n_div, n_on)
         code = np.zeros(k1 - k0, dtype=np.int64)
         for j, g in enumerate(switch_gate):
             code |= gate_out[k0:k1, g].astype(np.int64) << j
         sw_code[k0:k1] = code
 
     # --- 初期値 ---------------------------------------------------------------
+    def next_stop(k: int) -> int:
+        """次に核から戻るステップ番号（制御器を呼ぶ点、または計算の終わり）。"""
+        return min([n_steps] + [(k // m + 1) * m for m in ctrl_steps])
+
     table = _StateTable(system, h)
     max_flips = _flip_limit(n_dev - n_sw)
-    fill(0, 1)
+    k0, k1 = 0, next_stop(0)
+    fill(k0, k1)
     code0, x = _initial_state(system, table, int(sw_code[0]), u_start[0], max_flips)
     out[0] = x
+    _initial_value_notes(system, x, notes)
     ctl = np.zeros(kernel.CTL_SIZE, dtype=np.int64)
     ctl[kernel.CTL_STATE] = code0
-    ctl[kernel.CTL_DAMP] = damping_steps      # 計算の頭も切り替え直後として扱う
+    ctl[kernel.CTL_DAMP] = damping_steps      # 計算の先頭も、減衰ステップから始める
     d_pos = np.ascontiguousarray(system.dev_pos[n_sw:])
     d_neg = np.ascontiguousarray(system.dev_neg[n_sw:])
 
     # --- 制御周期ごとに区切って核を呼ぶ ---------------------------------------
-    k0 = 0
-    while k0 < n_steps:
-        k1 = min([n_steps] + [(k0 // m + 1) * m for m in ctrl_steps])
-        fill(k0, k1)
+    while True:
         while True:
             status = kernel.run_switched(
-                table.P, table.Q, table.Pb, table.Qb, table.Rx, table.Ru, table.code, table.count,
+                table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
+                table.Rx, table.Ru, table.code, table.count,
                 d_pos, d_neg, n_sw,
                 u_start, u_mid, u_end, event, sw_code,
                 x, ctl, k1,
@@ -453,7 +634,14 @@ def _simulate_switched(
         for m, outs in zip(ctrl_steps, ctrl_outputs, strict=True):
             if k1 % m == 0:
                 active[outs] = pending[outs]
-        k0 = k1
+        if k1 >= n_steps:
+            break
+        k0, k1 = k1, next_stop(k1)
+        fill(k0, k1)
+    if u_last is not None:
+        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+        s_last = table.slot(int(ctl[kernel.CTL_STATE]))
+        out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
     # 最後の点から始まる区間は無いので、区間ごとの記録は最後の区間の値を繰り返す
     gate_out[n_steps] = gate_out[n_steps - 1]
     cmd_out[n_steps] = cmd_out[n_steps - 1]

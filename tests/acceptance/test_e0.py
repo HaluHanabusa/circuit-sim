@@ -353,11 +353,6 @@ def test_c3_series_capacitors_keep_their_charges():
     assert res["v(m)"][-1] == pytest.approx(v2 + dq / c2, rel=1e-6)
 
 
-@product_bug(
-    "軽微",
-    "並列コンデンサに矛盾する初期値を与えると、エラーも注意も出さずに電荷の平均値",
-    "(3.5 V)で始める",
-)
 def test_c3_contradictory_initial_values_are_reported():
     netlist = net(
         I("I1", "0", "a", DC(value=0.0)), R("R1", "a", "0", 1e3),
@@ -485,11 +480,6 @@ def test_c4_stiff_circuit_is_correct_when_step_resolves_fast_branch():
     assert res["v(x)"].max() <= 5.0 * (1 + 1e-9)
 
 
-@product_bug(
-    "重大",
-    "刻みが速い時定数を解像しないと、電源のステップ後に数値振動が出る（v(x) ",
-    "が 8.33 V まで振れ、電源電流の符号が交互に変わる）。注意も出ない",
-)
 def test_c4_stiff_circuit_does_not_ring_after_step():
     """h = 10 µs（遅い枝を100分割、速い枝の時定数の10倍）。RC だけの回路なので、真の応答は行き過ぎない。"""
     res = _stiff_two_branch(1e-5)
@@ -506,12 +496,6 @@ def test_c4_stiff_circuit_does_not_ring_after_step():
     )
 
 
-@product_bug(
-    "重大",
-    "rlc_series（過減衰）で simulation.h を遅い極に合わせ",
-    "ると、i(L1) のピークが真値の約2倍になり、v(a) が ±9 V で交",
-    "互に振れる。注意も出ない",
-)
 def test_c4_template_overdamped_with_coarse_h_does_not_ring():
     v_in, r, ind, cap = 10.0, 1e3, 1e-3, 10e-6            # 速い極 L/R = 1 µs、遅い極 RC = 10 ms
     ex = expand(spec_of("rlc_series", {"h": 5e-5, "t_end": 5e-2},
@@ -593,11 +577,6 @@ def test_c5_solvable_special_cases_give_right_values():
     assert res["i(L1)"][-1] == pytest.approx(0.5, rel=1e-3)                          # 同じLなら半分ずつ
 
 
-@product_bug(
-    "軽微",
-    "インダクタの直列（物理的には解ける回路）が『回路が一意に解けない』で弾かれ、",
-    "メッセージの例示にも直列インダクタが無い",
-)
 def test_c5_series_inductors_solve_or_error_names_the_cause():
     netlist = net(
         V("V1", "in", "0", _dc()), L("L1", "in", "a", 1e-3), L("L2", "a", "b", 1e-3), R("R1", "b", "0", 10.0),
@@ -638,11 +617,6 @@ def test_c5_invalid_time_settings_are_rejected(t_end, h):
         simulate(rc_net(_dc(), 1e3, 1e-6), t_end, h)
 
 
-@product_bug(
-    "軽微",
-    "電源の値や初期値に NaN / 無限大を入れても検証を通り、結果が NaN ",
-    "になる（R / L / C の値は検証している）",
-)
 @pytest.mark.parametrize("build", [
     pytest.param(lambda: rc_net(DC(value=float("nan")), 1e3, 1e-6), id="電源=NaN"),
     pytest.param(lambda: rc_net(Step(final=float("inf")), 1e3, 1e-6), id="電源=inf"),
@@ -725,11 +699,6 @@ def test_c6_spec_rejects_unknown_keys_and_versions():
             Spec.model_validate(bad)
 
 
-@product_bug(
-    "重大",
-    "層Aの unit を読まずに値をそのまま使う。{value: 1, unit",
-    ": 'kohm'} が 1 Ω として計算され、エラーも注意も出ない",
-)
 def test_c6_unit_is_not_silently_ignored():
     """単位を換算するか、受け付けない単位として断るか、どちらかであること。"""
     spec = spec_of("rc_lowpass", Vin=(5.0, "V"), R=(1.0, "kohm"), C=(1.0, "uF"))
@@ -741,11 +710,6 @@ def test_c6_unit_is_not_silently_ignored():
     assert ex.netlist.component("C1").value == pytest.approx(1e-6)
 
 
-@product_bug(
-    "軽微",
-    "Vin に NaN / Infinity が入った仕様JSONを受け付け、結",
-    "果が NaN になる（終了コード 0）",
-)
 @pytest.mark.parametrize("literal", ["NaN", "Infinity"])
 def test_c6_non_finite_spec_value_is_rejected(literal):
     text = (
@@ -844,12 +808,6 @@ def test_c8_two_stage_rc_with_constants_12_decades_apart(r1, c1, r2, c2):
     assert max_err(res["v(b)"], ref[:, 1], 1.0) < TOL
 
 
-@product_bug(
-    "軽微",
-    "C[F] と L[H] の値の比が約1e-15以下になると、小さい方の素子が",
-    "状態として扱われなくなり、初期値が変わり(0.7→0.467 V)、ステップ",
-    "で電圧が跳ぶ。エラーなし",
-)
 def test_c8_tiny_capacitor_next_to_huge_inductor_keeps_its_state():
     cs, lb, rc, ic = 1e-12, 1e3, 1e6, 0.7          # 1 pF と 1 kH
     tau = rc * cs
@@ -889,11 +847,6 @@ def test_c8_very_coarse_step_stays_bounded_and_settles(ratio):
     assert np.allclose(v, v_in * (1 - rho**k), atol=1e-9)
 
 
-@product_bug(
-    "重大",
-    "刻みが時定数より粗いと、RC のステップ応答が入力の最大約2倍まで振れる（h",
-    "=10τ で 1.67 倍、12 ステップ続く）。注意も出ない",
-)
 def test_c8_coarse_step_gives_no_overshoot_or_warns():
     """RC（1次系）の真の応答は入力を超えない。粗い刻みでは、超えないか、粗いことを注意として返すこと。"""
     r, c, v_in = 1e3, 1e-6, 1.0
@@ -1073,12 +1026,6 @@ def test_c8_end_time_and_grid():
     assert res.x.shape == (101, len(res.unknowns))
 
 
-@product_bug(
-    "重大",
-    "rlc_series の既定の刻みは最速の極、計算時間は最遅の極で決まる。R",
-    "=10 kΩ, L=1 mH, C=10 µF（ζ=500）で 1.6e8 ",
-    "ステップ・結果だけで 6.4 GB になり MemoryError で落ちる",
-)
 def test_c8_template_default_timing_stays_computable_for_stiff_overdamped():
     """ありふれた過減衰の定数で、既定のままの計算が現実的な大きさに収まること（計算はしない）。
 
@@ -1088,11 +1035,6 @@ def test_c8_template_default_timing_stays_computable_for_stiff_overdamped():
     assert ex.t_end / ex.h <= 2.5e7, f"{ex.t_end / ex.h:.3g} ステップ"
 
 
-@product_bug(
-    "軽微",
-    "正弦波の周期を刻みが解像しない（1周期に2点未満）とき、折り返した波形をその",
-    "まま返し、注意を出さない",
-)
 def test_c8_unresolved_sine_source_is_reported():
     netlist = rc_net(Sine(amplitude=1.0, frequency=1.001e6), 1e3, 1e-9)
     res = simulate(netlist, 5e-3, 1e-5)                      # 1 MHz の電源に 10 µs 刻み
@@ -1100,10 +1042,6 @@ def test_c8_unresolved_sine_source_is_reported():
     assert res.notes or np.abs(res["v(out)"][250:]).max() == pytest.approx(true_amplitude, rel=0.1)
 
 
-@product_bug(
-    "軽微",
-    "t_end が h の整数倍でないと、終了時刻が黙って短く(長く)なる",
-)
 def test_c8_end_time_rounding_is_reported():
     res = simulate(rc_net(_dc(), 1e3, 1e-6), 1e-3, 6.7e-4)
     assert res.notes or res.t[-1] == pytest.approx(1e-3)

@@ -443,10 +443,6 @@ def test_c4_offgrid_step_time_is_rounded_to_nearest_grid_point_and_noted():
     assert len(out.notes) == 1
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（重大、E0_verifier_b.md の問題1）: 不連続点の直後も台形則のままなので、刻みが時定数の"
-    "2倍を超えると状態量が符号を変えながら振動する（h = 100τ で行き過ぎ96%）。"
-    "設計（architecture.md 4章、D-007）は切り替え直後の後退オイラーを求めている"))
 def test_c4_no_overshoot_after_midrun_step_with_coarse_step():
     """1次のRC回路は行き過ぎない。刻みが粗くても、途中のステップの後に入力電圧を超えない。"""
     tau = 1e-3
@@ -578,9 +574,6 @@ def test_c6_nonpositive_value_is_rejected_not_repaired():
     assert "R" in str(info.value) and "C" in str(info.value)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（重大、基準外。E0_verifier_b.md の問題2）: 層Aの unit は必須項目なのに展開で読まれない。"
-    "1 mH と書いた値が 1 H として計算され、エラーも注意も出ない"))
 def test_c6_unit_is_not_silently_ignored():
     """SI基本単位でない単位が付いた値は、換算するか、断る。黙って基本単位として使わない。"""
     spec = Spec.model_validate({"template": "rlc_series", "plant": {
@@ -693,9 +686,6 @@ def test_c8_time_constants_six_orders_apart_slow_node_with_coarse_step():
     assert max_err(out["v(b)"], ref[:, 1], STIFF["v"]) < TOL
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（重大、E0_verifier_b.md の問題1）: 刻みが速い時定数を解像しないとき、速い節点の電圧が"
-    "0 V と 10 V の間を振動し続ける（真値は約 5 V、誤差は入力電圧の99.9%）。注意も出ない"))
 def test_c8_time_constants_six_orders_apart_fast_node_with_coarse_step():
     """同じ条件で、速い節点も（最初の2点を除き）正しい値に落ち着く。"""
     net, a_mat, forcing = stiff_two_stage()
@@ -726,9 +716,6 @@ def test_c8_extremely_coarse_step_is_stable_and_converges():
     assert out["i(V1)"][-1] == pytest.approx(0.0, abs=1e-3 * v / r)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（重大、E0_verifier_b.md の問題1）: 刻みが時定数の2倍を超えると、1次のRC回路のステップ応答が"
-    "入力電圧を行き過ぎる（h = 100τ で1.96倍）。注意も出ない"))
 def test_c8_extremely_coarse_step_does_not_overshoot_first_order_circuit():
     v, r, c = 1.0, 1e3, 1e-6
     h = 100 * r * c
@@ -891,10 +878,6 @@ def test_c8_ground_node_can_have_any_name():
     assert max_err(out["v(out)"], 5.0 * (1 - np.exp(-out.t / 1e-3)), 5.0) < TOL
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微、E0_verifier_b.md の問題4）: キャパシタンス[F]とインダクタンス[H]の数値の比が約1e15を"
-    "超えると、初期値の整合で小さい方が無視され、t=0 で電源の節点が 1 V でなく 0.75 V になる。"
-    "エラーにならず、その後の波形も入力電圧の25%ずれる"))
 def test_c8_extreme_capacitance_to_inductance_ratio():
     """L = 1 pH、C = 1 kF（比 1e15）。電圧源の節点は t=0 から電源電圧に等しい。"""
     v, l_, c = 1.0, 1e-12, 1e3
@@ -906,9 +889,6 @@ def test_c8_extreme_capacitance_to_inductance_ratio():
     assert max_err(out["v(out)"], vc, v) < TOL
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（重大、E0_verifier_b.md の問題3）: 強い過減衰では、テンプレートが決める刻みと計算時間から"
-    "ステップ数が極の比に比例して膨らむ（R = 1 kΩ、L = 1 µH、C = 1 µF で1.6億ステップ、約11 GB）"))
 def test_c8_template_step_count_stays_practical_for_strongly_overdamped_rlc():
     """定数の桁が大きく違う仕様でも、既定の刻みで現実的なステップ数（1000万以下）に収まるか、断る。"""
     spec = Spec.model_validate({"template": "rlc_series", "plant": {
@@ -920,9 +900,6 @@ def test_c8_template_step_count_stays_practical_for_strongly_overdamped_rlc():
     assert ex.t_end / ex.h <= 1e7
 
 
-@pytest.mark.xfail(strict=True, raises=MemoryError, reason=(
-    "製品の不具合（重大、E0_verifier_b.md の問題3）: ステップ数の上限の確認が無く、計算できない大きさでも"
-    "配列を確保しに行って MemoryError になる（利用者には原因と対処が分からない）"))
 def test_c8_impossible_step_count_is_reported_clearly():
     """1e15 ステップのような計算できない指定は、配列を確保する前に、理由の分かるエラーにする。"""
     with pytest.raises((ValueError, CircuitError)):

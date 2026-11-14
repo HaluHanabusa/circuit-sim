@@ -4,7 +4,7 @@
 こうしておけば、後から Numba や C / C++ / Rust に載せ替えられる。
 回路の解釈（ネットリスト → 行列）は核の外（mna.py）でやる。
 
-run()          : スイッチの無い回路。台形則だけで進める。
+run()          : スイッチの無い回路。台形則で進め、計算の先頭と電源の不連続点の直後だけ減衰ステップにする。
 run_switched() : スイッチとダイオードを含む回路。回路状態ごとの行列を使い回し、
                  用意していない状態に出会ったら呼び出し側に戻る。制御器を呼ぶ区切りでも戻る。
 """
@@ -18,6 +18,8 @@ from scipy.linalg import LinAlgWarning, lu_factor, lu_solve, null_space
 
 from .mna import CircuitError
 
+DAMPING_SUBSTEPS = 1024   # 減衰ステップ1つを、この数の後退オイラーに刻む（2 のべき）
+
 
 @dataclass
 class Operators:
@@ -28,6 +30,9 @@ class Operators:
     Rx: np.ndarray   # 不連続点での整合: x(t+) = Rx x(t-) + Ru u(t+)
     Ru: np.ndarray
     Rex: np.ndarray  # 初期化: x(0) = Rex (E x(0)) + Ru u(0)
+    Pd: np.ndarray        # 減衰ステップ: x[k+1] = Pd x[k] + Qd_start u_start[k] + Qd_end u_end[k]
+    Qd_start: np.ndarray
+    Qd_end: np.ndarray
     Pb: np.ndarray | None = None   # 後退オイラー: x[k+1] = Pb x[k] + Qb u[k+1]
     Qb: np.ndarray | None = None
 
@@ -37,61 +42,124 @@ def _row_scale(A: np.ndarray) -> np.ndarray:
     return np.where(m > 0, 1.0 / np.where(m > 0, m, 1.0), 1.0)
 
 
+def _left_null_space(E: np.ndarray) -> np.ndarray:
+    """E の左零空間（微分を含まない式を作る、式の組み合わせ）。
+
+    E は、コンデンサでつながった節点の組と、インダクタ1個ずつのブロックに分かれる。
+    零空間はブロックごとに、そのブロックの大きさで正規化して求める。全体を1つの大きさで
+    正規化すると、F と H のように桁の違う量が混ざり、小さい方の素子が 0 とみなされる。
+    """
+    n = E.shape[0]
+    linked = (E != 0) | (E.T != 0)
+    block_of = np.full(n, -1)
+    columns = []
+    for first in range(n):
+        if block_of[first] >= 0:
+            continue
+        block_of[first] = first
+        members, todo = [first], [first]
+        while todo:
+            i = todo.pop()
+            for j in np.nonzero(linked[i])[0]:
+                if block_of[j] < 0:
+                    block_of[j] = first
+                    members.append(int(j))
+                    todo.append(int(j))
+        members.sort()
+        block = E[np.ix_(members, members)]
+        scale = np.abs(block).max()
+        basis = np.eye(len(members)) if scale == 0 else null_space((block / scale).T)
+        for j in range(basis.shape[1]):
+            w = np.zeros(n)
+            w[members] = basis[:, j]
+            columns.append(w)
+    return np.array(columns).T if columns else np.zeros((n, 0))
+
+
+def _solve_or_raise(M: np.ndarray, rhs: list[np.ndarray], h: float) -> list[np.ndarray]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", LinAlgWarning)
+        try:
+            lu = lu_factor(M)
+            out = [lu_solve(lu, r) for r in rhs]
+        except (LinAlgWarning, np.linalg.LinAlgError, ValueError) as exc:
+            raise CircuitError(f"時間刻み h={h} で行列が解けない: {exc}") from exc
+    if not all(np.isfinite(r).all() for r in out):
+        raise CircuitError(f"時間刻み h={h} で行列が解けない")
+    return out
+
+
 def prepare(
     E: np.ndarray, G: np.ndarray, B: np.ndarray, h: float, backward_euler: bool = False
 ) -> Operators:
-    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。"""
-    n = E.shape[0]
+    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。
+
+    解けない回路では CircuitError。undetermined 属性に、決まらない未知数の番号が入る。
+    """
+    n, n_u = B.shape
 
     # --- 整合の取れた初期値・不連続点の処理 -----------------------------------
     # 状態（コンデンサ電圧・インダクタ電流）は E x で決まる。残りの変数は、
     # 方程式のうち微分を含まない部分  W^T G x = W^T B u  （W は E の左零空間）で決まる。
-    scale = np.abs(E).max()
-    W = np.eye(n) if scale == 0 else null_space((E / scale).T)
+    W = _left_null_space(E)
     A_alg = W.T @ G
     B_alg = W.T @ B
     dE, dA = _row_scale(E), _row_scale(A_alg)
     S = np.vstack([dE[:, None] * E, dA[:, None] * A_alg])
     if np.linalg.matrix_rank(S) < n:
-        raise CircuitError(
+        error = CircuitError(
             "回路が一意に解けない。基準節点から浮いた部分、電圧源だけのループ、"
-            "電圧源とコンデンサの直結、電流源とインダクタの直列などが無いか確認する"
+            "電圧源とコンデンサの直結、電流源とインダクタの直列、インダクタどうしの直列などが無いか確認する"
         )
+        # 決まらない方向（S の零空間）に成分を持つ未知数を、原因の手がかりとして添える
+        _, sv, vt = np.linalg.svd(S)
+        free = vt[np.sum(sv > sv.max() * max(S.shape) * np.finfo(float).eps):]
+        weight = np.abs(free).max(axis=0) if free.size else np.zeros(n)
+        error.undetermined = [int(i) for i in np.nonzero(weight > 0.1 * weight.max())[0]] if free.size else []
+        raise error
     S_pinv = np.linalg.pinv(S)
     Rex = S_pinv[:, :n] * dE[None, :]
     Ru = (S_pinv[:, n:] * dA[None, :]) @ B_alg
     Rx = Rex @ E
 
     # --- 台形則 ---------------------------------------------------------------
-    M = E / h + G / 2.0
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", LinAlgWarning)
-        try:
-            lu = lu_factor(M)
-            P = lu_solve(lu, E / h - G / 2.0)
-            Q = lu_solve(lu, B)
-        except (LinAlgWarning, np.linalg.LinAlgError, ValueError) as exc:
-            raise CircuitError(f"時間刻み h={h} で行列が解けない: {exc}") from exc
-    if not (np.isfinite(P).all() and np.isfinite(Q).all()):
+    P, Q = _solve_or_raise(E / h + G / 2.0, [E / h - G / 2.0, B], h)
+
+    # --- 減衰ステップ ---------------------------------------------------------
+    # 計算の先頭と不連続点の直後に使う。1ステップを DAMPING_SUBSTEPS 個の後退オイラーに刻んだもの。
+    # 刻みより速い成分は消え、遅い成分はほぼ厳密に進む（誤差は後退オイラー1ステップの 1 / 刻む数）。
+    # 途中の電源値は両端の直線補間。行列のべき乗（2乗の繰り返し）で1つの行列にまとめる。
+    hs = h / DAMPING_SUBSTEPS
+    Ps, Qs = _solve_or_raise(E / hs + G, [E / hs, B], h)
+    M = np.zeros((n + 2 * n_u, n + 2 * n_u))      # [x; u; 1刻みごとの u の増分] を1刻み進める行列
+    M[:n, :n] = Ps
+    M[:n, n:n + n_u] = Qs
+    M[:n, n + n_u:] = Qs
+    M[n:, n:] = np.kron(np.array([[1.0, 1.0], [0.0, 1.0]]), np.eye(n_u))
+    for _ in range(DAMPING_SUBSTEPS.bit_length() - 1):
+        M = M @ M
+    Pd = np.ascontiguousarray(M[:n, :n])
+    Qd_end = M[:n, n + n_u:] / DAMPING_SUBSTEPS
+    Qd_start = M[:n, n:n + n_u] - Qd_end
+    if not (np.isfinite(Pd).all() and np.isfinite(Qd_start).all() and np.isfinite(Qd_end).all()):
         raise CircuitError(f"時間刻み h={h} で行列が解けない")
 
-    ops = Operators(P=P, Q=Q, Rx=Rx, Ru=Ru, Rex=Rex)
-    if not backward_euler:
-        return ops
-
-    # --- 後退オイラー（切り替え直後に硬い成分を減衰させるために使う） ---------
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", LinAlgWarning)
-        try:
-            lu = lu_factor(E / h + G)
-            Pb = lu_solve(lu, E / h)
-            Qb = lu_solve(lu, B)
-        except (LinAlgWarning, np.linalg.LinAlgError, ValueError) as exc:
-            raise CircuitError(f"時間刻み h={h} で行列が解けない: {exc}") from exc
-    if not (np.isfinite(Pb).all() and np.isfinite(Qb).all()):
-        raise CircuitError(f"時間刻み h={h} で行列が解けない")
-    ops.Pb, ops.Qb = Pb, Qb
+    ops = Operators(P=P, Q=Q, Rx=Rx, Ru=Ru, Rex=Rex, Pd=Pd, Qd_start=Qd_start, Qd_end=Qd_end)
+    if backward_euler:
+        # 状態が変わったステップの判定に使う（run_switched の説明を参照）
+        ops.Pb, ops.Qb = _solve_or_raise(E / h + G, [E / h, B], h)
     return ops
+
+
+def natural_rates(G: np.ndarray, Rex: np.ndarray) -> np.ndarray:
+    """回路の固有値 λ（電源を止めたときの成分 exp(λ t)）。時定数は 1 / |λ|。
+
+    状態量 y = E x について y' = -G x、x = Rex y なので、-G Rex の固有値を取る。
+    状態でない方向の分は 0 として混ざるが、速い成分を探す用途では害が無い。
+    """
+    if G.shape[0] == 0:
+        return np.zeros(0, dtype=complex)
+    return np.linalg.eigvals(-G @ Rex)
 
 
 def run(
@@ -104,8 +172,15 @@ def run(
     u_end: np.ndarray,
     event: np.ndarray,
     out: np.ndarray,
+    Pd: np.ndarray | None = None,
+    Qd_start: np.ndarray | None = None,
+    Qd_end: np.ndarray | None = None,
+    n_damp: int = 0,
 ) -> None:
-    """固定刻みの台形則で n_steps 進め、結果を out に書く。
+    """固定刻みで n_steps 進め、結果を out に書く。
+
+    計算の先頭と電源の不連続点から n_damp ステップは減衰ステップ（Pd, Qd_start, Qd_end）、
+    それ以外は台形則。台形則だけだと、刻みより速い成分が符号を変えながら残る。
 
     u_start[k] : 時刻 t[k]   での電源値（不連続点では切り替わった後の値）
     u_end[k]   : 時刻 t[k+1] での電源値（不連続点では切り替わる前の値）
@@ -115,11 +190,17 @@ def run(
     n_steps = u_start.shape[0]
     x = x0.copy()
     out[0] = x
+    damp = n_damp
     for k in range(n_steps):
         if event[k]:
             x = Rx @ x + Ru @ u_start[k]
             out[k] = x
-        x = P @ x + Q @ (0.5 * (u_start[k] + u_end[k]))
+            damp = n_damp
+        if damp > 0:
+            x = Pd @ x + Qd_start @ u_start[k] + Qd_end @ u_end[k]
+            damp -= 1
+        else:
+            x = P @ x + Q @ (0.5 * (u_start[k] + u_end[k]))
         out[k + 1] = x
 
 
@@ -132,7 +213,7 @@ NOT_SETTLED = 2    # ダイオードの状態が規定回数で落ち着かな�
 # ctl（再開に必要な進行状態）の並び
 CTL_K = 0          # 次に計算するステップの番号
 CTL_STATE = 1      # 直前の区間の回路状態の符号（x と整合している状態）
-CTL_DAMP = 2       # 後退オイラーで進める残りステップ数
+CTL_DAMP = 2       # 減衰ステップで進める残りステップ数
 CTL_CODE = 3       # NEED_STATE / NOT_SETTLED のときの符号
 CTL_CHANGES = 4    # 集計: 不連続点として扱ったステップの数
 CTL_RETRIES = 5    # 集計: 捨てた試行の数
@@ -144,6 +225,9 @@ def run_switched(
     Q: np.ndarray,
     Pb: np.ndarray,
     Qb: np.ndarray,
+    Pd: np.ndarray,
+    Qd_start: np.ndarray,
+    Qd_end: np.ndarray,
     Rx: np.ndarray,
     Ru: np.ndarray,
     slot_code: np.ndarray,
@@ -174,14 +258,19 @@ def run_switched(
       2. 候補の状態で1ステップ試す。ステップの終わりで、オンのダイオードの電圧（= 電流 × r_on）が
          負、またはオフのダイオードの電圧が v_on を超えていたら、反転してやり直す。
          最初の n_simul 回は違反したものを同時に反転し、その後は番号の小さい1つだけを反転する。
-      3. 状態が直前の区間と変わったステップ（と電源の不連続点）から n_damp ステップ（1以上）は
-         後退オイラー、それ以外は台形則で進める。後退オイラーは状態量（E x）だけを引き継ぐので、
-         コンデンサ電圧とインダクタ電流は切り替えの前後で連続になる。台形則のままだと、
-         オフ抵抗を通るインダクタ電流のような硬い成分が、符号を変えながら残る。
+      3. 状態が直前の区間と変わったステップ（やり直したステップを含む）は、後退オイラーで進める。
+         後退オイラーでの判定は「このステップの終わりまでダイオードが導通し続けるか」と同じになり、
+         状態が1つに決まる。続く n_damp ステップは減衰ステップ（刻みより速い成分を消す。
+         遅い成分はほぼ厳密）、それ以外は台形則で進める。計算の先頭と電源の不連続点も、
+         そこから n_damp ステップを減衰ステップにする。
+         後退オイラーも減衰ステップも状態量（E x）だけを引き継ぐので、コンデンサ電圧と
+         インダクタ電流は切り替えの前後で連続になる。台形則のままだと、オフ抵抗を通る
+         インダクタ電流のような硬い成分が、符号を変えながら残る。
 
     行列（スロットごと）
       P, Q   : 台形則        x[k+1] = P x[k] + Q u_mid[k]
       Pb, Qb : 後退オイラー  x[k+1] = Pb x[k] + Qb u_end[k]
+      Pd, Qd_start, Qd_end : 減衰ステップ  x[k+1] = Pd x[k] + Qd_start u_start[k] + Qd_end u_end[k]
       Rx, Ru : 整合          x(t+) = Rx x(t-) + Ru u_start[k]
       slot_code[:n_slots] : 各スロットの回路状態の符号
     入力（時間格子上の配列）
@@ -254,9 +343,8 @@ def run_switched(
             xk = Rx[s_prev] @ xc + Ru[s_prev] @ u_start[k]
             disc = True
         cand = int(sw) | (code_prev & d_mask)
-        if cand != code_prev:
-            disc = True
-        be = disc or damp > 0
+        be = cand != code_prev                  # 状態が変わるステップは後退オイラー
+        left = n_damp if disc else damp         # このステップを含めた、減衰ステップの残り
         flips = 0
         s = s_prev
         while True:
@@ -274,6 +362,8 @@ def run_switched(
                     break
             if be:
                 xn = Pb[s] @ xk + Qb[s] @ u_end[k]
+            elif left > 0:
+                xn = Pd[s] @ xk + Qd_start[s] @ u_start[k] + Qd_end[s] @ u_end[k]
             else:
                 xn = P[s] @ xk + Q[s] @ u_mid[k]
 
@@ -300,7 +390,6 @@ def run_switched(
                 status = NOT_SETTLED
                 break
             cand ^= flip_all if flips <= n_simul else flip_first
-            disc = True
             be = True
         if status != DONE:
             break
@@ -309,11 +398,12 @@ def run_switched(
         n_retries += flips
         if event[k]:
             out[k] = xk
-        if disc:
+        if be or disc:
             n_changes += 1
-            damp = n_damp
-        if damp > 0:
-            damp -= 1
+        if be:
+            damp = n_damp                       # 後退オイラーの後に、減衰ステップを n_damp 回
+        elif left > 0:
+            damp = left - 1                     # このステップが減衰ステップだった
         if cand != code_prev:
             code_prev = cand
             s_prev = s

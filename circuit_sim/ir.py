@@ -25,7 +25,7 @@ class Quantity(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    value: float | None = None
+    value: float | None = Field(default=None, allow_inf_nan=False)
     unit: str
     source: str | None = None
 
@@ -35,8 +35,8 @@ class SimulationSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    t_end: float | None = Field(default=None, gt=0)
-    h: float | None = Field(default=None, gt=0)
+    t_end: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    h: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class Spec(BaseModel):
@@ -60,7 +60,7 @@ class Spec(BaseModel):
 class DC(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["dc"] = "dc"
-    value: float
+    value: float = Field(allow_inf_nan=False)
 
 
 class Step(BaseModel):
@@ -68,9 +68,9 @@ class Step(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     kind: Literal["step"] = "step"
-    initial: float = 0.0
-    final: float
-    t_step: float = Field(default=0.0, ge=0)
+    initial: float = Field(default=0.0, allow_inf_nan=False)
+    final: float = Field(allow_inf_nan=False)
+    t_step: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 class Sine(BaseModel):
@@ -78,10 +78,10 @@ class Sine(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     kind: Literal["sine"] = "sine"
-    amplitude: float
-    frequency: float = Field(gt=0)
-    phase_deg: float = 0.0
-    offset: float = 0.0
+    amplitude: float = Field(allow_inf_nan=False)
+    frequency: float = Field(gt=0, allow_inf_nan=False)
+    phase_deg: float = Field(default=0.0, allow_inf_nan=False)
+    offset: float = Field(default=0.0, allow_inf_nan=False)
 
 
 Waveform = Annotated[DC | Step | Sine, Field(discriminator="kind")]
@@ -111,7 +111,7 @@ class Component(BaseModel):
     nodes: tuple[str, str]
     value: float | None = None
     waveform: Waveform | None = None
-    ic: float = 0.0
+    ic: float = Field(default=0.0, allow_inf_nan=False)
     r_on: float | None = None
     r_off: float | None = None
     gate: str | None = None
