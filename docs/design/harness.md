@@ -1,6 +1,6 @@
 # 開発ハーネス
 
-最終更新: 2026-11-14
+最終更新: 2026-11-15（W1: Windows対応）
 
 アプリ本体と同じ考え方で開発も回す。**判断はAI、手順と合否の扱いは決定的なコード。**
 エージェントの呼び出しは決まった入口を通し、結果は構造化して保存し、ゲートの判定はスクリプトが行う。
@@ -11,7 +11,7 @@
 |---|---|---|
 | 作業ツリーとブランチの用意 | `scripts/cycle.py start` | 手順の抜けを無くす |
 | エージェントの起動 | `scripts/cycle.py run`（ヘッドレス） | 役割、仕様、道具、上限額を毎回同じ形で渡す |
-| 自動確認 | `scripts/cycle.py check`（中身は `scripts/check.sh`） | 通ったかどうかを記録に残す |
+| 自動確認 | `scripts/cycle.py check`（中身は `scripts/check.py`。ruff と pytest） | 通ったかどうかを記録に残す |
 | ゲートの記録 | `.cycle/state/<ID>.json` | 誰が、何を見て、どう判定したかを残す |
 | 統合の可否 | `scripts/cycle.py merge` | 条件を満たさない統合を機械的に拒む |
 
@@ -56,24 +56,28 @@ needs_ux: false
 
 見出しに書けるのは `id`、`owner`、`needs_ux`、`gates` の4つだけ。`needs_ux` は `true` か `false`（注釈や引用符は付けない）。それ以外の行、知らない値、`needs_ux` と `gates` の食い違い（`needs_ux: true` なのに `gates` に ux が無い、など）はエラーになる。
 
+コマンドは Windows、macOS、Linux で同じ（Linux / macOS では、先頭の `python` を省いて `scripts/cycle.py …` でもよい）。
+
 ```bash
-scripts/cycle.py start E1a            # 作業ツリー ../wt/E1a とブランチを用意
-scripts/cycle.py run E1a implement    # 担当（見出しの owner）をヘッドレスで起動
-scripts/cycle.py check E1a            # 自動確認
-scripts/cycle.py run E1a review       # code-reviewer
-scripts/cycle.py run E1a verify       # verifier
-scripts/cycle.py status E1a           # ゲートの状況と、統合できない理由
+python scripts/cycle.py start E1a            # 作業ツリー ../wt/E1a とブランチを用意
+python scripts/cycle.py run E1a implement    # 担当（見出しの owner）をヘッドレスで起動
+python scripts/cycle.py check E1a            # 自動確認（scripts/check.py）
+python scripts/cycle.py run E1a review       # code-reviewer
+python scripts/cycle.py run E1a verify       # verifier
+python scripts/cycle.py status E1a           # ゲートの状況と、統合できない理由
 # 作業ツリーでコミットしてから
-scripts/cycle.py merge E1a            # 条件を満たすときだけ main に取り込む（push は別）
+python scripts/cycle.py merge E1a            # 条件を満たすときだけ main に取り込む（push は別）
 ```
 
 セッション内でエージェントを動かしたときの記録:
 
 ```bash
-TREE=$(scripts/cycle.py snapshot E1a)     # 確認を始める前に、対象のツリーIDを控える
+TREE=$(python scripts/cycle.py snapshot E1a)     # 確認を始める前に、対象のツリーIDを控える
 # （エージェントが確認する）
-scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree "$TREE"
+python scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree "$TREE"
 ```
+
+PowerShell では、1行目を `$TREE = python scripts/cycle.py snapshot E1a` と書く。
 
 - `record` の `--tree` は review、verify、ux で必須。省けるのは implement だけ（いまの内容で記録する）。
 - 検証担当とUX担当は、受け入れ試験と記録を**新しいファイルとして**足す。既にあるファイルを書き換えると、レビューと検証がやり直しになる（2回目の記録は `docs/verification/<ID>-2.md` のように別の名前で置く）。
@@ -81,6 +85,7 @@ scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree 
 - `start` はやり直せる（記録は引き継ぐ）。ただし、ゲートの記録がある作業単位で見出しを変えた場合は `start E1a --reset` で記録を消してから、ゲートをやり直す。統合済みの作業単位は、`start` も `merge` もやり直せない。
 - review と verify は並行で走らせてよい。同じゲートを同時に2つ走らせた場合、後から終わった合格は採用されないことがある（表示に従ってやり直す）。
 - `claude` コマンドが無い環境では、`run` は記録を変えずにエラーで終わる。セッション内で動かして `record` で記録する。
+- 自動確認は、`cycle.py` を動かしているのと同じ Python で `scripts/check.py` を実行する。`scripts/check.py` が無い作業ツリーは `error` になる（合格にはならない）。
 
 ## 4. エージェントの動かし方は2通り
 
@@ -101,9 +106,8 @@ scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree 
 - スクリプトでは守れないこと:
   - 担当の名前（`--by`）と、セッション内の合否（`record --verdict`）は自己申告。記録ファイル（`.cycle/state/`）は手で書き換えられる。
   - main が先に進んでいると、取り込んだ結果は確認した内容と同じにならない。この差を見るのは、取り込んだ後の自動確認（決まり7）だけ。
-  - 例外の場所に足したファイルはレビューを通らない。`scripts/check.sh` 自体の書き換えを止めるのはレビュー。
+  - 例外の場所に足したファイルはレビューを通らない。`scripts/check.py` 自体の書き換えを止めるのはレビュー。
   - 取り込みの途中でプロセスが強制終了された場合（kill -9、電源断。道具の時間切れで止められた場合を含む）、確認の済んでいない取り込みコミットは、次に `merge` を実行するまで main に残る。`merge` が正常に終わらなかったら、push の前に `status` で「注意」が出ていないことを確かめる。
-  - ロックに `fcntl` を使うので、Linux / macOS / WSL が前提。
 
 ## 6. 記録の場所
 

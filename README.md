@@ -20,11 +20,30 @@
 
 ## 動かし方
 
+Python 3.11 以上。Windows と Linux は、GitHub上の自動テストで毎回確かめている。
+コマンドはどのOSでも同じ（macOS も同じコマンドを使う。自動テストには入れていない）。
+
 ```bash
-pip install -e ".[dev]"
-pytest                                             # 解析解との照合
+python -m pip install -e ".[dev]"
+python scripts/check.py                            # ruff と pytest（解析解との照合を含む）
 python -m circuit_sim examples/rlc_series.json --csv out.csv
 ```
+
+Windows（PowerShell）で、仮想環境を作るところから始める例:
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python scripts\doctor.py                           # 環境の確認（OS、Python、git、claude、確認の結果）
+python -m circuit_sim examples\rlc_series.json --csv out.csv
+```
+
+- 仕様ファイルは UTF-8 で保存する（メモ帳が付ける先頭の BOM は、あっても読める）。
+- 画面に出せない文字は置き換えて表示する。たとえば日本語 Windows で出力をファイルやパイプに送ると、
+  文字コードが cp932 になり、`µF` は `uF`、オーム記号は `ohm` と表示される。計算結果は変わらない。
+- `python scripts/doctor.py` は、開発の道具が動く環境かどうかを確かめる。結果は画面と
+  `.cycle/doctor-result.json` に出る（`docs/design/harness.md` の7章）。
 
 Pythonから:
 

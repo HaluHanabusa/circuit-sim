@@ -1,19 +1,52 @@
 name: CI
 on:
-  push:
-    branches: [main]
+  push:            # main に加えて、作業ブランチへの push でも走る
   pull_request:
+concurrency:       # 作業ブランチに続けて push したら、古いほうの実行は止める（main は、どのコミットも最後まで走らせる）
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # 同じリポジトリのブランチは push の側で走るので、プルリクエストでは重ねて走らせない（外からのものだけ）
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
-      - run: scripts/check.sh
+      - run: python -m pip install -e ".[dev]"
+      # 環境の確認スクリプトが scripts/check.py（ruff と pytest）を実行する。
+      # 確認が通らなければ、このステップは 0 でない終了コードで終わる
+      - name: check（scripts/doctor.py が scripts/check.py を実行する）
+        run: python scripts/doctor.py
+      - name: 環境の確認の結果（.cycle/doctor-result.json）
+        if: always()
+        shell: python
+        run: |
+          import json
+          import pathlib
+          result = json.loads(pathlib.Path(".cycle/doctor-result.json").read_text(encoding="utf-8"))
+          print(json.dumps(result, ensure_ascii=True, indent=2))
+          for name in ("os", "python", "git", "claude", "check", "headless"):
+              assert name in result, name
+          assert result["headless"] == {"ran": False, "reason": "not_requested"}, result["headless"]
+      # UTF-8 でない端末（日本語 Windows の cp932）でも、例外で落ちないこと
+      - name: cp932 の端末で実行（examples/rlc_series.json）
+        env:
+          PYTHONIOENCODING: cp932
+        run: python -m circuit_sim examples/rlc_series.json
+      - name: cp932 の端末で実行（µ と Ω を含む注意が出る仕様）
+        env:
+          PYTHONIOENCODING: cp932
+        run: python -m circuit_sim tests/data/rc_lowpass_prefixed_units.json

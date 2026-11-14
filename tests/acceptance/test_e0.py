@@ -23,6 +23,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -755,10 +756,12 @@ def test_c7_same_input_gives_bit_identical_result_across_processes(tmp_path):
     here = simulate(Netlist.model_validate(json.loads(text)), 2e-3, 1e-6)
     expected = hashlib.sha256(here.x.tobytes() + here.t.tobytes()).hexdigest()
     for seed in ("0", "4242"):
+        env = {"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin", "PYTHONPATH": str(REPO)}
+        if "SYSTEMROOT" in os.environ:      # Windows では、これが無いと別プロセスの Python を起動できない
+            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
         out = subprocess.run(
             [sys.executable, "-c", _DIGEST_SNIPPET.format(text=text)],
-            cwd=REPO, env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin", "PYTHONPATH": str(REPO)},
-            capture_output=True, text=True, check=True,
+            cwd=REPO, env=env, capture_output=True, text=True, check=True,
         )
         assert out.stdout.strip() == expected
 
