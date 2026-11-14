@@ -25,7 +25,7 @@ class Quantity(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    value: float | None = None
+    value: float | None = Field(default=None, allow_inf_nan=False)
     unit: str
     source: str | None = None
 
@@ -35,8 +35,8 @@ class SimulationSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    t_end: float | None = Field(default=None, gt=0)
-    h: float | None = Field(default=None, gt=0)
+    t_end: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    h: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class Spec(BaseModel):
@@ -60,7 +60,7 @@ class Spec(BaseModel):
 class DC(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["dc"] = "dc"
-    value: float
+    value: float = Field(allow_inf_nan=False)
 
 
 class Step(BaseModel):
@@ -68,9 +68,9 @@ class Step(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     kind: Literal["step"] = "step"
-    initial: float = 0.0
-    final: float
-    t_step: float = Field(default=0.0, ge=0)
+    initial: float = Field(default=0.0, allow_inf_nan=False)
+    final: float = Field(allow_inf_nan=False)
+    t_step: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 class Sine(BaseModel):
@@ -78,31 +78,43 @@ class Sine(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     kind: Literal["sine"] = "sine"
-    amplitude: float
-    frequency: float = Field(gt=0)
-    phase_deg: float = 0.0
-    offset: float = 0.0
+    amplitude: float = Field(allow_inf_nan=False)
+    frequency: float = Field(gt=0, allow_inf_nan=False)
+    phase_deg: float = Field(default=0.0, allow_inf_nan=False)
+    offset: float = Field(default=0.0, allow_inf_nan=False)
 
 
 Waveform = Annotated[DC | Step | Sine, Field(discriminator="kind")]
 
 
+DEFAULT_R_ON = 1e-3    # S と D のオン抵抗の既定値 [ohm]
+DEFAULT_R_OFF = 1e6    # S と D のオフ抵抗の既定値 [ohm]
+
+
 class Component(BaseModel):
     """2端子素子。
 
-    type  : R [ohm], L [H], C [F], V = 電圧源 [V], I = 電流源 [A]
+    type  : R [ohm], L [H], C [F], V = 電圧源 [V], I = 電流源 [A],
+            S = 制御スイッチ, D = ダイオード（順方向電圧は 0）
     nodes : (n+, n-)。電流の正方向は素子の中を n+ から n- へ（SPICEと同じ）。
+            D はアノードが n+、カソードが n-。
     ic    : 初期値。C は n+ 側を正とした電圧 [V]、L は n+ → n- の電流 [A]。
+    r_on  : S と D のオン抵抗 [ohm]。省略すると 1 mΩ。
+    r_off : S と D のオフ抵抗 [ohm]。省略すると 1 MΩ。
+    gate  : S を動かすゲート信号の名前（信号そのものは計算の入口に渡す）。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    type: Literal["R", "L", "C", "V", "I"]
+    type: Literal["R", "L", "C", "V", "I", "S", "D"]
     nodes: tuple[str, str]
     value: float | None = None
     waveform: Waveform | None = None
-    ic: float = 0.0
+    ic: float = Field(default=0.0, allow_inf_nan=False)
+    r_on: float | None = None
+    r_off: float | None = None
+    gate: str | None = None
 
     @model_validator(mode="after")
     def _check(self) -> Component:
@@ -113,14 +125,40 @@ class Component(BaseModel):
                 raise ValueError(f"{self.id}: value は正の有限値が必要（現在 {self.value}）")
             if self.waveform is not None:
                 raise ValueError(f"{self.id}: {self.type} に waveform は指定できない")
-        else:
+        elif self.type in ("V", "I"):
             if self.waveform is None:
                 raise ValueError(f"{self.id}: 電源には waveform が必要")
             if self.value is not None:
                 raise ValueError(f"{self.id}: 電源の値は waveform で指定する")
+        else:
+            self._check_switching()
+        if self.type not in ("S", "D") and (self.r_on is not None or self.r_off is not None):
+            raise ValueError(f"{self.id}: r_on / r_off を指定できるのは S と D だけ")
+        if self.type != "S" and self.gate is not None:
+            raise ValueError(f"{self.id}: gate を指定できるのは S だけ")
         if self.ic != 0.0 and self.type not in ("L", "C"):
             raise ValueError(f"{self.id}: ic を指定できるのは L と C だけ")
         return self
+
+    def _check_switching(self) -> None:
+        """S と D の検証。オン抵抗とオフ抵抗の既定値もここで入れる。"""
+        if self.value is not None or self.waveform is not None:
+            raise ValueError(
+                f"{self.id}: {self.type} に value / waveform は指定できない（r_on / r_off を使う）"
+            )
+        if self.r_on is None:
+            self.r_on = DEFAULT_R_ON
+        if self.r_off is None:
+            self.r_off = DEFAULT_R_OFF
+        for name, r in (("r_on", self.r_on), ("r_off", self.r_off)):
+            if not math.isfinite(r) or r <= 0:
+                raise ValueError(f"{self.id}: {name} は正の有限値が必要（現在 {r}）")
+        if self.r_on >= self.r_off:
+            raise ValueError(
+                f"{self.id}: r_on（{self.r_on}）は r_off（{self.r_off}）より小さくする"
+            )
+        if self.type == "S" and not self.gate:
+            raise ValueError(f"{self.id}: スイッチにはゲート信号の名前 gate が必要")
 
 
 class Netlist(BaseModel):
