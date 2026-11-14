@@ -21,7 +21,6 @@ from test_harness import (
     fake_claude,
     headless,
     install_claude,
-    path_without_claude,
     was_run,
     write_text_like_windows,
 )
@@ -608,12 +607,11 @@ def test_doctor_does_not_run_a_claude_placed_inside_the_repository(root, tmp_pat
     """本体の中に置かれた claude は、PATH に書かれていても使わない（版を聞くための起動もしない）。"""
     planted = root / "tools"
     install_claude(planted, good_output())
-    env = {"PATH": f"{planted}{os.pathsep}{path_without_claude()}"}
-    code, result, _ = doctor(root, "--no-check", "--headless", env=env)
+    # PATH には、置いた場所だけを書く（使わなかった先で、本物の claude に届かないように）
+    code, result, _ = doctor(root, "--no-check", "--headless", env={"PATH": str(planted)})
     assert code == 1
     assert result["claude"] == {"found": False, "api_key_env_set": False}
     assert result["headless"] == {"ran": False, "reason": "claude_not_found"}
-    assert result["git"]["found"] is True           # 本体の外にある git は、これまでどおり見つかる
     assert not was_run(planted)
 
 

@@ -211,6 +211,11 @@ def command_file_names(name: str) -> list[str]:
     return [name + extension for extension in extensions.split(os.pathsep) if extension]
 
 
+def real_path(path: str | Path) -> Path:
+    """リンクや .. をたどった先の場所（比べるための形。たどれない所があっても、例外にしない）。"""
+    return Path(os.path.realpath(path))
+
+
 def is_inside(path: Path, tree: Path) -> bool:
     return path == tree or tree in path.parents
 
@@ -224,12 +229,12 @@ def find_command(name: str, avoid: Iterable[Path] = ()) -> str | None:
     - PATH の項目のうち、空のものと相対パスのもの（実行した場所によって、指す先が変わる）。
     - avoid に渡した場所の中（作業ツリーと本体。無視の対象のファイルは、ゲートが見る内容に入らない）。
     """
-    here = Path.cwd().resolve()
-    trees = [Path(tree).resolve() for tree in avoid]
+    here = real_path(os.getcwd())
+    trees = [real_path(tree) for tree in avoid]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not os.path.isabs(entry):
             continue
-        directory = Path(entry).resolve()
+        directory = real_path(entry)
         if directory == here or any(is_inside(directory, tree) for tree in trees):
             continue
         for file_name in command_file_names(name):

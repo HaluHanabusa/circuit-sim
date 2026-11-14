@@ -306,18 +306,6 @@ def fake_claude(
 CLAUDE_FILES = ("claude", "claude.exe", "claude.cmd", "claude.bat")
 
 
-def path_without_claude() -> str:
-    """いまの PATH から、claude のある場所を除いたもの（git などは残る）。
-
-    偽の claude を「採らない」ことを確かめる試験で使う。採らなかった先で、本物の claude を起動しないため。
-    """
-    def has_claude(entry: str) -> bool:
-        return any((Path(entry) / name).exists() for name in CLAUDE_FILES)
-
-    entries = os.environ["PATH"].split(os.pathsep)
-    return os.pathsep.join(entry for entry in entries if entry and not has_claude(entry))
-
-
 def was_run(directory: Path) -> bool:
     """directory に置いた偽の claude が、一度でも起動されたか。"""
     return (directory / "argv.json").exists()
@@ -892,14 +880,14 @@ def test_dry_run_shows_headless_command_for_the_right_agent(repo):
 def test_dry_run_line_starts_the_same_command_when_pasted_into_a_terminal(repo, tmp_path):
     """--dry-run の1行を端末（Windows ではコマンド プロンプト）に渡すと、同じ場所で同じ引数の claude が動く。
 
-    引数を引用符で囲まずに並べると、指示（空白を含む）と結果の形の指定（JSON）が、別々の引数に割れる。
+    引用符で囲まずに並べると、空白を含むもの（作業ツリーの場所、指示、結果の形の指定）が、途中で割れる。
     """
-    wt = implement(repo)
+    wt = tmp_path / "work tree"
+    assert cycle(repo, "start", "U1", "--worktree", str(wt)).returncode == 0
     line = cycle(repo, "run", "U1", "review", "--dry-run").stdout.strip()
     seen = tmp_path / "cwd.txt"
     script = f"pathlib.Path({str(seen)!r}).write_text(str(pathlib.Path.cwd()), encoding='utf-8')"
-    install_claude(tmp_path / "bin", headless(), script=script)
-    env = {**TEST_ENV, "PATH": f"{tmp_path / 'bin'}{os.pathsep}{path_without_claude()}"}
+    env = {**TEST_ENV, **fake_claude(tmp_path, headless(), script=script)}
     proc = subprocess.run(
         line, shell=True, env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
     )
@@ -1161,16 +1149,15 @@ def test_directory_named_like_the_command_is_not_taken_for_it(repo, tmp_path):
     decoy = tmp_path / "decoy"
     for name in CLAUDE_FILES:
         (decoy / name).mkdir(parents=True)
-    install_claude(tmp_path / "bin", headless())
-    path = os.pathsep.join([str(decoy), str(tmp_path / "bin"), path_without_claude()])
-    assert cycle(repo, "run", "U1", "review", env={"PATH": path}).returncode == 0
+    env = fake_claude(tmp_path, headless())
+    env = {"PATH": f"{decoy}{os.pathsep}{env['PATH']}"}
+    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
 
 
 def test_claude_is_found_when_pathext_is_not_set(repo, tmp_path):
     """Windows で環境変数 PATHEXT が無くても、claude.exe、claude.cmd、claude.bat は見つかる。"""
     implement(repo)
-    install_claude(tmp_path / "bin", headless())
-    env = {"PATH": f"{tmp_path / 'bin'}{os.pathsep}{path_without_claude()}", "PATHEXT": ""}
+    env = {**fake_claude(tmp_path, headless()), "PATHEXT": ""}
     assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
 
 
@@ -1235,9 +1222,9 @@ def test_claude_on_path_is_used_when_another_one_is_in_the_place_of_execution(re
     implement(repo)
     here = tmp_path / "here"
     install_claude(here, headless(session="planted"))
-    install_claude(tmp_path / "bin", headless(session="installed"))
+    installed = fake_claude(tmp_path, headless(session="installed"))["PATH"]
     monkeypatch.chdir(here)
-    path = os.pathsep.join([str(here), ".", str(tmp_path / "bin"), path_without_claude()])
+    path = os.pathsep.join([str(here), ".", installed])
     assert cycle(repo, "run", "U1", "review", env={"PATH": path}).returncode == 0
     assert state(repo)["gates"]["review"]["by"] == "installed"
     assert not was_run(here)
@@ -1252,6 +1239,33 @@ def test_places_to_avoid_are_compared_after_resolving_them(tmp_path):
         assert CYCLE_MODULE.find_command("claude", [tmp_path / "other" / ".." / "tree"]) is None
         found = CYCLE_MODULE.find_command("claude", [tmp_path / "other"])
     assert found is not None and Path(found).is_absolute() and Path(found).parent == tools
+
+
+def test_place_reached_through_a_link_counts_as_the_place_it_leads_to(tmp_path):
+    """別の名前（リンクなど）で指していても、たどった先が採らない場所なら採らない。
+
+    リンクを作れない環境（権限の無い Windows）でも確かめられるよう、たどり方（os.path.realpath）を差し替えて、
+    alias が tree/tools へのリンクであるかのように振る舞わせる。
+    """
+    alias, tree = tmp_path / "alias", tmp_path / "tree"
+    install_claude(alias, headless())
+    tree.mkdir()
+    realpath = os.path.realpath
+    target = os.path.join(realpath(tree), "tools")
+
+    def through_link(path, **kwargs):
+        resolved = realpath(path, **kwargs)
+        return target if resolved == realpath(alias) else resolved
+
+    with mock.patch.dict(os.environ, {"PATH": str(alias)}):
+        assert CYCLE_MODULE.find_command("claude", [tree]) is not None      # 差し替える前は、見つかる
+        with mock.patch.object(os.path, "realpath", through_link):
+            # PATH の項目が、採らない場所（tree の中）へのリンク
+            assert CYCLE_MODULE.find_command("claude", [tree]) is None
+            # 実行した場所が、リンクの名前で返ってくる（PATH の項目と同じ場所）
+            with mock.patch.object(os, "getcwd", return_value=str(alias)):
+                assert CYCLE_MODULE.find_command("claude") is None
+            assert CYCLE_MODULE.find_command("claude") is not None
 
 
 def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, tmp_path):
