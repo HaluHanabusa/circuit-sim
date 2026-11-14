@@ -25,7 +25,8 @@
 1. 計画は `docs/plan/roadmap.md`。現在地とPO向けの要約は `docs/plan/po-board.md`。
 2. 作業単位は `milestone-cycle` スキルの手順で進める（仕様 → 実装 → レビュー → 独立検証 → UX確認 → 統合 → 報告）。
 3. 数値モデルを足す・変えるときは `model-validation` スキルに従って検証を付ける。
-4. 設計は `docs/design/`、決定は `docs/decisions.md` に追記する。
+4. ゲートの記録と統合は `scripts/cycle.py` を通す（`docs/design/harness.md`）。条件を満たさない統合はスクリプトが拒む。手で `git merge` しない。
+5. 設計は `docs/design/`、決定は `docs/decisions.md` に追記する。
 
 ## コマンド
 
@@ -33,6 +34,7 @@
 pip install -e ".[dev]"
 scripts/check.sh                                  # ruff + pytest。統合前に必ず通す
 python -m circuit_sim examples/rlc_series.json    # 仕様JSONから計算
+scripts/cycle.py status                           # 作業単位ごとのゲートの状況
 ```
 
 ## 守る決まり
