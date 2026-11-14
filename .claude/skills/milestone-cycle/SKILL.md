@@ -27,6 +27,7 @@ description: 回路シミュレータの作業単位（機能やマイルスト�
 
 1. `docs/plan/roadmap.md` から次の作業単位を選ぶ。依存する作業が終わっているか確かめる。
 2. 仕様ファイルを書く。先頭に見出し（`id`、`owner`、`needs_ux`）を付ける。受け入れ基準は「何を、どう測り、いくつなら合格か」まで書く。根拠の無い数字を置かない。
+   見出しに書けるのは `id`、`owner`、`needs_ux`（`true` か `false` だけ）、`gates` の4つ。それ以外の行や値、`needs_ux` と `gates` の食い違いは `start` がエラーにする。ゲートを記録した後で見出しを変えると `start` も `merge` も拒む。変えるなら `scripts/cycle.py start <ID> --reset` で記録を消し、ゲートをやり直す。
 3. 画面を含む作業は、先に ux-designer に画面仕様を書かせ、それを仕様から参照する。
 4. 範囲が1回の実装で収まらないなら、a / b に割る。
 
@@ -40,14 +41,17 @@ description: 回路シミュレータの作業単位（機能やマイルスト�
 
 ### G2 / G3 / G4 確認を委任する
 
-1. code-reviewer と verifier は並行で走らせてよい。どちらにも実装者の報告を鵜呑みにしないよう伝える。ヘッドレスなら `scripts/cycle.py run <ID> review` と `run <ID> verify`。セッション内なら、先に `scripts/cycle.py snapshot <ID>` で対象のツリーIDを控え、終わったら `record <ID> <gate> --verdict … --by … --tree <控えたID>` で記録する。
+1. code-reviewer と verifier は並行で走らせてよい。どちらにも実装者の報告を鵜呑みにしないよう伝える。ヘッドレスなら `scripts/cycle.py run <ID> review` と `run <ID> verify`。セッション内なら、確認を始める前に `scripts/cycle.py snapshot <ID>` で対象のツリーIDを控え、終わったら `record <ID> <gate> --verdict … --by … --tree <控えたID>` で記録する（review、verify、ux では `--tree` が必須）。
 2. verifier には仕様（受け入れ基準）と作業場所を渡す。実装者と同じ実行を検証役に使わない。
+   verifier と ux-designer には、受け入れ試験（`tests/acceptance/`）と記録（`docs/verification/`）を**新しいファイルとして**足すよう伝える。既にあるファイルの書き換え、削除、名前の変更は、製品コードの変更と同じ扱いになり、レビューと検証がやり直しになる（2回目の記録は別のファイル名で置く）。
 3. 指摘が出たら実装担当に戻す。**同じ作業で3回戻っても通らなければ**、仕様か設計に問題がある。仕様を見直し、必要なら `po-board.md` の「止まっていること」に書く。
 4. 基準を満たせないと分かったら、基準を黙って緩めない。緩めるなら `docs/decisions.md` に理由を書く。
 
 ### G5 統合する
 
 1. `scripts/cycle.py status <ID>` で統合できることを確かめ、作業ツリーでコミットし、`scripts/cycle.py merge <ID>` で `main` に取り込む。その後 push し、作業ツリーを片付ける。
+   取り込まれるのは作業ツリーの HEAD のコミット。作業ツリーはブランチの上に置いたままにする（切り離さない）。本体のチェックアウトは `main` で、未コミットの変更が無い状態にしておく。競合や、取り込んだ後の確認の失敗で取り込めなかったときは、スクリプトが本体を元に戻す。作業ツリー側で `main` を取り込んで直し、ゲートをやり直す。
+   `merge` は、取り込んだ後の確認が終わるまで掛かる。道具の時間切れを十分に長く取り、途中で打ち切らない。途中で止まった場合は、push の前に `scripts/cycle.py status` を見る。「注意: 前回の統合が途中で終わっている」と出たら、確認の済んでいない取り込みが `main` に残っているので、`merge` をもう一度実行して戻す。
 2. `docs/plan/roadmap.md` の状態、`CHANGELOG.md`、設計の決定があれば `docs/decisions.md` を更新する。
 3. リリースの区切りなら release-manager に文書と配布物の確認を頼む。
 
