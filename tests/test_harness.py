@@ -364,6 +364,10 @@ def test_merge_succeeds_when_all_gates_pass(repo):
     report = state(repo)["gates"]["check"]["report"]
     assert report.startswith(".cycle/runs/U1-check-") and (repo / report).is_file()
     assert state(repo)["spec"] == "docs/plan/U1-demo.md"
+    # どの経路の記録かも残る
+    assert {gate: entry["source"] for gate, entry in state(repo)["gates"].items()} == {
+        "implement": "session", "review": "session", "verify": "session", "check": "script",
+    }
     assert not (repo / ".cycle" / "merge-pending.json").exists()
     assert "U1（docs/plan/U1-demo.md、担当 solver-engineer）  統合済み" in cycle(repo, "status", "U1").stdout
 
@@ -450,11 +454,42 @@ def test_contradicting_or_unreadable_header_is_rejected(repo, extra, message):
     assert not (repo / ".cycle" / "state" / "U1.json").exists()
 
 
-def test_spec_without_header_is_rejected(repo):
-    (repo / "docs" / "plan" / "U1-demo.md").write_text("# 見出しなし\n", encoding="utf-8")
+@pytest.mark.parametrize("text, message", [
+    ("# 見出しなし\n", "先頭に --- で囲んだ見出し"),
+    ("# U1\nid: U1\nowner: solver-engineer\n---\n", "先頭に --- で囲んだ見出し"),    # 1行目が --- でない
+    ("---\nid: U1\nowner: solver-engineer\n", "見出しが --- で閉じられていない"),
+    ("---\nowner: solver-engineer\n---\n", "見出しに id が無い"),
+    ("---\nid: U1\n---\n", "見出しに owner が無い"),
+    ("---\nid: U1\nowner:\n---\n", "見出しに owner が無い"),
+])
+def test_spec_without_a_complete_header_is_rejected(repo, text, message):
+    (repo / "docs" / "plan" / "U1-demo.md").write_text(text, encoding="utf-8")
     result = cycle(repo, "start", "U1")
     assert result.returncode == 2
-    assert "見出し" in result.stderr
+    assert message in result.stderr
+    assert not (repo / ".cycle" / "state" / "U1.json").exists()
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_unit_needs_exactly_one_spec(repo, count):
+    spec = repo / "docs" / "plan" / "U1-demo.md"
+    if count == 0:
+        spec.unlink()
+    else:
+        spec.with_name("U1-other.md").write_text(SPEC, encoding="utf-8")
+    result = cycle(repo, "start", "U1")
+    assert result.returncode == 2
+    assert f"U1 の仕様が1つだけ必要（見つかった数: {count}）" in result.stderr
+    assert not (repo / ".cycle" / "state" / "U1.json").exists()
+
+
+def test_state_file_of_another_shape_is_rejected(repo):
+    implement(repo)
+    (repo / ".cycle" / "state" / "U1.json").write_text("[]", encoding="utf-8")
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 2
+    assert "U1.json の形が正しくない" in result.stderr
+    assert main_log(repo) == ["init"]
 
 
 def test_spec_for_another_id_is_rejected(repo):
@@ -937,21 +972,28 @@ def test_missing_claude_is_reported_clearly(repo, tmp_path):
     assert "review" not in state(repo)["gates"]
 
 
-def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path):
+@pytest.mark.parametrize("gate, agent, tools", [
+    ("implement", "solver-engineer", "Read,Edit,Write,Bash,Grep,Glob"),
+    ("review", "code-reviewer", "Read,Bash,Grep,Glob"),             # レビューは、書き換える道具を持たない
+    ("verify", "verifier", "Read,Edit,Write,Bash,Grep,Glob"),
+    ("ux", "ux-designer", "Read,Edit,Write,Bash,Grep,Glob"),
+])
+def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path, gate, agent, tools):
     """役割、指示、結果の形の指定が、起動用のファイル（Windows では claude.cmd）を通っても崩れない。"""
     implement(repo)
     env = fake_claude(tmp_path, headless())
-    assert cycle(repo, "run", "U1", "review", "--budget", "2.5", env=env).returncode == 0
-    report = state(repo)["gates"]["review"]["report"]
-    assert report.startswith(".cycle/runs/U1-review-") and (repo / report).is_file()
+    assert cycle(repo, "run", "U1", gate, "--budget", "2.5", env=env).returncode == 0
+    entry = state(repo)["gates"][gate]
+    assert entry["source"] == "headless"
+    assert entry["report"].startswith(f".cycle/runs/U1-{gate}-") and (repo / entry["report"]).is_file()
     argv = claude_argv(tmp_path)
     assert argv[0] == "-p"
-    assert argv[1] == CYCLE_MODULE.GATE_PROMPT["review"].format(spec="docs/plan/U1-demo.md")
+    assert argv[1] == CYCLE_MODULE.GATE_PROMPT[gate].format(spec="docs/plan/U1-demo.md")
     options = dict(zip(argv[2::2], argv[3::2], strict=True))
     assert json.loads(options.pop("--json-schema")) == CYCLE_MODULE.VERDICT_SCHEMA
     assert options == {
-        "--agent": "code-reviewer", "--output-format": "json", "--permission-mode": "acceptEdits",
-        "--max-budget-usd": "2.5", "--allowedTools": "Read,Bash,Grep,Glob",
+        "--agent": agent, "--output-format": "json", "--permission-mode": "acceptEdits",
+        "--max-budget-usd": "2.5", "--allowedTools": tools,
     }
 
 

@@ -153,7 +153,7 @@ PowerShell では、1行目を `$TREE = python scripts/cycle.py snapshot E1a` �
 - Linux（Python 3.11、3.12、3.13）と Windows（3.11、3.13）。
 - 中身は `python scripts/doctor.py`（その中で `scripts/check.py` = ruff と pytest）と、cp932 の端末（`PYTHONIOENCODING=cp932`）での `python -m circuit_sim` の実行2件。
 - Windows の実行は、文字コードの設定を足していない素の状態（既定の文字コードは UTF-8 ではない）で流す。
-- ハーネスの試験は Windows でも同じものが走る。スキップするのは、Windows に無い機能そのものを試す3件（他のプロセスへ SIGINT、SIGTERM、SIGHUP を送って `merge` を止める試験）だけ。その代わりに、Ctrl-Break で止める試験が Windows でだけ走る（Linux では、この1件をスキップする）。Ctrl-C で止めた場合の取り消しは、同じプロセスの中で起こす試験が、どのOSでも確かめる。スキップした試験と理由は、実行ログの最後に一覧で出る（`pytest -rs`）。
+- ハーネスの試験は Windows でも同じものが走る。スキップするのは、Windows に無い機能そのものを試す3件（他のプロセスへ SIGINT、SIGTERM、SIGHUP を送って `merge` を止める試験）だけ。その代わりに、Windows にだけある挙動を試す2件（Ctrl-Break で止める試験、他のプログラムが開いたままの状態ファイルを置き換える試験）が Windows でだけ走る（Linux では、この2件をスキップする）。Ctrl-C で止めた場合の取り消しは、同じプロセスの中で起こす試験が、どのOSでも確かめる。スキップした試験と理由は、実行ログの最後に一覧で出る（`pytest -rs`）。
 
 ### 環境の確認（`scripts/doctor.py`）
 

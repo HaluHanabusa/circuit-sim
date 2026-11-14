@@ -4,6 +4,8 @@
 接頭語つきの単位を換算した注意を、そのまま出そうとすると例外になる。
 tests/data/rc_lowpass_prefixed_units.json は、その2つの文字を単位に使った仕様。
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -74,6 +76,17 @@ def test_replacement_table(encoding):
     # その文字コードで表せる文字は、置き換えない
     kept = text.encode(encoding, errors="circuit_sim.plain").decode(encoding)
     assert kept == (plain if encoding == "ascii" else "u \u03bc \u03a9 ohm \u2192 ?")
+    # 置き換えるのは、書き出すときだけ。読めないバイト列を、黙って別の文字にはしない
+    with pytest.raises(UnicodeDecodeError):
+        b"\xff".decode("ascii", errors="circuit_sim.plain")
+
+
+def test_output_that_is_not_a_terminal_is_left_as_it_is():
+    """出力先がプログラムの中の文字列（文字コードの設定を持たない）でも、そのまま動く。"""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli_main([str(ROOT / PREFIXED)]) == 0
+    assert "注意: C: 10 \u00b5F を 1e-05 F に換算した" in out.getvalue()
 
 
 def test_spec_saved_with_a_byte_order_mark_is_read(tmp_path, capsys):

@@ -24,7 +24,7 @@ STEPS = (
 
 def main() -> int:
     for step in STEPS:
-        code = subprocess.run(step, cwd=ROOT).returncode
+        code = subprocess.run(step, cwd=ROOT, check=False).returncode
         if code != 0:
             return code
     return 0

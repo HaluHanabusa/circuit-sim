@@ -6,6 +6,7 @@ scripts/check.py の本物も起動しない（その中で pytest が走り、�
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,49 @@ def test_check_runs_at_the_top_of_the_repository(tmp_path):
     code = f"import os, pathlib; pathlib.Path({str(out)!r}).write_text(os.getcwd(), encoding='utf-8')"
     assert run_steps([code]) == 0
     assert Path(out.read_text(encoding="utf-8")).resolve() == ROOT
+
+
+def run_copy_of_check(base: Path, files: dict[str, str]) -> tuple[int, str]:
+    """check.py を別の場所に写して、コマンドラインから実行する（ruff と pytest は、そこの files を見る）。"""
+    (base / "scripts").mkdir()
+    shutil.copy(ROOT / "scripts" / "check.py", base / "scripts" / "check.py")
+    # ruff の設定は、この試験用のもの（使っていない import などを見る）
+    (base / "ruff.toml").write_text('[lint]\nselect = ["F"]\n', encoding="utf-8")
+    for name, text in files.items():
+        (base / name).write_text(text, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(base / "scripts" / "check.py")], capture_output=True,
+        text=True, encoding="utf-8", errors="replace", env=TEST_ENV,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+PASSING_TEST = "def test_ok():\n    assert True\n"
+
+
+def test_check_script_passes_clean_code_with_passing_tests(tmp_path):
+    code, output = run_copy_of_check(tmp_path, {"test_sample.py": PASSING_TEST})
+    assert code == 0, output
+    assert "All checks passed" in output and "1 passed" in output
+
+
+def test_check_script_fails_on_a_lint_error_without_running_the_tests(tmp_path):
+    files = {"unused.py": "import os\n", "test_sample.py": PASSING_TEST}
+    code, output = run_copy_of_check(tmp_path, files)
+    assert code != 0
+    assert "F401" in output and "1 passed" not in output
+
+
+def test_check_script_fails_on_a_failing_test_and_lists_skipped_tests(tmp_path):
+    test = (
+        "import pytest\n\n\n"
+        "@pytest.mark.skip(reason='not on this OS')\ndef test_skipped():\n    pass\n\n\n"
+        "def test_broken():\n    assert False\n"
+    )
+    code, output = run_copy_of_check(tmp_path, {"test_sample.py": test})
+    assert code == 1
+    assert "1 failed, 1 skipped" in output
+    assert "SKIPPED [1] test_sample.py:4: not on this OS" in output
 
 
 # ------------------------------------------------------------ scripts/doctor.py
