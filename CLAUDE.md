@@ -31,11 +31,14 @@
 
 ## コマンド
 
+コマンドは Windows、macOS、Linux で同じ（Linux / macOS では `scripts/check.sh`、`scripts/cycle.py …` の形でもよい）。
+
 ```bash
-pip install -e ".[dev]"
-scripts/check.sh                                  # ruff + pytest。統合前に必ず通す
+python -m pip install -e ".[dev]"
+python scripts/check.py                           # ruff + pytest。統合前に必ず通す
 python -m circuit_sim examples/rlc_series.json    # 仕様JSONから計算
-scripts/cycle.py status                           # 作業単位ごとのゲートの状況
+python scripts/cycle.py status                    # 作業単位ごとのゲートの状況
+python scripts/doctor.py                          # 環境の確認（OS、Python、git、claude、確認の結果）
 ```
 
 ## 守る決まり
@@ -53,8 +56,8 @@ scripts/cycle.py status                           # 作業単位ごとのゲー�
 
 ## ブランチと完了の定義
 
-- `main` は常に `scripts/check.sh` が通る状態にする。作業はブランチで行い、ゲートを通ってから統合する。
-- 完了 = 仕様の受け入れ基準を満たす ＋ `scripts/check.sh` が通る ＋ code-reviewer の重大な指摘がゼロ ＋ verifier が合格 ＋（画面を含む場合）ux-designer が合格 ＋ `roadmap.md` と `po-board.md` を更新。
+- `main` は常に `python scripts/check.py`（`scripts/check.sh` も同じもの）が通る状態にする。作業はブランチで行い、ゲートを通ってから統合する。
+- 完了 = 仕様の受け入れ基準を満たす ＋ `python scripts/check.py` が通る ＋ code-reviewer の重大な指摘がゼロ ＋ verifier が合格 ＋（画面を含む場合）ux-designer が合格 ＋ `roadmap.md` と `po-board.md` を更新。
 - 実装した本人（同じエージェントの同じ実行）は、その成果の検証役を兼ねない。
 
 ## POの判断が必要なこと

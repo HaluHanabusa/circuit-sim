@@ -1,6 +1,6 @@
 # 開発ハーネス
 
-最終更新: 2026-11-14
+最終更新: 2026-11-15（W1: Windows対応。レビューと独立検証の指摘の修正を含む）
 
 アプリ本体と同じ考え方で開発も回す。**判断はAI、手順と合否の扱いは決定的なコード。**
 エージェントの呼び出しは決まった入口を通し、結果は構造化して保存し、ゲートの判定はスクリプトが行う。
@@ -11,7 +11,7 @@
 |---|---|---|
 | 作業ツリーとブランチの用意 | `scripts/cycle.py start` | 手順の抜けを無くす |
 | エージェントの起動 | `scripts/cycle.py run`（ヘッドレス） | 役割、仕様、道具、上限額を毎回同じ形で渡す |
-| 自動確認 | `scripts/cycle.py check`（中身は `scripts/check.sh`） | 通ったかどうかを記録に残す |
+| 自動確認 | `scripts/cycle.py check`（中身は `scripts/check.py`。ruff と pytest） | 通ったかどうかを記録に残す |
 | ゲートの記録 | `.cycle/state/<ID>.json` | 誰が、何を見て、どう判定したかを残す |
 | 統合の可否 | `scripts/cycle.py merge` | 条件を満たさない統合を機械的に拒む |
 
@@ -38,7 +38,7 @@
 8. 記録を失わない。記録の瞬間にロックを取り、状態を読み直してから書く。実行中に同じゲートの別の記録（または記録の消去）が入ったら、先に始めた実行の合格は採用しない（履歴には残す）。統合は1つずつ行う。
 9. どのコマンドも、作業ツリーの索引（選んでステージした状態、競合の解決の途中）を変えない。内容のツリーIDは一時的な索引で計算する。
 
-この決まりは `tests/test_harness.py` で確かめている。テストは、スクリプトの決まりを1つ外すと落ちるように書いてあり、スクリプトを1か所ずつ壊して全テストを流す方法で確かめた（139通りの壊し方のすべてで、テストが落ちる）。決まりを足すときは、それを外すと落ちるテストを一緒に足す。
+この決まりは `tests/test_harness.py` で確かめている。テストは、スクリプトの決まりを1つ外すと落ちるように書いてあり、スクリプトを1か所ずつ壊して全テストを流す方法で確かめている（件数と結果は5章）。決まりを足すときは、それを外すと落ちるテストを一緒に足す。
 
 ## 3. 使い方
 
@@ -56,24 +56,28 @@ needs_ux: false
 
 見出しに書けるのは `id`、`owner`、`needs_ux`、`gates` の4つだけ。`needs_ux` は `true` か `false`（注釈や引用符は付けない）。それ以外の行、知らない値、`needs_ux` と `gates` の食い違い（`needs_ux: true` なのに `gates` に ux が無い、など）はエラーになる。
 
+コマンドは Windows、macOS、Linux で同じ（Linux / macOS では、先頭の `python` を省いて `scripts/cycle.py …` でもよい）。
+
 ```bash
-scripts/cycle.py start E1a            # 作業ツリー ../wt/E1a とブランチを用意
-scripts/cycle.py run E1a implement    # 担当（見出しの owner）をヘッドレスで起動
-scripts/cycle.py check E1a            # 自動確認
-scripts/cycle.py run E1a review       # code-reviewer
-scripts/cycle.py run E1a verify       # verifier
-scripts/cycle.py status E1a           # ゲートの状況と、統合できない理由
+python scripts/cycle.py start E1a            # 作業ツリー ../wt/E1a とブランチを用意
+python scripts/cycle.py run E1a implement    # 担当（見出しの owner）をヘッドレスで起動
+python scripts/cycle.py check E1a            # 自動確認（scripts/check.py）
+python scripts/cycle.py run E1a review       # code-reviewer
+python scripts/cycle.py run E1a verify       # verifier
+python scripts/cycle.py status E1a           # ゲートの状況と、統合できない理由
 # 作業ツリーでコミットしてから
-scripts/cycle.py merge E1a            # 条件を満たすときだけ main に取り込む（push は別）
+python scripts/cycle.py merge E1a            # 条件を満たすときだけ main に取り込む（push は別）
 ```
 
 セッション内でエージェントを動かしたときの記録:
 
 ```bash
-TREE=$(scripts/cycle.py snapshot E1a)     # 確認を始める前に、対象のツリーIDを控える
+TREE=$(python scripts/cycle.py snapshot E1a)     # 確認を始める前に、対象のツリーIDを控える
 # （エージェントが確認する）
-scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree "$TREE"
+python scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree "$TREE"
 ```
+
+PowerShell では、1行目を `$TREE = python scripts/cycle.py snapshot E1a` と書く。
 
 - `record` の `--tree` は review、verify、ux で必須。省けるのは implement だけ（いまの内容で記録する）。
 - 検証担当とUX担当は、受け入れ試験と記録を**新しいファイルとして**足す。既にあるファイルを書き換えると、レビューと検証がやり直しになる（2回目の記録は `docs/verification/<ID>-2.md` のように別の名前で置く）。
@@ -81,6 +85,7 @@ scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree 
 - `start` はやり直せる（記録は引き継ぐ）。ただし、ゲートの記録がある作業単位で見出しを変えた場合は `start E1a --reset` で記録を消してから、ゲートをやり直す。統合済みの作業単位は、`start` も `merge` もやり直せない。
 - review と verify は並行で走らせてよい。同じゲートを同時に2つ走らせた場合、後から終わった合格は採用されないことがある（表示に従ってやり直す）。
 - `claude` コマンドが無い環境では、`run` は記録を変えずにエラーで終わる。セッション内で動かして `record` で記録する。
+- 自動確認は、`cycle.py` を動かしているのと同じ Python で `scripts/check.py` を実行する。`scripts/check.py` が無い作業ツリーは `error` になる（合格にはならない）。
 
 ## 4. エージェントの動かし方は2通り
 
@@ -96,14 +101,26 @@ scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree 
 
 ## 5. 確認できていること、いないこと
 
-- 確認済み: ゲートの決まり（テスト116件。2章の末尾の方法で、テストの実効性も確かめた）。ヘッドレス起動のコマンドの形（`--dry-run`）と、結果の取り込み（偽のCLIを使ったテスト）。
-- 未確認: 本物のCLIでのヘッドレス実行。クラウドの作業環境ではCLIの認証が通らず、試せなかった。POのPCなど、CLIにログイン済みの環境で `scripts/cycle.py run <ID> review --dry-run` の表示を確かめ、次に小さな作業で実行して確認する必要がある。結果の読み方（`is_error`、`subtype`、`structured_output`）も、本物の出力とは突き合わせていない。形が違えば `error` になる（合格にはならない）。
+- 確認済み:
+  - ゲートの決まり（`tests/test_harness.py`）。Linux（Python 3.11〜3.13）と Windows（3.11、3.13）の自動テストで、push のたびに流す（7章）。
+  - テストの実効性（2章の末尾の方法）。H1 の時点では、139通りの壊し方のすべてでテストが落ちた。W1 では、Windows でしか実行されない分岐（ロック、Ctrl-Break、打ち切りで止める範囲、置き換えの待ち、パスの区切りなど）を9通り壊して、Windows の実物（GitHub上の自動テスト）で流した。8通りでテストが落ちた。残る1通りは、壊しても動作が変わらない余分な分岐だったので、分岐そのものを消した。
+  - ヘッドレス起動のコマンドの形（`--dry-run`）と、結果の取り込み（偽のCLIを使ったテスト）。Windows では、偽のCLIを npm 版と同じ `claude.cmd` の形で置き、指示（日本語）と結果の形の指定（JSON）が崩れずに届くことを確かめている。
+- 途中のもの: 機械的に1か所ずつ壊す確認（W1）。
+  - W1 で変えた後のスクリプトから機械的に作った壊し方は 1165 通り。実行したのは 600 通りで、その中に生き残りがある（実装の担当の報告では 38。一覧はリポジトリに残っていない）。残りの 565 通りと、`scripts/doctor.py` の壊し方は、実行していない。「生き残りが無い」とは、まだ言えない。残りは H2 で消化する。
+  - 独立検証が手で作った 78 通り（`docs/verification/W1-verifier.md` の「壊す確認」）では、生き残りが 10、試験が止まらなくなるものが 1 あった。それぞれに試験を足した。足した後に、今回の変更と上の生き残りを手で壊し直した 54 通りを流した（Linux。道具の試験 3 ファイル）。53 通りで試験が落ち、止まらなくなるものは無かった。残る 1 通りは、動作が変わらない書き換え（`doctor.py` で、結果のオブジェクトが無いときの扱いを別の書き方にしたもの）。Windows でしか通らない分岐（PATHEXT の拡張子、PATH に書かれていない実行した場所）を壊す確認は、していない。
+  - Windows でしか違いが出ない壊し方のうち、状態ファイルの改行と、`claude` の出力を読む文字コードは、Linux でも落ちる試験にした（改行は、Windows と同じ書き込みを模擬する。文字コードは、既定が UTF-8 でない Python を起動する）。記録するパスの区切りと、置き換えを待つ秒数は、Windows の自動テストでだけ落ちる。
+- 未確認: 本物のCLIでのヘッドレス実行。クラウドの作業環境ではCLIの認証が通らず、試せなかった。結果の読み方（`is_error`、`subtype`、`structured_output`、`session_id`）も、本物の出力とは突き合わせていない。形が違えば `error` になる（合格にはならない）。
+  - 確かめ方: CLIにサインイン済みのPCで `python scripts/doctor.py --headless` を実行する（7章）。本物の `claude -p` を、`cycle.py run` と同じ組み立てで1回だけ実行し、出力の形を `.cycle/doctor-result.json` に記録する。`headless.unexpected` が空なら、前提どおり。空でなければ、その記録（形と真偽だけで、本文は入っていない）をもとに `cycle.py` の読み方を直す。
 - スクリプトでは守れないこと:
   - 担当の名前（`--by`）と、セッション内の合否（`record --verdict`）は自己申告。記録ファイル（`.cycle/state/`）は手で書き換えられる。
   - main が先に進んでいると、取り込んだ結果は確認した内容と同じにならない。この差を見るのは、取り込んだ後の自動確認（決まり7）だけ。
-  - 例外の場所に足したファイルはレビューを通らない。`scripts/check.sh` 自体の書き換えを止めるのはレビュー。
+  - 例外の場所に足したファイルはレビューを通らない。`scripts/check.py` 自体の書き換えを止めるのはレビュー。
   - 取り込みの途中でプロセスが強制終了された場合（kill -9、電源断。道具の時間切れで止められた場合を含む）、確認の済んでいない取り込みコミットは、次に `merge` を実行するまで main に残る。`merge` が正常に終わらなかったら、push の前に `status` で「注意」が出ていないことを確かめる。
-  - ロックに `fcntl` を使うので、Linux / macOS / WSL が前提。
+  - Linux / macOS では、打ち切り（`--timeout`）で止めるのは、起動した `claude` だけ。`claude` が残した子プロセスは動き続ける（`run` は待たずに戻り、`error` を記録する）。
+- 未確認（Windows で、実行した場所のファイルが先に動く経路。W1 で塞いだのは `claude` の見つけ方だけ）:
+  - npm 版の `claude.cmd` は、中で `node` を名前だけで呼ぶ。cmd.exe は、実行した場所（`run` では作業ツリー）を PATH より先に探すので、作業ツリーの直下に `node.cmd` や `node.exe` があれば、そちらが動くはず。
+  - `cycle.py` は git を名前だけで起動する。Windows は、実行した場所の `git.exe` を PATH より先に探すはず。
+  - どちらも、Windows では試していない。塞ぐなら、起動するプロセスの環境変数に `NoDefaultCurrentDirectoryInExePath` を足す、git を `claude` と同じ探し方で絶対パスにする、などを H2 で検討する。
 
 ## 6. 記録の場所
 
@@ -111,3 +128,61 @@ scripts/cycle.py record E1a review --verdict pass --by <担当の名前> --tree 
 - `.cycle/state/<ID>.lock`、`.cycle/merge.lock`: 記録と統合のロック（中身は空）
 - `.cycle/merge-pending.json`: 取り込みの間だけある控え（作業単位、取り込み前のコミット、取り込むコミット）。残っていたら、前回の `merge` が途中で止まっている
 - `.cycle/runs/`: ヘッドレス実行の生の出力、自動確認のログ（取り込んだ後の確認は `<ID>-merge-check-*.log`）
+
+## 7. OSの違いと、環境の確認
+
+対象は Windows、macOS、Linux。ゲートの決まり（2章）は、どのOSでも同じコードが強制する。
+
+### OSで違う箇所
+
+`scripts/cycle.py` の「OSの違い」の節にまとめてある。ほかの場所では、OSを見て分岐しない。
+
+| 項目 | Linux / macOS | Windows |
+|---|---|---|
+| ロック | `fcntl.flock` | `msvcrt.locking`（ロックのファイルの先頭1バイト。取れるまで待つ） |
+| 終了の合図（統合を取り消してから終わる） | Ctrl-C、SIGTERM、SIGHUP | Ctrl-C、Ctrl-Break |
+| 後始末ができない止まり方（決まり7の控えで、次の `merge` が戻す） | kill -9、電源断 | タスクの強制終了（`taskkill /F`）、端末を閉じる、電源断 |
+| `claude` として起動するファイル | PATH の上の `claude` | PATH の上の `claude.exe`、`claude.cmd`、`claude.bat`（環境変数 PATHEXT の拡張子）。拡張子の無い同名のファイル（シェル用）は使わない |
+| `claude.cmd` を通る起動 | — | cmd.exe を通るので、引数に `%` `^` `&` `\|` `<` `>` `!` `(` `)` と改行があれば、起動せずにエラーにする（崩れた指示を渡さない。`!` は遅延展開、`(` `)` は引数をかっこの中に置く起動ファイルへの備え） |
+| 時間切れ、中断で止める範囲 | 起動したプロセス | 起動したプロセスと、その先のプロセス（`taskkill /T`）。`claude.cmd` の先の本体まで止める |
+| 状態ファイルの置き換えと読み取り | そのまま | 他のプロセスが開いている間は一時的に拒まれるので、5秒まで待ってやり直す。それでも駄目ならエラーで終わる（記録は変えない） |
+
+どのOSでも共通にしていること:
+
+- ファイルは UTF-8 で読み書きする。状態ファイルの改行は LF。記録に残すパス（仕様、ログ）は `/` 区切り。
+- git と `claude` の出力は UTF-8 として読む。自動確認（`scripts/check.py`）は `cycle.py` と同じ Python で起動し、出力を UTF-8 で受け取る。
+- `claude` は、PATH の項目のうち絶対パスで書かれたものを、書かれた順に探す。次の場所にあるものは使わない: 実行した場所（カレント）、作業ツリーの中、本体の中。空の項目と相対パスの項目も使わない。確認を受けていないファイル（作業ツリーに置かれた `claude.cmd`、無視の対象の `node_modules` の中のものなど）が、レビューや検証の合格を返せないようにするため。Windows の端末は PATH より先に実行した場所を探すが、それには合わせない。`doctor.py` が git と `claude` を探すときも同じ（本体の中のものは、版を聞くための起動もしない）。
+- 打ち切りと中断で `claude` を止めた後は、出力の終わりを待たずに戻る（`claude` が残した子プロセスが出力の口を持ったままでも、`--timeout` が効く）。
+- `claude` には、呼び出し元の標準入力を渡さない（入力を待って止まり続けないように）。
+- 画面に出せない文字（UTF-8 でない端末での日本語や記号）は `?` に置き換えて表示する。例外では止まらない。
+- リポジトリの改行は `.gitattributes` で LF に固定している。
+
+### 自動テスト
+
+`.github/workflows/ci.yml`。どのブランチへの push でも走る（同じリポジトリのプルリクエストでは、push の側だけが走る）。
+
+- Linux（Python 3.11、3.12、3.13）と Windows（3.11、3.13）。
+- 中身は、`python scripts/check.py`（ruff と pytest）、`python scripts/doctor.py --no-check`、cp932 の端末（`PYTHONIOENCODING=cp932`）での `python -m circuit_sim` の実行2件。
+- 合否は `scripts/check.py` の終了コードで直接決まる（`doctor.py` の終了コードには懸けない）。`doctor.py` は別のステップで動かし、確認（check）は重ねて実行しない。結果のファイルに問題（`problems`）が無いことも確かめる。`doctor.py` が確認を実行して結果を記録する経路は、試験（`tests/test_dev_tools.py`）が Linux と Windows の両方で確かめる。
+- 自動テストに渡す権限は、リポジトリの読み取りだけ（`permissions: contents: read`）。
+- 試験の中から、このリポジトリの試験がもう一度実行された場合（確認スクリプトを起動する試験で、起動する場所の指定が壊れたとき）は、すぐに止める（`tests/conftest.py`）。
+- Windows の実行は、文字コードの設定を足していない素の状態（既定の文字コードは UTF-8 ではない）で流す。
+- ハーネスの試験は Windows でも同じものが走る。スキップするのは、Windows に無い機能そのものを試す3件（他のプロセスへ SIGINT、SIGTERM、SIGHUP を送って `merge` を止める試験）だけ。その代わりに、Windows にだけある挙動を試す2件（Ctrl-Break で止める試験、他のプログラムが開いたままの状態ファイルを置き換える試験）が Windows でだけ走る（Linux では、この2件をスキップする）。Ctrl-C で止めた場合の取り消しは、同じプロセスの中で起こす試験が、どのOSでも確かめる。スキップした試験と理由は、実行ログの最後に一覧で出る（`pytest -rs`）。
+
+### 環境の確認（`scripts/doctor.py`）
+
+自分のPCで、開発の道具が動く環境かどうかを確かめる。
+
+```bash
+python scripts/doctor.py               # OS、Python、文字コード、git、claude の有無と版、scripts/check.py の結果
+python scripts/doctor.py --no-check    # scripts/check.py（数分かかる）を省く
+python scripts/doctor.py --headless    # 加えて、本物の claude -p を1回だけ実行して、出力の形を確かめる
+```
+
+- 結果は画面と `.cycle/doctor-result.json` に出る。終了コードは、必要なもの（Python 3.11 以上、git、`scripts/check.py` の合格、頼まれたヘッドレスの確認）に問題が無ければ 0。`claude` が無いことは、それだけでは問題にしない（セッション内で動かせる）。
+- `--headless` は、付けたときだけ実行する。Claudeの利用枠を少し使うので、実行の前に、何をするか（役割、道具、上限額、指示の全文、実行するコマンド）を表示する。コマンドは `cycle.py run` と同じ関数で組み立てる（`--agent`、`--output-format json`、`--json-schema`、`--permission-mode`、`--max-budget-usd`、`--allowedTools`）。指示は「何も読まず、決まった形の結果だけを返す」という最小のもの。
+- APIキーの環境変数（`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`）が設定されていると、利用枠ではなくAPIの料金になる。その場合は実行せずに知らせる（`--allow-api-billing` を付けたときだけ実行する）。
+- 記録するのは形と真偽だけ: 終了コード、出力の形（JSON のオブジェクトか、一覧か、行ごとか、JSON でないか）、項目の名前、`is_error`・`subtype`・`structured_output`・`session_id`・`result` などの有無と型、ハーネスが同じ出力を読んだときの判定、前提と違っていた点の一覧（`unexpected`）。値まで記録するのは、真偽、数（費用の概算など）、種類を表す英小文字の語（`success` など）だけ。
+  - 項目の名前は、あらかじめ決めた一覧（ハーネスが読む項目と、CLI の出力にある決まった名前）にあるものだけを残す。それ以外は、個数だけを記録する（`other_keys`）。
+  - `structured_output` が無い（オブジェクトでない）ときは、`result` の文字列が JSON として読めるか、決まった形に合うかを記録する（`result_as_json`。中身は記録しない）。本物の CLI が結果を `result` の側に返していたら、`cycle.py` の読み方を直す。
+- 記録しないもの: 応答の本文（`result`、`summary`、基準や指摘の文面）、セッションのID、エラーの文面、環境変数の中身、コマンドの置き場所。エラーの文面からは、「こちらが渡したオプションのうち、CLIが知らないと言ったもの」と「サインインや認証に触れているか」だけを取り出す。くわしい原因は、表示されたコマンドを自分の端末で実行して確かめる。

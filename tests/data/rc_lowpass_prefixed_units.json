@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.1",
+  "template": "rc_lowpass",
+  "plant": {
+    "Vin": {"value": 5, "unit": "V", "source": "手入力"},
+    "R": {"value": 1, "unit": "k\u2126", "source": "手入力"},
+    "C": {"value": 10, "unit": "\u00b5F", "source": "手入力"}
+  },
+  "targets": {},
+  "missing": []
+}
