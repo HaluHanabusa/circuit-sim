@@ -835,16 +835,39 @@ def test_c8_very_fine_step_accumulates_no_error():
 
 @pytest.mark.parametrize("ratio", [10.0, 1e3, 1e6])
 def test_c8_very_coarse_step_stays_bounded_and_settles(ratio):
-    """h が時定数の 10〜100万倍でも発散しない（台形則は安定）。振動が減る速さは理論どおり。"""
+    """h が時定数の 10〜100万倍でも壊れない（既定の振る舞い）。
+
+    見直し（E1a 追補 A1）: 以前はここで「台形則の増幅率どおりに振れること」を期待値にしていた。
+    それは解き方の性質で、要求ではなかった。要求は「発散しない・数値振動しない・黙って誤らない」なので、
+    真の応答（1次のRCは入力を超えず、1刻み後にはほぼ入力に達している）を基準にする。
+    台形則そのものの性質は、下の damping_steps=0 の試験に分けた。
+    """
     r, c, v_in = 1e3, 1e-6, 1.0
     tau = r * c
     res = simulate(rc_net(Step(final=v_in), r, c), 2000 * ratio * tau, ratio * tau)
+    v = res["v(out)"]
+    assert np.all(np.isfinite(res.x))
+    # 数値振動しない: 1次のRCの真の応答は 0 と入力の間にある（注意の有無によらない）
+    assert v.min() >= -TOL * v_in and v.max() <= (1 + TOL) * v_in, f"最小 {v.min()}、最大 {v.max()}"
+    assert v[-1] == pytest.approx(v_in, rel=TOL)                # 落ち着く
+    # 黙って誤らない: 格子点の値が真値と 1% 以内か、粗いことが注意で分かる
+    accurate = max_err(v, v_in * (1 - np.exp(-res.t / tau)), v_in) < TOL
+    assert accurate or res.notes
+
+
+@pytest.mark.parametrize("ratio", [10.0, 1e3, 1e6])
+def test_c8_trapezoidal_rule_alone_is_stable_with_theoretical_amplification(ratio):
+    """減衰ステップを切る（damping_steps=0）と台形則だけになる。発散せず、振れ方は増幅率の式どおり。"""
+    r, c, v_in = 1e3, 1e-6, 1.0
+    tau = r * c
+    res = simulate(rc_net(Step(final=v_in), r, c), 2000 * ratio * tau, ratio * tau, damping_steps=0)
     v = res["v(out)"]
     assert np.all(np.isfinite(res.x))
     assert v.min() >= -1e-9 and v.max() <= 2 * v_in + 1e-9
     rho = (1 - ratio / 2) / (1 + ratio / 2)                    # 台形則の1ステップの増幅率
     k = np.arange(len(v))
     assert np.allclose(v, v_in * (1 - rho**k), atol=1e-9)
+    assert res.notes, "台形則だけで振れているのに、刻みが粗いことが注意に出ていない"
 
 
 def test_c8_coarse_step_gives_no_overshoot_or_warns():

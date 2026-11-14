@@ -25,6 +25,7 @@ from scipy.linalg import expm
 
 from circuit_sim import CircuitError, MissingValueError, Netlist, Spec, expand, kernel, simulate
 from circuit_sim.__main__ import main as cli_main
+from circuit_sim.units import UnitError
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -93,6 +94,15 @@ def series_rlc(v_source: dict, r: float, l_: float, c: float, i0: float = 0.0, v
 def rc_lowpass(v_source: dict, r: float, c: float, v0: float = 0.0) -> Netlist:
     """電源(in) - R - (out) - C - 基準。"""
     return netlist(v_source, res_("R1", "in", "out", r), cap("C1", "out", "0", c, ic=v0))
+
+
+# 層A（仕様）の項目ごとの単位。値はどれもSI基本単位で書く
+PLANT_UNITS = {"Vin": "V", "R": "ohm", "L": "H", "C": "F"}
+
+
+def plant_of(values: dict) -> dict:
+    """{"R": 1e3, ...} を層Aの plant の形にする。値が None の項目は「設計書に無かった」を表す。"""
+    return {name: {"value": value, "unit": PLANT_UNITS[name]} for name, value in values.items()}
 
 
 # ---------------------------------------------------------------- 実装と別経路の参照解
@@ -189,8 +199,7 @@ def test_c1_series_rlc_step_matches_closed_form(r):
 ], ids=["rc", "rlc_under", "rlc_over"])
 def test_c1_templates_with_their_own_timing(template, plant, probe_refs):
     """仕様（層A）→ 展開 → 計算の経路で、テンプレートが決めた刻みのまま1%以内。"""
-    spec = Spec.model_validate({"template": template,
-                                "plant": {k: {"value": val, "unit": "SI"} for k, val in plant.items()}})
+    spec = Spec.model_validate({"template": template, "plant": plant_of(plant)})
     ex = expand(spec)
     out = simulate(ex.netlist, ex.t_end, ex.h)
     v = plant["Vin"]
@@ -531,10 +540,6 @@ def test_c5_current_source_into_capacitor_is_solved():
 
 # ================================================================ 基準6: 足りない値
 
-def quantity(value) -> dict:
-    return {"value": value, "unit": "SI"}
-
-
 @pytest.mark.parametrize("template,plant,expected", [
     ("rlc_series", {"Vin": None, "R": 1.0, "L": None, "C": None}, {"Vin", "L", "C"}),     # null が3つ
     ("rlc_series", {"Vin": 10.0}, {"R", "L", "C"}),                                       # 項目ごと無い
@@ -544,7 +549,7 @@ def quantity(value) -> dict:
     ("rc_lowpass", {"Vin": 5.0, "R": 1e3}, {"C"}),
 ], ids=["nulls", "absent", "mixed", "empty", "rc_all", "rc_one"])
 def test_c6_all_missing_values_are_reported_together(template, plant, expected):
-    spec = Spec.model_validate({"template": template, "plant": {k: quantity(v) for k, v in plant.items()}})
+    spec = Spec.model_validate({"template": template, "plant": plant_of(plant)})
     with pytest.raises(MissingValueError) as info:
         expand(spec)
     assert set(info.value.names) == expected
@@ -567,11 +572,13 @@ def test_c6_cli_reports_all_missing_values_and_does_not_compute(tmp_path, capsys
 
 
 def test_c6_nonpositive_value_is_rejected_not_repaired():
-    spec = Spec.model_validate({"template": "rlc_series", "plant": {
-        "Vin": quantity(10.0), "R": quantity(0.0), "L": quantity(1e-3), "C": quantity(-1e-6)}})
+    values = {"Vin": 10.0, "R": 0.0, "L": 1e-3, "C": -1e-6}
     with pytest.raises(ValueError) as info:
-        expand(spec)
+        expand(Spec.model_validate({"template": "rlc_series", "plant": plant_of(values)}))
+    assert not isinstance(info.value, UnitError)     # 断る理由は値であって、単位ではない
     assert "R" in str(info.value) and "C" in str(info.value)
+    # 対照: 0 と負の値を直すと展開できる（単位は正しく書けている）
+    expand(Spec.model_validate({"template": "rlc_series", "plant": plant_of(values | {"R": 1.0, "C": 1e-6})}))
 
 
 def test_c6_unit_is_not_silently_ignored():
@@ -891,12 +898,14 @@ def test_c8_extreme_capacitance_to_inductance_ratio():
 
 def test_c8_template_step_count_stays_practical_for_strongly_overdamped_rlc():
     """定数の桁が大きく違う仕様でも、既定の刻みで現実的なステップ数（1000万以下）に収まるか、断る。"""
-    spec = Spec.model_validate({"template": "rlc_series", "plant": {
-        "Vin": quantity(10.0), "R": quantity(1e3), "L": quantity(1e-6), "C": quantity(1e-6)}})
+    spec = Spec.model_validate({"template": "rlc_series", "plant": plant_of(
+        {"Vin": 10.0, "R": 1e3, "L": 1e-6, "C": 1e-6})})
     try:
         ex = expand(spec)
+    except UnitError:
+        raise           # 単位は正しく書いてある。単位のエラーで「断った」ことにしない
     except ValueError:
-        return      # 理由の分かるエラーで断るのでもよい
+        return          # 理由の分かるエラーで断るのでもよい
     assert ex.t_end / ex.h <= 1e7
 
 
