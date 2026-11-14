@@ -235,3 +235,34 @@ def test_breaking_a_branch_only_windows_takes_makes_a_harness_test_fail(tmp_path
             broken.append((kind, result.returncode, result.stdout[-400:] + result.stderr[-400:]))
     assert not broken, broken                   # 試験の失敗ではない終わり方（差し替えの誤りなど）
     assert survived == []
+
+
+# ================================================================ Windows 以外での、コマンドの名前
+
+NOT_ON_WINDOWS = "Windows では claude.cmd などが正しい名前（そちらは、上の試験が確かめる）"
+
+
+@pytest.mark.skipif(WINDOWS, reason=NOT_ON_WINDOWS)
+def test_windows_launcher_names_are_not_taken_for_the_command_elsewhere(tmp_path):
+    """Windows 以外では、claude という名前のファイルだけを claude として起動する（main と同じ）。
+
+    claude.cmd、claude.exe、claude.bat という名前の実行できるファイルが PATH の上にあっても、採らない。
+    """
+    root = started_repo(tmp_path)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in ("claude.cmd", "claude.exe", "claude.bat"):
+        planted = fake / name
+        body = f"#!/bin/sh\n: > '{fake}/ran'\nprintf '%s' '{json.dumps(PASSING)}'\n"
+        planted.write_text(body, encoding="utf-8")
+        planted.chmod(0o755)
+    # PATH には、置いた場所だけを書く（本物の claude に届かないように）
+    proc = subprocess.run(
+        [sys.executable, str(CYCLE), "run", "U1", "review"], capture_output=True, text=True, encoding="utf-8",
+        env=base_env(CYCLE_ROOT=str(root), PATH=str(fake)), stdin=subprocess.DEVNULL, timeout=120,
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "見つからない" in proc.stderr and "Traceback" not in proc.stderr
+    assert not (fake / "ran").exists()
+    state = json.loads((root / ".cycle" / "state" / "U1.json").read_text(encoding="utf-8"))
+    assert "review" not in state.get("gates", {})
