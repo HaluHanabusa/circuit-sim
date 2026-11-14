@@ -4,6 +4,7 @@
 Windows、macOS、Linux のどれでも同じ試験を流す。偽の確認スクリプトと偽の claude は Python で書く。
 OSに無い機能そのものを試す場合だけ、理由を付けてスキップする。
 """
+import codecs
 import contextlib
 import importlib.util
 import io
@@ -281,17 +282,45 @@ def install_command(directory: Path, name: str, source: str) -> None:
         command.chmod(0o755)
 
 
+def install_claude(
+    directory: Path, output: object, script: str = "", exit_code: int = 0, stderr: str = "",
+) -> None:
+    """偽の claude を directory に置く。script（Python）を実行してから output を出力する。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+    (directory / "out.json").write_text(text, encoding="utf-8")
+    (directory / "err.txt").write_text(stderr, encoding="utf-8")
+    source = FAKE_CLAUDE.format(here=str(directory), script=script, exit_code=exit_code)
+    install_command(directory, "claude", source)
+
+
 def fake_claude(
     tmp_path: Path, output: object, script: str = "", exit_code: int = 0, stderr: str = "",
 ) -> dict[str, str]:
     """偽の claude を PATH の先頭に置く環境変数を返す。script（Python）を実行してから output を出力する。"""
     fake = tmp_path / "bin"
-    fake.mkdir(exist_ok=True)
-    text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-    (fake / "out.json").write_text(text, encoding="utf-8")
-    (fake / "err.txt").write_text(stderr, encoding="utf-8")
-    install_command(fake, "claude", FAKE_CLAUDE.format(here=str(fake), script=script, exit_code=exit_code))
+    install_claude(fake, output, script, exit_code, stderr)
     return {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+
+
+CLAUDE_FILES = ("claude", "claude.exe", "claude.cmd", "claude.bat")
+
+
+def path_without_claude() -> str:
+    """いまの PATH から、claude のある場所を除いたもの（git などは残る）。
+
+    偽の claude を「採らない」ことを確かめる試験で使う。採らなかった先で、本物の claude を起動しないため。
+    """
+    def has_claude(entry: str) -> bool:
+        return any((Path(entry) / name).exists() for name in CLAUDE_FILES)
+
+    entries = os.environ["PATH"].split(os.pathsep)
+    return os.pathsep.join(entry for entry in entries if entry and not has_claude(entry))
+
+
+def was_run(directory: Path) -> bool:
+    """directory に置いた偽の claude が、一度でも起動されたか。"""
+    return (directory / "argv.json").exists()
 
 
 def claude_argv(tmp_path: Path) -> list[str]:
@@ -860,6 +889,25 @@ def test_dry_run_shows_headless_command_for_the_right_agent(repo):
     assert "--agent verifier" in cycle(repo, "run", "U1", "verify", "--dry-run").stdout
 
 
+def test_dry_run_line_starts_the_same_command_when_pasted_into_a_terminal(repo, tmp_path):
+    """--dry-run の1行を端末（Windows ではコマンド プロンプト）に渡すと、同じ場所で同じ引数の claude が動く。
+
+    引数を引用符で囲まずに並べると、指示（空白を含む）と結果の形の指定（JSON）が、別々の引数に割れる。
+    """
+    wt = implement(repo)
+    line = cycle(repo, "run", "U1", "review", "--dry-run").stdout.strip()
+    seen = tmp_path / "cwd.txt"
+    script = f"pathlib.Path({str(seen)!r}).write_text(str(pathlib.Path.cwd()), encoding='utf-8')"
+    install_claude(tmp_path / "bin", headless(), script=script)
+    env = {**TEST_ENV, "PATH": f"{tmp_path / 'bin'}{os.pathsep}{path_without_claude()}"}
+    proc = subprocess.run(
+        line, shell=True, env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert claude_argv(tmp_path) == CYCLE_MODULE.agent_command(state(repo), "review", 5.0)[1:]
+    assert Path(seen.read_text(encoding="utf-8")).resolve() == wt.resolve()
+
+
 def test_headless_run_without_structured_result_is_not_a_pass(repo, tmp_path):
     implement(repo)
     env = fake_claude(tmp_path, {"result": "done", "session_id": "s1"})
@@ -962,6 +1010,94 @@ def test_headless_run_that_times_out_is_not_a_pass(repo, tmp_path):
     assert time.monotonic() - started < 15
 
 
+# 出力の口を受け継いだ子プロセスを残して、止まり続けるコマンド。
+# 子は、印のファイルが置かれるまで（最長 30 秒）いる
+LEAVES_A_CHILD = """\
+import pathlib
+import subprocess
+import sys
+import time
+
+child = (
+    "import pathlib, sys, time\\n"
+    "pathlib.Path(sys.argv[1] + '.started').touch()\\n"
+    "end = time.monotonic() + 30\\n"
+    "while time.monotonic() < end and not pathlib.Path(sys.argv[1]).exists():\\n"
+    "    time.sleep(0.05)\\n"
+)
+subprocess.Popen([sys.executable, "-c", child, sys.argv[1]])
+while not pathlib.Path(sys.argv[1] + ".started").exists():
+    time.sleep(0.05)
+print("started", flush=True)
+time.sleep(60)
+"""
+
+
+def test_timeout_does_not_wait_for_a_child_that_still_holds_the_output(tmp_path):
+    """打ち切りは、止めたコマンドが残した子プロセス（出力の口を持ったまま）の終わりを待たない。
+
+    cycle.py run、doctor.py --headless、版の確認は、どれもこの関数を通る。
+    待つ実装だと、子が終わる 30 秒後まで戻らない。
+    """
+    release = tmp_path / "release"
+    began = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            CYCLE_MODULE.run_captured([sys.executable, "-c", LEAVES_A_CHILD, str(release)], tmp_path, 3)
+        waited = time.monotonic() - began
+    finally:
+        release.touch()                                 # 残った子プロセスを終わらせる
+    assert Path(f"{release}.started").exists()          # 打ち切りの前に、子プロセスは起動していた
+    assert waited < 15
+
+
+JAPANESE = "要約は日本語で届く（10 µF、1 kΩ）"
+
+
+def test_japanese_in_the_cli_output_reaches_the_screen_and_the_record(repo, tmp_path):
+    """claude の出力（UTF-8）の日本語と記号が、崩れずに、判定の表示と記録に届く。"""
+    implement(repo)
+    env = fake_claude(tmp_path, headless({**PASS, "summary": JAPANESE}))
+    result = cycle(repo, "run", "U1", "review", env=env)
+    assert result.returncode == 0 and f"review: pass（{JAPANESE}）" in result.stdout
+    raw = (repo / state(repo)["gates"]["review"]["report"]).read_text(encoding="utf-8")
+    assert json.loads(raw)["structured_output"]["summary"] == JAPANESE
+
+
+# 既定の文字コードが UTF-8 でない Python の中で、run_captured に UTF-8 の出力を読ませる
+READS_OUTPUT = """\
+import importlib.util
+import locale
+import pathlib
+import sys
+
+spec = importlib.util.spec_from_file_location("cycle_script", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+emit = "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))"
+proc = module.run_captured([sys.executable, "-c", emit, sys.argv[2]], pathlib.Path.cwd(), 60)
+print(locale.getencoding())
+print(ascii(proc.stdout))
+"""
+
+
+def test_cli_output_is_read_as_utf8_where_the_default_encoding_is_not_utf8(tmp_path):
+    """出力の読み取りは、OSの既定の文字コード（日本語 Windows の cp932 など）に左右されない。
+
+    既定が UTF-8 でない Python を起動して確かめる（Linux と macOS では C ロケール。Windows は素のまま）。
+    文字コードの指定を外すと、Linux でも落ちる。
+    """
+    env = {**TEST_ENV, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    proc = subprocess.run(
+        [sys.executable, "-c", READS_OUTPUT, str(CYCLE), JAPANESE.encode("utf-8").hex()],
+        capture_output=True, text=True, encoding="utf-8", env=env, cwd=tmp_path,
+    )
+    assert proc.returncode == 0, proc.stderr
+    default, shown = proc.stdout.splitlines()
+    assert codecs.lookup(default).name != "utf-8"       # この試験の前提: 既定は UTF-8 でない
+    assert shown == ascii(JAPANESE)
+
+
 def test_missing_claude_is_reported_clearly(repo, tmp_path):
     implement(repo)
     (tmp_path / "empty").mkdir()
@@ -1020,6 +1156,104 @@ def test_file_named_claude_that_cannot_be_launched_is_not_picked(repo, tmp_path)
     assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
 
 
+def test_directory_named_like_the_command_is_not_taken_for_it(repo, tmp_path):
+    implement(repo)
+    decoy = tmp_path / "decoy"
+    for name in CLAUDE_FILES:
+        (decoy / name).mkdir(parents=True)
+    install_claude(tmp_path / "bin", headless())
+    path = os.pathsep.join([str(decoy), str(tmp_path / "bin"), path_without_claude()])
+    assert cycle(repo, "run", "U1", "review", env={"PATH": path}).returncode == 0
+
+
+def test_claude_is_found_when_pathext_is_not_set(repo, tmp_path):
+    """Windows で環境変数 PATHEXT が無くても、claude.exe、claude.cmd、claude.bat は見つかる。"""
+    implement(repo)
+    install_claude(tmp_path / "bin", headless())
+    env = {"PATH": f"{tmp_path / 'bin'}{os.pathsep}{path_without_claude()}", "PATHEXT": ""}
+    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
+
+
+# 実行した場所（カレント）を指す、PATH の項目の書き方。None は、PATH に書かない場合
+# （Windows の端末と shutil.which は、書かれていなくても、カレントを PATH より先に探す）
+HERE_ON_PATH = {
+    "絶対パス": lambda here: str(here),
+    "相対パス（.）": lambda here: ".",
+    "空の項目": lambda here: "",
+    "相対パス（下の場所）": lambda here: "bin",
+    "PATH に無い": lambda here: None,
+}
+
+
+@pytest.mark.parametrize("form", HERE_ON_PATH)
+def test_claude_in_the_place_of_execution_is_not_used(repo, tmp_path, monkeypatch, form):
+    """実行した場所に置かれた claude（Windows では claude.cmd など）は、使わない。
+
+    確認を受けていないファイルが、レビューや検証の合格を返せないようにする。
+    """
+    implement(repo)
+    here = tmp_path / "here"
+    planted = here / "bin" if form == "相対パス（下の場所）" else here
+    install_claude(planted, headless(session="planted"))
+    (tmp_path / "empty").mkdir()
+    entry = HERE_ON_PATH[form](here)
+    path = [str(tmp_path / "empty")] if entry is None else [entry, str(tmp_path / "empty")]
+    monkeypatch.chdir(here)
+    result = cycle(repo, "run", "U1", "review", env={"PATH": os.pathsep.join(path)})
+    assert result.returncode == 2
+    assert "claude コマンドが見つからない" in result.stderr
+    assert not was_run(planted) and "review" not in state(repo)["gates"]
+
+
+INSIDE_THE_TREES = {
+    "作業ツリーの直下": "wt/U1",
+    "作業ツリーの下の場所": "wt/U1/tools/bin",
+    "本体の直下": "repo",
+    "本体の下の場所": "repo/tools/bin",
+    "作業ツリーを .. で回り込んで指す": "elsewhere/../wt/U1/tools/bin",
+}
+
+
+@pytest.mark.parametrize("where", INSIDE_THE_TREES)
+def test_claude_inside_the_worktree_or_the_main_checkout_is_not_used(repo, tmp_path, where):
+    """作業ツリーや本体の中の claude は、PATH に書かれていても使わない。
+
+    無視の対象のファイル（node_modules など）は、ゲートが見る内容に入らないので、確認を受けていない。
+    """
+    implement(repo)
+    (tmp_path / "elsewhere").mkdir()
+    entry = tmp_path / INSIDE_THE_TREES[where]
+    install_claude(entry, headless(session="planted"))
+    result = cycle(repo, "run", "U1", "review", env={"PATH": str(entry)})
+    assert result.returncode == 2
+    assert "claude コマンドが見つからない" in result.stderr
+    assert not was_run(entry) and "review" not in state(repo)["gates"]
+
+
+def test_claude_on_path_is_used_when_another_one_is_in_the_place_of_execution(repo, tmp_path, monkeypatch):
+    """実行した場所の claude を飛ばして、PATH の上の claude を使う（見つからない扱いにはしない）。"""
+    implement(repo)
+    here = tmp_path / "here"
+    install_claude(here, headless(session="planted"))
+    install_claude(tmp_path / "bin", headless(session="installed"))
+    monkeypatch.chdir(here)
+    path = os.pathsep.join([str(here), ".", str(tmp_path / "bin"), path_without_claude()])
+    assert cycle(repo, "run", "U1", "review", env={"PATH": path}).returncode == 0
+    assert state(repo)["gates"]["review"]["by"] == "installed"
+    assert not was_run(here)
+
+
+def test_places_to_avoid_are_compared_after_resolving_them(tmp_path):
+    """採らない場所は、書き方が違っても（.. を含むなど）、同じ場所として見分ける。"""
+    tools = tmp_path / "tree" / "tools"
+    install_claude(tools, headless())
+    (tmp_path / "other").mkdir()
+    with mock.patch.dict(os.environ, {"PATH": str(tools)}):
+        assert CYCLE_MODULE.find_command("claude", [tmp_path / "other" / ".." / "tree"]) is None
+        found = CYCLE_MODULE.find_command("claude", [tmp_path / "other"])
+    assert found is not None and Path(found).is_absolute() and Path(found).parent == tools
+
+
 def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, tmp_path):
     implement(repo)
     broken = tmp_path / "broken"
@@ -1035,9 +1269,12 @@ def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, t
 
 
 @pytest.mark.parametrize("found", ["C:/npm/claude.cmd", "C:/npm/claude.CMD", "C:/npm/claude.bat"])
-@pytest.mark.parametrize("unsafe", list("%^&|<>\r\n"))
+@pytest.mark.parametrize("unsafe", ["%", "^", "&", "|", "<", ">", "!", "(", ")", "\r", "\n"])
 def test_arguments_that_cmd_exe_would_reinterpret_are_refused_for_batch_launchers(found, unsafe):
-    """claude.cmd は cmd.exe を通る。そこで別の意味になる文字を含む指示は、崩れて届く前に断る。"""
+    """claude.cmd は cmd.exe を通る。そこで別の意味になる文字を含む指示は、崩れて届く前に断る。
+
+    ! は遅延展開、( ) は引数をかっこの中に置く起動ファイルへの備え。
+    """
     with mock.patch.object(CYCLE_MODULE, "find_command", return_value=found):
         with pytest.raises(CYCLE_MODULE.CycleError, match="cmd.exe を通る"):
             CYCLE_MODULE.launchable(["claude", "-p", f"前{unsafe}後", "--agent", "x"])
@@ -1047,7 +1284,7 @@ def test_arguments_that_cmd_exe_would_reinterpret_are_refused_for_batch_launcher
 
 @pytest.mark.parametrize("found", ["C:/npm/claude.cmd", "C:/bin/claude.exe", "/usr/bin/claude"])
 def test_arguments_are_passed_as_they_are_when_nothing_is_reinterpreted(found):
-    unsafe_only_for_batch = [] if found.endswith(".cmd") else ["a & b | c > d", "100%\n"]
+    unsafe_only_for_batch = [] if found.endswith(".cmd") else ["a & b | c > d", "100%\n", "(x)!"]
     cmd = ["claude", "-p", '指示（かっこ）、"引用"、{"a": [1, "b"]}', *unsafe_only_for_batch]
     with mock.patch.object(CYCLE_MODULE, "find_command", return_value=found):
         assert CYCLE_MODULE.launchable(cmd) == [found, *cmd[1:]]
@@ -1219,6 +1456,29 @@ def test_state_that_cannot_be_written_is_an_error(repo):
     assert "U1.json を書けない" in result.stderr
     assert state(repo)["gates"]["implement"]["by"] == "impl-1"
     assert sorted(path.name for path in (repo / ".cycle" / "state").iterdir()) == ["U1.json", "U1.lock"]
+
+
+def write_text_like_windows() -> contextlib.AbstractContextManager:
+    """改行の指定が無い書き込みを、Windows と同じ（LF を CRLF に変える）に振る舞わせる。
+
+    Windows 以外では、指定しなくても LF のまま書かれるので、指定を外しても違いが出ない。
+    """
+    write_text = Path.write_text
+
+    def like_windows(self, data, encoding=None, errors=None, newline=None):
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), ""
+        return write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    return mock.patch.object(Path, "write_text", like_windows)
+
+
+def test_state_file_ends_lines_with_lf_where_text_files_get_crlf(repo):
+    """状態ファイルの改行は、テキストの書き込みが改行を CRLF に変えるOS（Windows）でも LF。"""
+    with write_text_like_windows():
+        implement(repo)
+    data = (repo / ".cycle" / "state" / "U1.json").read_bytes()
+    assert b"\r" not in data and data.endswith(b"}\n") and data.count(b"\n") > 10
 
 
 @pytest.mark.parametrize("failures, wait, code", [(2, 5.0, 0), (10**6, 0.2, 2)])

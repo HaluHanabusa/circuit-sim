@@ -29,13 +29,12 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import IO, TypeVar
 
@@ -146,6 +145,10 @@ class CycleError(Exception):
     pass
 
 
+class CommandNotFound(CycleError):
+    """起動するコマンドが、使ってよい場所に見つからない。"""
+
+
 # ------------------------------------------------------------------ OSの違い
 # Windows と、それ以外（Linux / macOS）で違う箇所は、この節にまとめる。ゲートの決まりは、どのOSでも同じ。
 
@@ -156,8 +159,13 @@ STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGBREAK")
 CHECK_SCRIPT = "scripts/check.py"
 
 # Windows の起動用のファイル（claude.cmd など）は cmd.exe を通る。そこで別の意味になる文字は渡せない。
+# % ^ & | < > は cmd.exe の記号。! は遅延展開が有効な起動ファイルで変数の印になる。
+# ( ) は、起動ファイルが引数をかっこの中（if や for のブロック）に置いていると、ブロックの区切りに読まれる。
 BATCH_SUFFIXES = (".cmd", ".bat")
-BATCH_UNSAFE = "%^&|<>\r\n"
+BATCH_UNSAFE = "%^&|<>!()\r\n"
+
+# Windows で、コマンドの名前に付けて探す拡張子（環境変数 PATHEXT が無いときの既定）
+DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 
 # Windows では、他のプロセスが開いているファイルの置き換えと、置き換えの最中のファイルの読み取りが、
 # 一時的に拒まれることがある。この秒数までは、待ってやり直す。
@@ -192,22 +200,55 @@ def stop_signals() -> list[signal.Signals]:
     return [getattr(signal, name) for name in STOP_SIGNAL_NAMES if hasattr(signal, name)]
 
 
-def find_command(name: str) -> str | None:
-    """コマンドの実体の場所。見つからなければ None。端末でその名前を打ったときと同じ順（PATH の順）で探す。
+def command_file_names(name: str) -> list[str]:
+    """その名前のコマンドとして起動できるファイルの名前。Windows では拡張子が付く（claude.cmd など）。
 
-    Windows では claude.exe や claude.cmd のように拡張子が付くので、名前だけでは起動できない。
-    shutil.which が、PATHEXT の拡張子を付けて探す。npm が一緒に置く、拡張子の無いシェル用のファイルを
-    拾わないことは、試験で確かめている（拾った場合は、起動できないというエラーになる）。
+    拡張子の無い同名のファイル（npm が一緒に置く、シェル用のもの）は、Windows では起動できないので含めない。
     """
-    return shutil.which(name)
+    if not WINDOWS:
+        return [name]
+    extensions = os.environ.get("PATHEXT") or DEFAULT_PATHEXT
+    return [name + extension for extension in extensions.split(os.pathsep) if extension]
 
 
-def launchable(cmd: list[str]) -> list[str]:
-    """先頭のコマンドを実体の場所に直した、起動できるコマンド。見つからなければ CycleError。"""
-    found = find_command(cmd[0])
+def is_inside(path: Path, tree: Path) -> bool:
+    return path == tree or tree in path.parents
+
+
+def find_command(name: str, avoid: Iterable[Path] = ()) -> str | None:
+    """コマンドの実体の場所（絶対パス）。見つからなければ None。PATH の項目を、書かれた順に探す。
+
+    次の場所にあるものは採らない。確認を受けていないファイルが、その名前のコマンドとして動かないようにする
+    （作業ツリーに置かれた claude.cmd が、レビューや検証の合格を返す、など）。
+    - 実行した場所（カレント）。Windows の端末と shutil.which は、PATH より先にカレントを探す。
+    - PATH の項目のうち、空のものと相対パスのもの（実行した場所によって、指す先が変わる）。
+    - avoid に渡した場所の中（作業ツリーと本体。無視の対象のファイルは、ゲートが見る内容に入らない）。
+    """
+    here = Path.cwd().resolve()
+    trees = [Path(tree).resolve() for tree in avoid]
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isabs(entry):
+            continue
+        directory = Path(entry).resolve()
+        if directory == here or any(is_inside(directory, tree) for tree in trees):
+            continue
+        for file_name in command_file_names(name):
+            candidate = os.path.join(entry, file_name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def launchable(cmd: list[str], avoid: Iterable[Path] = ()) -> list[str]:
+    """先頭のコマンドを実体の場所に直した、起動できるコマンド。
+
+    見つからなければ CommandNotFound、起動用のファイルに渡せない引数があれば CycleError。
+    """
+    found = find_command(cmd[0], avoid)
     if found is None:
-        raise CycleError(
-            f"{cmd[0]} コマンドが見つからない。Claude Code の CLI を入れて PATH を通すか、"
+        raise CommandNotFound(
+            f"{cmd[0]} コマンドが見つからない（実行した場所、作業ツリー、本体の中にあるものは使わない）。"
+            "Claude Code の CLI を入れて PATH を通すか、"
             "セッション内でエージェントを動かして record で記録する"
         )
     if found.lower().endswith(BATCH_SUFFIXES):
@@ -239,6 +280,10 @@ def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess
 
     呼び出し元の標準入力は渡さない（人が見ていない実行で、入力を待って止まり続けないように）。
     時間切れなら、起動したプロセスを止めてから subprocess.TimeoutExpired を送出する。
+
+    止めた後は、出力の終わりを待たない。起動したプロセスが残した子プロセスが出力の口を持ったままだと、
+    その子が終わるまで戻れなくなる（打ち切りは、人が見ていない実行の最後の歯止め）。
+    打ち切った実行の出力は使わないので、読み残してよい。
     """
     with subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -246,11 +291,7 @@ def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            kill_tree(proc)
-            proc.communicate()          # 止めた後の残りの出力を読み切る
-            raise
-        except BaseException:           # 中断（Ctrl-C、終了の合図）
+        except BaseException:           # 時間切れ、中断（Ctrl-C、終了の合図）
             kill_tree(proc)
             raise
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
@@ -713,7 +754,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(shell_line(worktree, cmd))
         return 0
-    cmd = launchable(cmd)
+    cmd = launchable(cmd, (root, worktree))
 
     seen = record_count(state, args.gate)
     before = tree_id(worktree)

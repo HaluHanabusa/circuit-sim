@@ -50,8 +50,6 @@ BILLING_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # 値まで記録してよいもの。版の表示（数字、英字、空白、かっこ）と、種類を表す語（英小文字と _ だけ）
 VERSION_TEXT = re.compile(r"[A-Za-z0-9_.+\-() ]{1,60}")
 WORD = re.compile(r"[a-z][a-z_]{0,39}")
-KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
-MAX_KEYS = 40
 
 # ハーネスが読む項目（cycle.headless_verdict と cmd_run）と、形を知っておきたい項目
 FIELDS = (
@@ -60,6 +58,13 @@ FIELDS = (
 )
 NUMBER_FIELDS = ("total_cost_usd", "num_turns", "duration_ms")
 WORD_FIELDS = ("type", "subtype")
+
+# 結果に名前を残してよい項目。ここに無い名前は、個数だけを記録する
+# （項目の名前の位置に秘密のような文字列が入っていても、結果には残さない）
+KNOWN_KEYS = frozenset({
+    *FIELDS, "duration_api_ms", "usage", "modelUsage", "permission_denials", "uuid", "errors", "stop_reason",
+})
+KNOWN_RESULT_KEYS = frozenset(cycle.VERDICT_SCHEMA["properties"])
 
 
 # ------------------------------------------------------------------ 環境
@@ -89,9 +94,12 @@ def encoding_info() -> dict:
     }
 
 
-def command_info(name: str) -> dict:
-    """コマンドの有無と版。版は --version の1行目を、版の表示らしい文字のときだけ記録する。"""
-    found = cycle.find_command(name)
+def command_info(name: str, root: Path) -> dict:
+    """コマンドの有無と版。版は --version の1行目を、版の表示らしい文字のときだけ記録する。
+
+    実行した場所と本体（root）の中にあるものは、見つけても使わない（版を聞くための起動もしない）。
+    """
+    found = cycle.find_command(name, (root,))
     if found is None:
         return {"found": False}
     info = {"found": True, "file": Path(found).name, "runs": False, "version": None}
@@ -138,11 +146,26 @@ def kind(value: object) -> str:
     return "object" if isinstance(value, dict) else "other"
 
 
-def key_names(data: object) -> list[str]:
-    """項目の名前の一覧（名前らしい形のものだけ、数を限って）。値は含めない。"""
-    if not isinstance(data, dict):
-        return []
-    return sorted(key for key in data if isinstance(key, str) and KEY_NAME.fullmatch(key))[:MAX_KEYS]
+def key_names(data: object, known: frozenset[str]) -> tuple[list[str], int]:
+    """項目の名前のうち、あらかじめ決めた一覧（known）にあるものと、それ以外の個数。値は含めない。"""
+    keys = list(data) if isinstance(data, dict) else []
+    return sorted(key for key in keys if key in known), sum(1 for key in keys if key not in known)
+
+
+def result_as_json(data: dict) -> dict | None:
+    """structured_output が無いとき、result（文字列）が JSON として読めるか。読めた中身は記録しない。
+
+    ハーネスが読むのは structured_output だけ。本物の CLI が、結果を result の側に JSON の文字列で返すなら、
+    ハーネスの読み方を直す必要がある。その判断の材料にする。当てはまらない場合は None。
+    """
+    text = data.get("result")
+    if isinstance(data.get("structured_output"), dict) or not isinstance(text, str):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"readable": False}
+    return {"readable": True, "kind": kind(parsed), "fits_schema": cycle.schema_problem(parsed) == ""}
 
 
 def last_result(items: list) -> dict | None:
@@ -193,7 +216,7 @@ def describe_fields(data: dict) -> dict:
         elif name == "session_id":
             entry["empty"] = not value
         elif name == "structured_output":
-            entry["keys"] = key_names(value)
+            entry["keys"], entry["other_keys"] = key_names(value, KNOWN_RESULT_KEYS)
             entry["problem"] = cycle.schema_problem(value)
             if not entry["problem"]:
                 entry["verdict"] = value["verdict"]
@@ -241,12 +264,15 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
     }
     # 出力が JSON でないときは、そこにエラーの文面が出ていることがある
     messages = stderr if data is not None else "\n".join(part for part in (stdout, stderr) if part)
+    keys, other_keys = key_names(data, KNOWN_KEYS)
     return {
         "returncode": returncode,
         "stdout": {"form": form, "characters": len(stdout)},
         "messages": describe_messages(messages, options),
-        "keys": key_names(data),
+        "keys": keys,
+        "other_keys": other_keys,
         "fields": fields,
+        "result_as_json": result_as_json(data) if data is not None else None,
         "harness_verdict": verdict,
         "unexpected": [name for name, ok in expected.items() if not ok],
     }
@@ -264,10 +290,10 @@ def headless_info(root: Path, budget: float, timeout: int, allow_api_billing: bo
             "変数を外すか、料金が掛かってよければ --allow-api-billing を付けてください"
         )
         return {"ran": False, "reason": "api_key_set"}
-    if cycle.find_command(cmd[0]) is None:
-        return {"ran": False, "reason": "claude_not_found"}
     try:
-        launch = cycle.launchable(cmd)
+        launch = cycle.launchable(cmd, (root,))
+    except cycle.CommandNotFound:
+        return {"ran": False, "reason": "claude_not_found"}
     except cycle.CycleError:
         return {"ran": False, "reason": "cannot_pass_arguments"}
 
@@ -352,6 +378,11 @@ def headless_lines(headless: dict) -> list[str]:
         f"ハーネスの判定 {headless['harness_verdict']}",
         f"あった項目: {'、'.join(present) or 'なし'}",
     ]
+    as_json = headless["result_as_json"]
+    if as_json is not None:
+        fits = "決まった形に合う" if as_json.get("fits_schema") else "決まった形には合わない"
+        readable = f"JSON として読める（{fits}）" if as_json["readable"] else "JSON として読めない"
+        lines.append(f"structured_output が無い。result の文字列は {readable}")
     messages = headless["messages"]
     if messages["rejected_options"]:
         lines.append(f"CLI が知らないと言ったオプション: {'、'.join(messages['rejected_options'])}")
@@ -411,9 +442,9 @@ def main(argv: list[str] | None = None) -> int:
         "os": os_info(),
         "python": python_info(),
         "encoding": encoding_info(),
-        "git": command_info("git"),
+        "git": command_info("git", root),
         "claude": {
-            **command_info("claude"),
+            **command_info("claude", root),
             "api_key_env_set": any(os.environ.get(name) for name in BILLING_VARS),
         },
         "check": check_info(root, args.no_check),

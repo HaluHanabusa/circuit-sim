@@ -626,13 +626,6 @@ def test_check_that_cannot_be_launched_is_an_error_not_a_pass(tmp_path):
     assert "scripts/check.py を起動できない" in output
 
 
-@product_bug(
-    "major",
-    "打ち切られた claude が、出力の口を持ったままの子プロセスを残すと、run が --timeout を過ぎても戻らない。",
-    "main では、打ち切ってすぐに error を記録して戻る（Linux での後退。W1 の基準5）。",
-    "Windows では、taskkill /T が子プロセスも止めるので戻る。",
-    condition=not WINDOWS,
-)
 def test_headless_timeout_returns_even_when_the_cli_left_a_child_holding_its_output(tmp_path):
     """--timeout は、claude が子プロセスを残していても効く（人が見ていない実行の、最後の歯止め）。"""
     root = started(tmp_path)
