@@ -155,8 +155,10 @@ STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGBREAK")
 # 自動確認のスクリプト。作業ツリーの直下から見た場所（git の中の名前と同じく、区切りは /）
 CHECK_SCRIPT = "scripts/check.py"
 
-# Windows の起動用のファイル（claude.cmd など）は cmd.exe を通る。そこで別の意味になる文字は渡せない。
+# Windows で起動できるファイルの拡張子。このうち起動用のファイル（claude.cmd など）は cmd.exe を通る。
+# そこで別の意味になる文字は渡せない。
 BATCH_SUFFIXES = (".cmd", ".bat")
+LAUNCH_SUFFIXES = (".exe", ".com", *BATCH_SUFFIXES)
 BATCH_UNSAFE = "%^&|<>\r\n"
 
 # Windows では、他のプロセスが開いているファイルの置き換えと、置き換えの最中のファイルの読み取りが、
@@ -193,18 +195,16 @@ def stop_signals() -> list[signal.Signals]:
 
 
 def find_command(name: str) -> str | None:
-    """コマンドの実体の場所。見つからなければ None。
+    """コマンドの実体の場所。見つからなければ None。端末でその名前を打ったときと同じ順（PATH の順）で探す。
 
     Windows では claude.exe や claude.cmd のように拡張子が付く。拡張子の無い同名のファイル
-    （シェル用の起動スクリプト）は起動できないので、拾わない。cmd.exe を通らない .exe を先に探す。
+    （npm が一緒に置く、シェル用の起動スクリプト）は起動できないので、拡張子を付けて探し直す。
     """
-    if not WINDOWS:
-        return shutil.which(name)
-    for suffix in (".exe", *BATCH_SUFFIXES):
-        found = shutil.which(name + suffix)
-        if found:
-            return found
-    return None
+    found = shutil.which(name)
+    if WINDOWS and found and not found.lower().endswith(LAUNCH_SUFFIXES):
+        candidates = (shutil.which(name + suffix) for suffix in LAUNCH_SUFFIXES)
+        found = next((path for path in candidates if path), None)
+    return found
 
 
 def launchable(cmd: list[str]) -> list[str]:
@@ -226,7 +226,7 @@ def launchable(cmd: list[str]) -> list[str]:
 
 
 def shell_line(cwd: Path, cmd: list[str]) -> str:
-    """人が端末に貼って実行できる形の1行。"""
+    """人が端末に貼って実行できる形の1行（Windows では、コマンド プロンプト用の書き方）。"""
     if WINDOWS:
         return f"cd /d {subprocess.list2cmdline([str(cwd)])} && {subprocess.list2cmdline(cmd)}"
     return f"cd {shlex.quote(str(cwd))} && {shlex.join(cmd)}"
@@ -242,10 +242,11 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess.CompletedProcess:
     """コマンドを実行して、出力を UTF-8 の文字列で受け取る。
 
+    呼び出し元の標準入力は渡さない（人が見ていない実行で、入力を待って止まり続けないように）。
     時間切れなら、起動したプロセスを止めてから subprocess.TimeoutExpired を送出する。
     """
     with subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace",
     ) as proc:
         try:

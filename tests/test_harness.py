@@ -186,14 +186,16 @@ def cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subproce
     return subprocess.CompletedProcess(args, code, out.getvalue(), err.getvalue())
 
 
-def start_cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.Popen:
+def start_cycle(
+    root: Path, *args: str, env: dict[str, str] | None = None, stdin: int | None = None,
+) -> subprocess.Popen:
     """cycle.py をコマンドラインから起動し、終わるのを待たずに返す（並行する実行、ロック、中断の確認用）。"""
     if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     else:           # 呼び出し元が SIGINT を無視していても、既定の扱い（KeyboardInterrupt）に戻す
         options = {"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)}
     return subprocess.Popen(
-        [sys.executable, str(CYCLE), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [sys.executable, str(CYCLE), *args], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", env=cycle_env(root, env), **options,
     )
 
@@ -358,7 +360,10 @@ def test_merge_succeeds_when_all_gates_pass(repo):
     assert "review: pass（rev-1）" in message
     assert sh(wt, "git", "rev-parse", "HEAD") in message
     assert message.endswith("\n\nReviewed-by: someone")
-    assert (repo / state(repo)["gates"]["check"]["report"]).is_file()
+    # 記録に残すパスは、どのOSでも / 区切り
+    report = state(repo)["gates"]["check"]["report"]
+    assert report.startswith(".cycle/runs/U1-check-") and (repo / report).is_file()
+    assert state(repo)["spec"] == "docs/plan/U1-demo.md"
     assert not (repo / ".cycle" / "merge-pending.json").exists()
     assert "U1（docs/plan/U1-demo.md、担当 solver-engineer）  統合済み" in cycle(repo, "status", "U1").stdout
 
@@ -937,6 +942,8 @@ def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path):
     implement(repo)
     env = fake_claude(tmp_path, headless())
     assert cycle(repo, "run", "U1", "review", "--budget", "2.5", env=env).returncode == 0
+    report = state(repo)["gates"]["review"]["report"]
+    assert report.startswith(".cycle/runs/U1-review-") and (repo / report).is_file()
     argv = claude_argv(tmp_path)
     assert argv[0] == "-p"
     assert argv[1] == CYCLE_MODULE.GATE_PROMPT["review"].format(spec="docs/plan/U1-demo.md")
@@ -946,6 +953,18 @@ def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path):
         "--agent": "code-reviewer", "--output-format": "json", "--permission-mode": "acceptEdits",
         "--max-budget-usd": "2.5", "--allowedTools": "Read,Bash,Grep,Glob",
     }
+
+
+def test_headless_cli_does_not_get_the_callers_standard_input(repo, tmp_path):
+    """人が見ていない実行で、claude が呼び出し元の入力を待って止まり続けないようにする。"""
+    implement(repo)
+    seen = tmp_path / "stdin.txt"
+    script = f"pathlib.Path({str(seen)!r}).write_text(ascii(sys.stdin.readline()), encoding='utf-8')"
+    env = fake_claude(tmp_path, headless(), script=script)
+    proc = start_cycle(repo, "run", "U1", "review", env=env, stdin=subprocess.PIPE)
+    proc.communicate("input of the caller\n", timeout=30)
+    assert proc.returncode == 0
+    assert seen.read_text(encoding="utf-8") == "''"
 
 
 def test_file_named_claude_that_cannot_be_launched_is_not_picked(repo, tmp_path):
@@ -1129,6 +1148,20 @@ def test_state_write_waits_while_another_process_has_the_file_open(repo):
     with busy_wait(5.0), mock.patch.object(os, "replace", busy_twice):
         record(repo, "implement", "impl-2")
     assert len(calls) == 3
+    assert state(repo)["gates"]["implement"]["by"] == "impl-2"
+
+
+@only_windows("開いているファイルの置き換えが拒まれるのは Windows だけ")
+def test_record_is_written_while_another_program_has_the_state_file_open(repo):
+    """模擬ではなく、本当に開いたままにして確かめる（エディタやウイルス対策が、一時的に開くことがある）。"""
+    implement(repo)
+    handle = open(repo / ".cycle" / "state" / "U1.json", encoding="utf-8")
+    closing = threading.Timer(0.5, handle.close)
+    closing.start()
+    try:
+        record(repo, "implement", "impl-2")
+    finally:
+        closing.join()
     assert state(repo)["gates"]["implement"]["by"] == "impl-2"
 
 

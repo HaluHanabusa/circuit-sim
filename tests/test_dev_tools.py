@@ -109,7 +109,7 @@ def test_doctor_reports_the_environment(root, tmp_path):
     assert result["git"]["version"].startswith("git version ")
     assert result["claude"]["found"] and result["claude"]["runs"]
     assert result["claude"]["version"] == "9.9.9 (fake)"
-    assert result["claude"]["file"] == ("claude.cmd" if os.name == "nt" else "claude")
+    assert result["claude"]["file"].lower() == ("claude.cmd" if os.name == "nt" else "claude")
     assert result["claude"]["api_key_env_set"] is False
     check = result["check"]
     assert check["ran"] and check["passed"] and check["returncode"] == 0 and check["seconds"] >= 0
@@ -221,7 +221,7 @@ def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp
     head = result["headless"]
     assert head["ran"] is True and head["timed_out"] is False and head["unexpected"] == []
     assert head["options"] == argv[0::2]
-    assert head["launcher"] == ("claude.cmd" if os.name == "nt" else "claude")
+    assert head["launcher"].lower() == ("claude.cmd" if os.name == "nt" else "claude")
     assert head["returncode"] == 0 and head["harness_verdict"] == "pass"
     assert head["stdout"]["form"] == "json_object"
     assert head["fields"]["is_error"] == {"present": True, "kind": "boolean", "value": False}

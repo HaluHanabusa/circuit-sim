@@ -14,10 +14,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 実行中の Python から起動する（PATH の上にある、別の環境の ruff や pytest を使わない）
+# 実行中の Python から起動する（PATH の上にある、別の環境の ruff や pytest を使わない）。
+# -rs は、スキップした試験と理由を最後に一覧にする（OSに無い機能の試験を、どれだけ飛ばしたかが記録に残る）
 STEPS = (
     [sys.executable, "-m", "ruff", "check", "."],
-    [sys.executable, "-m", "pytest", "-q"],
+    [sys.executable, "-m", "pytest", "-q", "-rs"],
 )
 
 

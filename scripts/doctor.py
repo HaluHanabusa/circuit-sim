@@ -357,7 +357,10 @@ def headless_lines(headless: dict) -> list[str]:
         lines.append(f"CLI が知らないと言ったオプション: {'、'.join(messages['rejected_options'])}")
     if messages["mentions_login"]:
         lines.append("エラーの文面が、サインインや認証に触れている（claude を起動して、状態を確かめる）")
-    lines.append("くわしい原因は、上の「実行するコマンド」を端末で実行して確かめる（その出力は記録されない）")
+    lines.append(
+        "くわしい原因は、上の「実行するコマンド」を端末（Windows ではコマンド プロンプト）で実行して確かめる"
+        "（その出力は記録されない）"
+    )
     return lines
 
 

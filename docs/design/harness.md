@@ -115,3 +115,54 @@ PowerShell では、1行目を `$TREE = python scripts/cycle.py snapshot E1a` �
 - `.cycle/state/<ID>.lock`、`.cycle/merge.lock`: 記録と統合のロック（中身は空）
 - `.cycle/merge-pending.json`: 取り込みの間だけある控え（作業単位、取り込み前のコミット、取り込むコミット）。残っていたら、前回の `merge` が途中で止まっている
 - `.cycle/runs/`: ヘッドレス実行の生の出力、自動確認のログ（取り込んだ後の確認は `<ID>-merge-check-*.log`）
+
+## 7. OSの違いと、環境の確認
+
+対象は Windows、macOS、Linux。ゲートの決まり（2章）は、どのOSでも同じコードが強制する。
+
+### OSで違う箇所
+
+`scripts/cycle.py` の「OSの違い」の節にまとめてある。ほかの場所では、OSを見て分岐しない。
+
+| 項目 | Linux / macOS | Windows |
+|---|---|---|
+| ロック | `fcntl.flock` | `msvcrt.locking`（ロックのファイルの先頭1バイト。取れるまで待つ） |
+| 終了の合図（統合を取り消してから終わる） | Ctrl-C、SIGTERM、SIGHUP | Ctrl-C、Ctrl-Break |
+| 後始末ができない止まり方（決まり7の控えで、次の `merge` が戻す） | kill -9、電源断 | タスクの強制終了（`taskkill /F`）、端末を閉じる、電源断 |
+| `claude` の見つけ方 | PATH の上の `claude` | PATH の上の `claude.exe`、`claude.cmd`、`claude.bat`。拡張子の無い同名のファイル（シェル用）は使わない |
+| `claude.cmd` を通る起動 | — | cmd.exe を通るので、引数に `%` `^` `&` `\|` `<` `>` と改行があれば、起動せずにエラーにする（崩れた指示を渡さない） |
+| 時間切れ、中断で止める範囲 | 起動したプロセス | 起動したプロセスと、その先のプロセス（`taskkill /T`）。`claude.cmd` の先の本体まで止める |
+| 状態ファイルの置き換えと読み取り | そのまま | 他のプロセスが開いている間は一時的に拒まれるので、5秒まで待ってやり直す。それでも駄目ならエラーで終わる（記録は変えない） |
+
+どのOSでも共通にしていること:
+
+- ファイルは UTF-8 で読み書きする。状態ファイルの改行は LF。記録に残すパス（仕様、ログ）は `/` 区切り。
+- git と `claude` の出力は UTF-8 として読む。自動確認（`scripts/check.py`）は `cycle.py` と同じ Python で起動し、出力を UTF-8 で受け取る。
+- `claude` には、呼び出し元の標準入力を渡さない（入力を待って止まり続けないように）。
+- 画面に出せない文字（UTF-8 でない端末での日本語や記号）は `?` に置き換えて表示する。例外では止まらない。
+- リポジトリの改行は `.gitattributes` で LF に固定している。
+
+### 自動テスト
+
+`.github/workflows/ci.yml`。どのブランチへの push でも走る（同じリポジトリのプルリクエストでは、push の側だけが走る）。
+
+- Linux（Python 3.11、3.12、3.13）と Windows（3.11、3.13）。
+- 中身は `python scripts/doctor.py`（その中で `scripts/check.py` = ruff と pytest）と、cp932 の端末（`PYTHONIOENCODING=cp932`）での `python -m circuit_sim` の実行2件。
+- Windows の実行は、文字コードの設定を足していない素の状態（既定の文字コードは UTF-8 ではない）で流す。
+- ハーネスの試験は Windows でも同じものが走る。スキップするのは、Windows に無い機能そのものを試す3件（他のプロセスへ SIGINT、SIGTERM、SIGHUP を送って `merge` を止める試験）だけ。その代わりに、Ctrl-Break で止める試験が Windows でだけ走る（Linux では、この1件をスキップする）。Ctrl-C で止めた場合の取り消しは、同じプロセスの中で起こす試験が、どのOSでも確かめる。スキップした試験と理由は、実行ログの最後に一覧で出る（`pytest -rs`）。
+
+### 環境の確認（`scripts/doctor.py`）
+
+自分のPCで、開発の道具が動く環境かどうかを確かめる。
+
+```bash
+python scripts/doctor.py               # OS、Python、文字コード、git、claude の有無と版、scripts/check.py の結果
+python scripts/doctor.py --no-check    # scripts/check.py（数分かかる）を省く
+python scripts/doctor.py --headless    # 加えて、本物の claude -p を1回だけ実行して、出力の形を確かめる
+```
+
+- 結果は画面と `.cycle/doctor-result.json` に出る。終了コードは、必要なもの（Python 3.11 以上、git、`scripts/check.py` の合格、頼まれたヘッドレスの確認）に問題が無ければ 0。`claude` が無いことは、それだけでは問題にしない（セッション内で動かせる）。
+- `--headless` は、付けたときだけ実行する。Claudeの利用枠を少し使うので、実行の前に、何をするか（役割、道具、上限額、指示の全文、実行するコマンド）を表示する。コマンドは `cycle.py run` と同じ関数で組み立てる（`--agent`、`--output-format json`、`--json-schema`、`--permission-mode`、`--max-budget-usd`、`--allowedTools`）。指示は「何も読まず、決まった形の結果だけを返す」という最小のもの。
+- APIキーの環境変数（`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`）が設定されていると、利用枠ではなくAPIの料金になる。その場合は実行せずに知らせる（`--allow-api-billing` を付けたときだけ実行する）。
+- 記録するのは形と真偽だけ: 終了コード、出力の形（JSON のオブジェクトか、一覧か、行ごとか、JSON でないか）、最上位の項目の名前、`is_error`・`subtype`・`structured_output`・`session_id`・`result` などの有無と型、ハーネスが同じ出力を読んだときの判定、前提と違っていた点の一覧（`unexpected`）。値まで記録するのは、真偽、数（費用の概算など）、種類を表す英小文字の語（`success` など）だけ。
+- 記録しないもの: 応答の本文（`result`、`summary`、基準や指摘の文面）、セッションのID、エラーの文面、環境変数の中身、コマンドの置き場所。エラーの文面からは、「こちらが渡したオプションのうち、CLIが知らないと言ったもの」と「サインインや認証に触れているか」だけを取り出す。くわしい原因は、表示されたコマンドを自分の端末で実行して確かめる。
