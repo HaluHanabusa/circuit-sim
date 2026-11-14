@@ -1,3 +1,9 @@
+---
+id: E1a
+owner: solver-engineer
+needs_ux: false
+---
+
 # E1a: スイッチング回路エンジン
 
 担当: solver-engineer ／ 依存: E0（完了） ／ 次: E1b（制御ブロックと降圧コンバータのテンプレート）
