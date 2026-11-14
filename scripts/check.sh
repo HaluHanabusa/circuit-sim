@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# マージ前に必ず通す確認。使い方: scripts/check.sh
+# 統合前に必ず通す確認。中身は scripts/check.py（どのOSでも同じに動く）。使い方: scripts/check.sh
 set -euo pipefail
-cd "$(dirname "$0")/.."
-ruff check .
-python -m pytest -q
+exec python "$(dirname "$0")/check.py"

@@ -1,9 +1,10 @@
 """開発サイクルのスクリプト（scripts/cycle.py）が、ゲートの決まりを守らせることを確かめる。
 
 どのテストも、決まりを1つ外すと落ちるように書く（スクリプトを1か所ずつ壊して確かめている）。
+Windows、macOS、Linux のどれでも同じ試験を流す。偽の確認スクリプトと偽の claude は Python で書く。
+OSに無い機能そのものを試す場合だけ、理由を付けてスキップする。
 """
 import contextlib
-import fcntl
 import importlib.util
 import io
 import json
@@ -11,31 +12,57 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 CYCLE = Path(__file__).resolve().parents[1] / "scripts" / "cycle.py"
 
 
-def load_main():
+def load_cycle():
     spec = importlib.util.spec_from_file_location("cycle_script", CYCLE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.main
+    return module
 
 
-CYCLE_MAIN = load_main()
+CYCLE_MODULE = load_cycle()
+CYCLE_MAIN = CYCLE_MODULE.main
 
-# 試験の中の git は、利用者の設定（署名、フックなど）や、呼び出し元の GIT_DIR などに左右されないようにする
+# 利用者の git の設定の代わりに読ませる、空のファイル
+EMPTY_GIT_CONFIG = Path(tempfile.gettempdir()) / "circuit-sim-test-empty.gitconfig"
+EMPTY_GIT_CONFIG.write_text("", encoding="utf-8")
+
+# 試験の中の git は、利用者の設定（署名、フック、改行の変換など）や、呼び出し元の GIT_DIR などに
+# 左右されないようにする。起動した Python の出力は、端末の文字コードに依らず UTF-8 で受け取る
 TEST_ENV = {
     **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
-    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": str(EMPTY_GIT_CONFIG), "GIT_CONFIG_NOSYSTEM": "1",
+    "PYTHONIOENCODING": "utf-8",
 }
+
+
+
+def only_posix(reason: str) -> pytest.MarkDecorator:
+    return pytest.mark.skipif(WINDOWS, reason=reason)
+
+
+def only_windows(reason: str) -> pytest.MarkDecorator:
+    return pytest.mark.skipif(not WINDOWS, reason=reason)
+
 
 SPEC = """---
 id: U1
@@ -45,14 +72,67 @@ owner: solver-engineer
 # U1: 試験用の作業単位
 """
 
-# 試験用の確認スクリプト。FAIL があるか、A と B が両方あると失敗する
-CHECK = "#!/bin/sh\ntest ! -f FAIL && { test ! -f A || test ! -f B; }\n"
+# 試験用の確認スクリプト（scripts/check.py）。FAIL があるか、A と B が両方あると失敗する
+CHECK = """\
+import pathlib
+import sys
+
+have = {name for name in ("FAIL", "A", "B") if pathlib.Path(name).exists()}
+sys.exit(1 if "FAIL" in have or {"A", "B"} <= have else 0)
+"""
+
+# 環境変数 HANG があるときだけ、印を置いて止まる確認スクリプト（印に .stop を付けたファイルが置かれるまで）
+HANGING_CHECK = """\
+import os
+import pathlib
+import time
+
+hang = os.environ.get("HANG")
+if hang:
+    pathlib.Path(hang).touch()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not pathlib.Path(hang + ".stop").exists():
+        time.sleep(0.02)
+"""
+
+# 環境変数 WAIT があれば合図を待ってから合格し、BROKEN があれば失敗する確認スクリプト
+WAITING_CHECK = """\
+import os
+import pathlib
+import sys
+import time
+
+wait = os.environ.get("WAIT")
+if wait:
+    pathlib.Path(wait + ".started").touch()
+    while not pathlib.Path(wait + ".go").exists():
+        time.sleep(0.02)
+sys.exit(1 if os.environ.get("BROKEN") else 0)
+"""
+
+# 偽の claude。受け取った引数を控え、script を実行してから、用意された出力を返す
+FAKE_CLAUDE = """\
+import json
+import pathlib
+import sys
+import time
+
+here = pathlib.Path({here!r})
+(here / "argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+if "--version" in sys.argv:
+    print("9.9.9 (fake)")
+    sys.exit(0)
+{script}
+sys.stdout.buffer.write((here / "out.json").read_bytes())
+sys.stderr.buffer.write((here / "err.txt").read_bytes())
+sys.exit({exit_code})
+"""
 
 PASS = {"verdict": "pass", "summary": "ok", "criteria": [], "issues": []}
 
 
 def sh(cwd: Path, *args: str) -> str:
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, env=TEST_ENV)
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", env=TEST_ENV)
     assert proc.returncode == 0, proc.stderr
     return proc.stdout.strip()
 
@@ -61,8 +141,7 @@ def make_repo(base: Path) -> Path:
     root = base / "repo"
     (root / "scripts").mkdir(parents=True)
     (root / "docs" / "plan").mkdir(parents=True)
-    (root / "scripts" / "check.sh").write_text(CHECK, encoding="utf-8")
-    (root / "scripts" / "check.sh").chmod(0o755)
+    (root / "scripts" / "check.py").write_text(CHECK, encoding="utf-8")
     (root / "docs" / "plan" / "U1-demo.md").write_text(SPEC, encoding="utf-8")
     (root / ".gitignore").write_text(".cycle/\n", encoding="utf-8")
     (root / "product.py").write_text("x = 1\n", encoding="utf-8")
@@ -109,10 +188,33 @@ def cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subproce
 
 def start_cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.Popen:
     """cycle.py をコマンドラインから起動し、終わるのを待たずに返す（並行する実行、ロック、中断の確認用）。"""
+    if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
+        options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:           # 呼び出し元が SIGINT を無視していても、既定の扱い（KeyboardInterrupt）に戻す
+        options = {"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)}
     return subprocess.Popen(
-        [sys.executable, str(CYCLE), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env=cycle_env(root, env), preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        [sys.executable, str(CYCLE), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", env=cycle_env(root, env), **options,
     )
+
+
+def run_cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """cycle.py をコマンドラインから起動して、終わるまで待つ。"""
+    proc = start_cycle(root, *args, env=env)
+    out, err = proc.communicate(timeout=60)
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+@contextlib.contextmanager
+def held_lock(path: Path) -> Iterator[None]:
+    """別の実行がロックを持っている状態を作る（スクリプトの実装を通さず、OSの仕組みを直接使う）。"""
+    with open(path, "a", encoding="utf-8") as handle:
+        if WINDOWS:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def state(root: Path) -> dict:
@@ -160,16 +262,39 @@ def set_header(root: Path, extra: str) -> None:
     commit(root, "仕様の見出し")
 
 
-def fake_claude(tmp_path: Path, output: object, script: str = "", exit_code: int = 0) -> dict[str, str]:
-    """偽の claude を PATH の先頭に置く環境変数を返す。script を実行してから output を出力する。"""
+def install_command(directory: Path, name: str, source: str) -> None:
+    """Python で書いたコマンドを、その名前で起動できる形で directory に置く。
+
+    Windows では、npm で入れた CLI と同じ形（名前.cmd が実体を呼ぶ）にする。
+    それ以外では、実行できるファイルにする。
+    """
+    if WINDOWS:
+        script = directory / f"{name}-script.py"
+        script.write_text(source, encoding="utf-8")
+        # cmd.exe が読むファイルなので、cmd.exe の文字コードで書く
+        (directory / f"{name}.cmd").write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="oem")
+    else:
+        command = directory / name
+        command.write_text(f"#!{sys.executable}\n{source}", encoding="utf-8")
+        command.chmod(0o755)
+
+
+def fake_claude(
+    tmp_path: Path, output: object, script: str = "", exit_code: int = 0, stderr: str = "",
+) -> dict[str, str]:
+    """偽の claude を PATH の先頭に置く環境変数を返す。script（Python）を実行してから output を出力する。"""
     fake = tmp_path / "bin"
     fake.mkdir(exist_ok=True)
     text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
     (fake / "out.json").write_text(text, encoding="utf-8")
-    body = f"#!/bin/sh\n{script}\ncat '{fake}/out.json'\nexit {exit_code}\n"
-    (fake / "claude").write_text(body, encoding="utf-8")
-    (fake / "claude").chmod(0o755)
-    return {"PATH": f"{fake}:{os.environ['PATH']}"}
+    (fake / "err.txt").write_text(stderr, encoding="utf-8")
+    install_command(fake, "claude", FAKE_CLAUDE.format(here=str(fake), script=script, exit_code=exit_code))
+    return {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+
+
+def claude_argv(tmp_path: Path) -> list[str]:
+    """偽の claude が最後に受け取った引数。"""
+    return json.loads((tmp_path / "bin" / "argv.json").read_text(encoding="utf-8"))
 
 
 def headless(structured: object = PASS, session: str = "s1", **top: object) -> dict:
@@ -189,11 +314,34 @@ def main_log(root: Path) -> list[str]:
 
 
 def test_command_line_entry_point(repo):
-    env = cycle_env(repo)
-    proc = subprocess.run([sys.executable, CYCLE, "status"], capture_output=True, text=True, env=env)
+    proc = run_cycle(repo, "status")
     assert proc.returncode == 0 and "進行中の作業単位は無い" in proc.stdout
-    proc = subprocess.run([sys.executable, CYCLE, "status", "U1"], capture_output=True, text=True, env=env)
+    proc = run_cycle(repo, "status", "U1")
     assert proc.returncode == 2 and "エラー: U1 はまだ始まっていない" in proc.stderr
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "cp932", "cp1252"])
+def test_output_does_not_crash_on_a_terminal_that_cannot_show_the_text(repo, encoding):
+    """UTF-8 でない端末（日本語 Windows の cp932 など）でも、表せない文字を置き換えて最後まで動く。"""
+    wt = implement(repo)
+    (wt / "µ.py").write_text("\n", encoding="utf-8")          # cp932 に無い文字の名前のファイル
+    pass_all(repo)
+    (wt / "µ.py").write_text("x = 1\n", encoding="utf-8")
+    env = {"PYTHONIOENCODING": encoding}
+    proc = subprocess.run(
+        [sys.executable, str(CYCLE), "status", "U1"], capture_output=True, env=cycle_env(repo, env),
+    )
+    out = proc.stdout.decode(encoding)
+    assert proc.returncode == 0 and proc.stderr == b"", proc.stderr.decode(encoding, errors="replace")
+    assert "review: " in out and ".py" in out
+    if encoding == "cp932":         # 日本語はそのまま出て、表せない µ だけが置き換わる
+        assert "review: 確認の後で変わったファイルがある（?.py）。やり直す" in out
+    # エラーの表示（標準エラー）も、同じ置き換えで出る
+    proc = subprocess.run(
+        [sys.executable, str(CYCLE), "status", "µ"], capture_output=True, env=cycle_env(repo, env),
+    )
+    assert proc.returncode == 2
+    assert b"Traceback" not in proc.stderr and b"\\x" not in proc.stderr and b"\\u" not in proc.stderr
 
 
 # ------------------------------------------------------------ 決まり1: 必要なゲート
@@ -565,7 +713,8 @@ def test_merge_refused_when_check_is_stale_or_failed(repo):
 
 def test_check_that_changes_the_content_is_not_a_pass(repo):
     wt = implement(repo)
-    (wt / "scripts" / "check.sh").write_text("#!/bin/sh\necho 'y = 1' >> product.py\n", encoding="utf-8")
+    script = "with open('product.py', 'a', encoding='utf-8') as out:\n    out.write('y = 1')\n"
+    (wt / "scripts" / "check.py").write_text(script, encoding="utf-8")
     result = cycle(repo, "check", "U1")
     assert result.returncode == 1
     assert "check: error" in result.stdout
@@ -574,11 +723,31 @@ def test_check_that_changes_the_content_is_not_a_pass(repo):
 
 def test_check_that_cannot_be_started_is_an_error_not_a_crash(repo):
     wt = implement(repo)
-    (wt / "scripts" / "check.sh").chmod(0o644)
+    (wt / "scripts" / "check.py").unlink()
     result = cycle(repo, "check", "U1")
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+    assert "check: error（scripts/check.py が無いので、確認を起動できない）" in result.stdout
     assert state(repo)["gates"]["check"]["verdict"] == "error"
+
+
+def test_check_runs_with_the_python_that_runs_the_harness(repo):
+    wt = implement(repo)
+    script = "import sys\nprint('python:' + sys.executable)\n"
+    (wt / "scripts" / "check.py").write_text(script, encoding="utf-8")
+    assert cycle(repo, "check", "U1").returncode == 0
+    log = (repo / state(repo)["gates"]["check"]["report"]).read_text(encoding="utf-8")
+    assert log.strip() == "python:" + sys.executable
+
+
+def test_check_output_is_recorded_as_utf8_whatever_the_terminal_encoding_is(repo):
+    wt = implement(repo)
+    (wt / "scripts" / "check.py").write_text("print('確認した µ')\n", encoding="utf-8")
+    result = cycle(repo, "check", "U1", env={"PYTHONIOENCODING": "cp932"})
+    assert result.returncode == 0, result.stdout
+    assert "check: pass（確認した µ）" in result.stdout
+    assert (repo / state(repo)["gates"]["check"]["report"]).read_text(encoding="utf-8") == "確認した µ\n"
+    assert state(repo)["gates"]["check"]["by"] == "scripts/check.py"
 
 
 def test_force_added_ignored_file_is_part_of_the_checked_content(repo):
@@ -729,7 +898,8 @@ def test_headless_pass_with_minor_findings_is_a_pass(repo, tmp_path):
 def test_confirmation_run_records_the_content_seen_before_the_run(repo, tmp_path):
     wt = implement(repo)
     # レビューの実行中に、製品のコードが変わる
-    env = fake_claude(tmp_path, headless(), script="echo 'x = 7' > product.py")
+    script = "pathlib.Path('product.py').write_text('x = 7', encoding='utf-8')"
+    env = fake_claude(tmp_path, headless(), script=script)
     assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
     record(repo, "verify", "ver-1", tree=snap(repo))
     assert cycle(repo, "check", "U1").returncode == 0
@@ -742,11 +912,14 @@ def test_confirmation_run_records_the_content_seen_before_the_run(repo, tmp_path
 
 def test_headless_run_that_times_out_is_not_a_pass(repo, tmp_path):
     implement(repo)
-    env = fake_claude(tmp_path, headless(), script="exec sleep 20")
+    env = fake_claude(tmp_path, headless(), script="time.sleep(20)")
+    started = time.monotonic()
     result = cycle(repo, "run", "U1", "review", "--timeout", "1", env=env)
     assert result.returncode == 1
-    assert "review: error" in result.stdout
+    assert "review: error（1 秒で終わらなかったので打ち切った）" in result.stdout
     assert state(repo)["gates"]["review"]["verdict"] == "error"
+    # 打ち切ったら、起動した先（Windows では claude.cmd が呼んだプロセス）も止めて、すぐに戻る
+    assert time.monotonic() - started < 15
 
 
 def test_missing_claude_is_reported_clearly(repo, tmp_path):
@@ -759,12 +932,100 @@ def test_missing_claude_is_reported_clearly(repo, tmp_path):
     assert "review" not in state(repo)["gates"]
 
 
+def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path):
+    """役割、指示、結果の形の指定が、起動用のファイル（Windows では claude.cmd）を通っても崩れない。"""
+    implement(repo)
+    env = fake_claude(tmp_path, headless())
+    assert cycle(repo, "run", "U1", "review", "--budget", "2.5", env=env).returncode == 0
+    argv = claude_argv(tmp_path)
+    assert argv[0] == "-p"
+    assert argv[1] == CYCLE_MODULE.GATE_PROMPT["review"].format(spec="docs/plan/U1-demo.md")
+    options = dict(zip(argv[2::2], argv[3::2], strict=True))
+    assert json.loads(options.pop("--json-schema")) == CYCLE_MODULE.VERDICT_SCHEMA
+    assert options == {
+        "--agent": "code-reviewer", "--output-format": "json", "--permission-mode": "acceptEdits",
+        "--max-budget-usd": "2.5", "--allowedTools": "Read,Bash,Grep,Glob",
+    }
+
+
+def test_file_named_claude_that_cannot_be_launched_is_not_picked(repo, tmp_path):
+    """Windows の npm は、拡張子の無い claude（シェル用のスクリプト）も置く。起動できるほうを使う。"""
+    implement(repo)
+    env = fake_claude(tmp_path, headless())
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / "claude").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")      # 実行の印は付けない
+    env = {"PATH": f"{decoy}{os.pathsep}{env['PATH']}"}
+    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
+
+
+def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, tmp_path):
+    implement(repo)
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    command = broken / ("claude.exe" if WINDOWS else "claude")
+    command.write_text("#!/no/such/interpreter\n", encoding="utf-8")      # 実行ファイルの形をしていない
+    command.chmod(0o755)
+    env = {"PATH": f"{broken}{os.pathsep}{os.environ['PATH']}"}
+    result = cycle(repo, "run", "U1", "review", env=env)
+    assert result.returncode == 2
+    assert "claude を起動できない" in result.stderr and "Traceback" not in result.stderr
+    assert "review" not in state(repo)["gates"]
+
+
+@pytest.mark.parametrize("found", ["C:/npm/claude.cmd", "C:/npm/claude.CMD", "C:/npm/claude.bat"])
+@pytest.mark.parametrize("unsafe", list("%^&|<>\r\n"))
+def test_arguments_that_cmd_exe_would_reinterpret_are_refused_for_batch_launchers(found, unsafe):
+    """claude.cmd は cmd.exe を通る。そこで別の意味になる文字を含む指示は、崩れて届く前に断る。"""
+    with mock.patch.object(CYCLE_MODULE, "find_command", return_value=found):
+        with pytest.raises(CYCLE_MODULE.CycleError, match="cmd.exe を通る"):
+            CYCLE_MODULE.launchable(["claude", "-p", f"前{unsafe}後", "--agent", "x"])
+        with pytest.raises(CYCLE_MODULE.CycleError, match="cmd.exe を通る"):
+            CYCLE_MODULE.launchable(["claude", "-p", "指示", "--agent", unsafe])
+
+
+@pytest.mark.parametrize("found", ["C:/npm/claude.cmd", "C:/bin/claude.exe", "/usr/bin/claude"])
+def test_arguments_are_passed_as_they_are_when_nothing_is_reinterpreted(found):
+    unsafe_only_for_batch = [] if found.endswith(".cmd") else ["a & b | c > d", "100%\n"]
+    cmd = ["claude", "-p", '指示（かっこ）、"引用"、{"a": [1, "b"]}', *unsafe_only_for_batch]
+    with mock.patch.object(CYCLE_MODULE, "find_command", return_value=found):
+        assert CYCLE_MODULE.launchable(cmd) == [found, *cmd[1:]]
+
+
+def test_interrupted_headless_run_stops_the_cli(repo, tmp_path):
+    """中断（Ctrl-C）されたら、起動した claude を止める（Windows では claude.cmd が呼んだ先も）。"""
+    implement(repo)
+    env, started, go = blocking_claude(tmp_path, "rev-s")
+    communicate = subprocess.Popen.communicate
+
+    def interrupted(self, *args, **kwargs):
+        if "claude" in Path(self.args[0]).name:
+            wait_for(started)
+            raise KeyboardInterrupt
+        return communicate(self, *args, **kwargs)
+
+    # 止め損なっても試験が止まり続けないよう、少し後で偽の claude に合図を出す
+    release = threading.Timer(1.5, go.touch)
+    release.start()
+    with mock.patch.object(subprocess.Popen, "communicate", interrupted), pytest.raises(KeyboardInterrupt):
+        cycle(repo, "run", "U1", "review", env=env)
+    release.join()
+    time.sleep(0.5)
+    assert not Path(f"{go}.seen").exists()          # 止められたので、合図を見ていない
+    assert "review" not in state(repo)["gates"]
+
+
 # ------------------------------------------------------------ 記録を失わない（並行実行）
 
 def blocking_claude(tmp_path: Path, session: str) -> tuple[dict[str, str], Path, Path]:
     """起動したら started を置き、go が置かれるまで待ってから合格を返す、偽の claude。"""
     started, go = tmp_path / "started", tmp_path / "go"
-    script = f"touch '{started}'\nwhile [ ! -f '{go}' ]; do sleep 0.02; done"
+    script = (
+        f"pathlib.Path({str(started)!r}).touch()\n"
+        f"while not pathlib.Path({str(go)!r}).exists():\n"
+        "    time.sleep(0.02)\n"
+        f"pathlib.Path({str(go)!r} + '.seen').touch()"
+    )
     return fake_claude(tmp_path, headless(session=session), script=script), started, go
 
 
@@ -816,12 +1077,7 @@ def test_pass_from_a_run_that_started_before_a_reset_is_not_adopted(repo, tmp_pa
 
 def test_pass_from_a_check_overtaken_by_another_check_is_not_adopted(repo, tmp_path):
     wt = implement(repo)
-    # WAIT があれば合図を待ってから合格し、BROKEN があれば失敗する確認スクリプト
-    script = (
-        '#!/bin/sh\nif [ -n "$WAIT" ]; then : > "$WAIT.started"; '
-        'while [ ! -f "$WAIT.go" ]; do sleep 0.02; done; fi\ntest -z "$BROKEN"\n'
-    )
-    (wt / "scripts" / "check.sh").write_text(script, encoding="utf-8")
+    (wt / "scripts" / "check.py").write_text(WAITING_CHECK, encoding="utf-8")
     wait = tmp_path / "wait"
     proc = start_cycle(repo, "check", "U1", env={"WAIT": str(wait)})
     wait_for(Path(f"{wait}.started"))
@@ -844,16 +1100,70 @@ def test_writing_commands_wait_for_the_lock(repo, command, lock):
     pass_all(repo)
     commit(wt)
     before = state(repo)
-    with open(repo / ".cycle" / lock, "a", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)                      # 別の実行がロックを持っている
+    with held_lock(repo / ".cycle" / lock):                     # 別の実行がロックを持っている
         proc = start_cycle(repo, *command)
         with pytest.raises(subprocess.TimeoutExpired):
             proc.wait(timeout=1.0)
         assert state(repo) == before
         assert main_log(repo) == ["init"]
-        fcntl.flock(handle, fcntl.LOCK_UN)
     assert proc.wait(timeout=30) == 0
     assert state(repo) != before
+
+
+def busy_wait(seconds: float) -> contextlib.AbstractContextManager:
+    """ファイルが使われている間、待ってやり直す秒数（Windows 以外では、ふだんは 0）を差し替える。"""
+    return mock.patch.object(CYCLE_MODULE, "BUSY_WAIT_SECONDS", seconds)
+
+
+def test_state_write_waits_while_another_process_has_the_file_open(repo):
+    """Windows では、他のプロセスが開いている間は置き換えが拒まれる。待ってやり直し、記録を失わない。"""
+    implement(repo)
+    replace, calls = os.replace, []
+
+    def busy_twice(source, target):
+        calls.append(target)
+        if len(calls) <= 2:
+            raise PermissionError(13, "他のプロセスが使っている")
+        replace(source, target)
+
+    with busy_wait(5.0), mock.patch.object(os, "replace", busy_twice):
+        record(repo, "implement", "impl-2")
+    assert len(calls) == 3
+    assert state(repo)["gates"]["implement"]["by"] == "impl-2"
+
+
+def test_state_that_cannot_be_written_is_an_error(repo):
+    implement(repo)
+
+    def refused(source, target):
+        raise PermissionError(13, "書けない")
+
+    with busy_wait(0.2), mock.patch.object(os, "replace", refused):
+        result = cycle(repo, "record", "U1", "implement", "--verdict", "pass", "--by", "impl-2")
+    assert result.returncode == 2
+    assert "U1.json を書けない" in result.stderr
+    assert state(repo)["gates"]["implement"]["by"] == "impl-1"
+    assert sorted(path.name for path in (repo / ".cycle" / "state").iterdir()) == ["U1.json", "U1.lock"]
+
+
+@pytest.mark.parametrize("failures, wait, code", [(2, 5.0, 0), (10**6, 0.2, 2)])
+def test_state_read_waits_while_the_file_is_being_replaced(repo, failures, wait, code):
+    implement(repo)
+    read_text, refused = Path.read_text, []
+
+    def busy(self, *args, **kwargs):
+        if self.name == "U1.json" and len(refused) < failures:
+            refused.append(self)
+            raise PermissionError(13, "置き換えの最中")
+        return read_text(self, *args, **kwargs)
+
+    with busy_wait(wait), mock.patch.object(Path, "read_text", busy):
+        result = cycle(repo, "status", "U1")
+    assert result.returncode == code
+    if code:
+        assert "U1.json を読めない" in result.stderr and "Traceback" not in result.stderr
+    else:
+        assert len(refused) == 2 and "implement  pass  impl-1" in result.stdout
 
 
 # ------------------------------------------------------------ 見るだけの操作は索引を変えない
@@ -875,7 +1185,7 @@ def test_reading_and_recording_leave_the_index_alone(repo, tmp_path):
     assert sh(wt, "git", "status", "--porcelain") == before
     # 索引は変えないが、内容にはステージしていないファイルも含めている
     assert sh(wt, "git", "ls-tree", "-r", "--name-only", tree).splitlines() == [
-        ".gitignore", "docs/plan/U1-demo.md", "product.py", "scripts/check.sh", "staged.py", "untracked.py",
+        ".gitignore", "docs/plan/U1-demo.md", "product.py", "scripts/check.py", "staged.py", "untracked.py",
     ]
 
 
@@ -997,7 +1307,7 @@ def test_merge_refuses_a_worktree_with_detached_head(repo):
 
 
 def test_start_refuses_a_directory_below_the_worktree_top(repo):
-    """下の階層を作業ツリーとして渡すと、そこに置いた別の scripts/check.sh が使われてしまう。"""
+    """下の階層を作業ツリーとして渡すと、そこに置いた別の scripts/check.py が使われてしまう。"""
     wt = repo.parent / "wt" / "U1"
     sh(repo, "git", "worktree", "add", "-q", str(wt), "-b", "U1")
     (wt / "sub").mkdir()
@@ -1063,8 +1373,8 @@ def test_merge_is_undone_when_check_cannot_be_started_on_main(repo):
     wt = implement(repo)
     pass_all(repo)
     commit(wt)
-    (repo / "scripts" / "check.sh").chmod(0o644)                # main 側で実行ビットが落ちている
-    commit(repo, "実行ビットを落とす")
+    sh(repo, "git", "rm", "-q", "scripts/check.py")             # main 側で確認スクリプトが無くなっている
+    commit(repo, "確認スクリプトを消す")
     before = sh(repo, "git", "rev-parse", "HEAD")
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1
@@ -1073,32 +1383,60 @@ def test_merge_is_undone_when_check_cannot_be_started_on_main(repo):
     assert_main_untouched(repo, before)
 
 
-def merge_stopped_during_check(root: Path, tmp_path: Path, stop: signal.Signals) -> str:
-    """取り込んだ後の check が走っている最中に、merge を止める。取り込み前の main のコミットを返す。"""
+def merge_stopped_during_check(root: Path, tmp_path: Path, stop: str) -> str:
+    """取り込んだ後の check が走っている最中に、merge を止める。取り込み前の main のコミットを返す。
+
+    stop は合図の名前（signal の中の名前）。KILL なら、後始末の機会が無い強制終了。
+    """
     wt = implement(root)
-    # 環境変数 HANG があるときだけ、印を置いて止まる確認スクリプト
-    script = '#!/bin/sh\nif [ -n "$HANG" ]; then : > "$HANG"; exec sleep 30; fi\n'
-    (wt / "scripts" / "check.sh").write_text(script, encoding="utf-8")
+    (wt / "scripts" / "check.py").write_text(HANGING_CHECK, encoding="utf-8")
     pass_all(root)
     commit(wt)
     before = sh(root, "git", "rev-parse", "HEAD")
     marker = tmp_path / "check-started"
     proc = start_cycle(root, "merge", "U1", env={"HANG": str(marker)})
-    wait_for(marker)                                            # 取り込んだ後の check が走っている
-    assert sh(root, "git", "rev-parse", "HEAD^1") == before     # 取り込みコミットが、もう main にある
-    proc.send_signal(stop)
-    assert proc.wait(timeout=30) != 0
+    try:
+        wait_for(marker)                                            # 取り込んだ後の check が走っている
+        assert sh(root, "git", "rev-parse", "HEAD^1") == before     # 取り込みコミットが、もう main にある
+        if stop == "KILL":
+            proc.kill()
+        else:
+            proc.send_signal(getattr(signal, stop))
+        assert proc.wait(timeout=30) != 0
+    finally:
+        Path(f"{marker}.stop").touch()          # 残った確認スクリプトを終わらせる
     return before
 
 
-@pytest.mark.parametrize("stop", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("stop", [
+    pytest.param("SIGINT", marks=only_posix("Windows には、他のプロセスへ SIGINT を送る手段が無い")),
+    pytest.param("SIGTERM", marks=only_posix("Windows の SIGTERM は強制終了で、後始末の機会が無い")),
+    pytest.param("SIGHUP", marks=only_posix("Windows には SIGHUP が無い")),
+    pytest.param("CTRL_BREAK_EVENT", marks=only_windows("Ctrl-Break の合図は Windows にだけある")),
+])
 def test_merge_is_undone_when_interrupted_during_check_on_main(repo, tmp_path, stop):
     before = merge_stopped_during_check(repo, tmp_path, stop)
     assert_main_untouched(repo, before)
 
 
+def test_merge_is_undone_when_interrupted_from_the_keyboard(repo):
+    """Ctrl-C（KeyboardInterrupt）。他のプロセスへ SIGINT を送れないOSでも確かめるため、試験の中で起こす。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    before = sh(repo, "git", "rev-parse", "HEAD")
+
+    def interrupted(cwd: Path) -> tuple[str, str, str]:
+        assert sh(repo, "git", "rev-parse", "HEAD^1") == before     # 取り込みコミットが、もう main にある
+        raise KeyboardInterrupt
+
+    with mock.patch.object(CYCLE_MODULE, "run_check", interrupted), pytest.raises(KeyboardInterrupt):
+        cycle(repo, "merge", "U1")
+    assert_main_untouched(repo, before)
+
+
 def test_merge_killed_during_check_is_undone_by_the_next_merge(repo, tmp_path):
-    before = merge_stopped_during_check(repo, tmp_path, signal.SIGKILL)
+    before = merge_stopped_during_check(repo, tmp_path, "KILL")
     # 後始末なしで終わったので、確認の済んでいない取り込みが main に残っている
     assert sh(repo, "git", "rev-parse", "HEAD^1") == before
     assert "注意: 前回の統合が途中で終わっている" in cycle(repo, "status").stdout
@@ -1112,7 +1450,7 @@ def test_merge_killed_during_check_is_undone_by_the_next_merge(repo, tmp_path):
 
 @pytest.mark.parametrize("after", ["commit_on_top", "edit", "other_branch"])
 def test_recovery_leaves_main_alone_when_it_changed_after_the_kill(repo, tmp_path, after):
-    merge_stopped_during_check(repo, tmp_path, signal.SIGKILL)
+    merge_stopped_during_check(repo, tmp_path, "KILL")
     if after == "commit_on_top":
         (repo / "note.txt").write_text("memo\n", encoding="utf-8")
         commit(repo, "その後の変更")

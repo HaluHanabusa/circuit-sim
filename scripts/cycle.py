@@ -12,19 +12,19 @@
   scripts/cycle.py record <ID> <gate> --verdict pass|fail --by <名前> --tree <ID> [--report <ファイル>]
                                                  セッション内で動かしたエージェントの結果を記録する
                                                  （--tree を省けるのは implement だけ）
-  scripts/cycle.py check <ID>                    作業ツリーで scripts/check.sh を実行して記録する
+  scripts/cycle.py check <ID>                    作業ツリーで scripts/check.py を実行して記録する
   scripts/cycle.py status [<ID>]                 ゲートの状況を表示する
   scripts/cycle.py merge <ID>                    必要なゲートがすべて合格のときだけ main に取り込む
 
 ゲート: implement（実装）、check（自動確認）、review（レビュー）、verify（独立検証）、ux（UX確認）
-標準ライブラリだけで動く（ロックに fcntl を使うので、Linux / macOS / WSL が前提）。
+標準ライブラリだけで動く。Windows、macOS、Linux のどれでも同じ決まりを強制する
+（Windows では `python scripts/cycle.py …` の形で実行する。OSで違う箇所は「OSの違い」の節にまとめてある）。
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import os
 import re
@@ -34,8 +34,18 @@ import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import IO, TypeVar
+
+T = TypeVar("T")
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
 
 AGENT_GATES = ("implement", "review", "verify", "ux")
 ALL_GATES = ("implement", "check", "review", "verify", "ux")
@@ -71,7 +81,7 @@ ADD_ONLY = (
 GATE_PROMPT = {
     "implement": (
         "仕様 {spec} を、この作業ツリーの中で実装してください。"
-        "受け入れ基準をすべて自分で実測し、scripts/check.sh を通してください。"
+        "受け入れ基準をすべて自分で実測し、python scripts/check.py を通してください。"
         "コミットはしないでください。"
     ),
     "review": (
@@ -134,6 +144,145 @@ HEADER_DRIFT = "仕様の見出し（owner、needs_ux、gates）が start の後
 
 class CycleError(Exception):
     pass
+
+
+# ------------------------------------------------------------------ OSの違い
+# Windows と、それ以外（Linux / macOS）で違う箇所は、この節にまとめる。ゲートの決まりは、どのOSでも同じ。
+
+# 終了の合図。SIGHUP は Windows に無く、SIGBREAK（Ctrl-Break）は Windows にだけある。
+STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGBREAK")
+
+# 自動確認のスクリプト。作業ツリーの直下から見た場所（git の中の名前と同じく、区切りは /）
+CHECK_SCRIPT = "scripts/check.py"
+
+# Windows の起動用のファイル（claude.cmd など）は cmd.exe を通る。そこで別の意味になる文字は渡せない。
+BATCH_SUFFIXES = (".cmd", ".bat")
+BATCH_UNSAFE = "%^&|<>\r\n"
+
+# Windows では、他のプロセスが開いているファイルの置き換えと、置き換えの最中のファイルの読み取りが、
+# 一時的に拒まれることがある。この秒数までは、待ってやり直す。
+BUSY_WAIT_SECONDS = 5.0 if WINDOWS else 0.0
+POLL_SECONDS = 0.05
+
+
+def lock_handle(handle: IO[str]) -> None:
+    """開いたファイルにロックを掛ける。他の実行が持っていれば、外れるまで待つ。"""
+    if WINDOWS:
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except PermissionError:     # 他の実行が持っている
+                time.sleep(POLL_SECONDS)
+    else:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+
+
+def unlock_handle(handle: IO[str]) -> None:
+    if WINDOWS:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def stop_signals() -> list[signal.Signals]:
+    """このOSにある終了の合図。"""
+    return [getattr(signal, name) for name in STOP_SIGNAL_NAMES if hasattr(signal, name)]
+
+
+def find_command(name: str) -> str | None:
+    """コマンドの実体の場所。見つからなければ None。
+
+    Windows では claude.exe や claude.cmd のように拡張子が付く。拡張子の無い同名のファイル
+    （シェル用の起動スクリプト）は起動できないので、拾わない。cmd.exe を通らない .exe を先に探す。
+    """
+    if not WINDOWS:
+        return shutil.which(name)
+    for suffix in (".exe", *BATCH_SUFFIXES):
+        found = shutil.which(name + suffix)
+        if found:
+            return found
+    return None
+
+
+def launchable(cmd: list[str]) -> list[str]:
+    """先頭のコマンドを実体の場所に直した、起動できるコマンド。見つからなければ CycleError。"""
+    found = find_command(cmd[0])
+    if found is None:
+        raise CycleError(
+            f"{cmd[0]} コマンドが見つからない。Claude Code の CLI を入れて PATH を通すか、"
+            "セッション内でエージェントを動かして record で記録する"
+        )
+    if found.lower().endswith(BATCH_SUFFIXES):
+        unsafe = sorted({ch for arg in cmd[1:] for ch in arg if ch in BATCH_UNSAFE})
+        if unsafe:
+            raise CycleError(
+                f"{Path(found).name} は cmd.exe を通るので、引数に {unsafe} を含められない"
+                "（指示や仕様のファイル名から外すか、.exe の形の CLI を入れる）"
+            )
+    return [found, *cmd[1:]]
+
+
+def shell_line(cwd: Path, cmd: list[str]) -> str:
+    """人が端末に貼って実行できる形の1行。"""
+    if WINDOWS:
+        return f"cd /d {subprocess.list2cmdline([str(cwd)])} && {subprocess.list2cmdline(cmd)}"
+    return f"cd {shlex.quote(str(cwd))} && {shlex.join(cmd)}"
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """起動したプロセスを止める。Windows では、起動用のファイル（claude.cmd）の先のプロセスも一緒に止める。"""
+    if WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    proc.kill()
+
+
+def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess.CompletedProcess:
+    """コマンドを実行して、出力を UTF-8 の文字列で受け取る。
+
+    時間切れなら、起動したプロセスを止めてから subprocess.TimeoutExpired を送出する。
+    """
+    with subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            proc.communicate()          # 止めた後の残りの出力を読み切る
+            raise
+        except BaseException:           # 中断（Ctrl-C、終了の合図）
+            kill_tree(proc)
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def python_env() -> dict[str, str]:
+    """Python のスクリプトを起動するときの環境変数。出力を UTF-8 で受け取れるようにする。"""
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def retry_while_busy(action: Callable[[], T]) -> T:
+    """ファイルの操作を行う。他のプロセスが使っている間の一時的な拒否は、少し待ってやり直す。"""
+    deadline = time.monotonic() + BUSY_WAIT_SECONDS
+    while True:
+        try:
+            return action()
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(POLL_SECONDS)
+
+
+def make_output_safe() -> None:
+    """画面に出せない文字があっても落ちないよう、置き換えて出す（UTF-8 でない端末への備え）。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
 
 
 # ------------------------------------------------------------------ 共通
@@ -267,8 +416,8 @@ def load_state(root: Path, uid: str) -> dict:
     if not path.exists():
         raise CycleError(f"{uid} はまだ始まっていない。先に start を実行する")
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        state = json.loads(retry_while_busy(lambda: path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
         raise CycleError(f"{path} を読めない: {exc}") from exc
     if not isinstance(state, dict):
         raise CycleError(f"{path} の形が正しくない")
@@ -280,8 +429,13 @@ def save_state(root: Path, state: dict) -> None:
     path = state_file(root, state["id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    partial.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(partial, path)
+    text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    partial.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        retry_while_busy(lambda: os.replace(partial, path))
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        raise CycleError(f"{path} を書けない: {exc}") from exc
 
 
 @contextlib.contextmanager
@@ -289,11 +443,11 @@ def locked(path: Path) -> Iterator[None]:
     """同じファイルのロックを持つ他の実行が終わるまで待つ。プロセスが落ちれば、ロックは OS が外す。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        lock_handle(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            unlock_handle(handle)
 
 
 def unit_lock(root: Path, uid: str) -> Path:
@@ -311,12 +465,12 @@ def pending_file(root: Path) -> Path:
 
 @contextlib.contextmanager
 def termination_as_exception() -> Iterator[None]:
-    """終了の合図（SIGTERM、SIGHUP）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。"""
+    """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。"""
     def stop(signum: int, frame: object) -> None:
         raise SystemExit(128 + signum)
 
     try:
-        saved = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP)}
+        saved = {sig: signal.signal(sig, stop) for sig in stop_signals()}
     except ValueError:          # メインのスレッド以外からは設定できない
         saved = {}
     try:
@@ -407,17 +561,22 @@ def runs_dir(root: Path) -> Path:
 
 
 def run_check(cwd: Path) -> tuple[str, str, str]:
-    """scripts/check.sh を実行する。返すのは（判定、確認した内容のツリーID、出力）。
+    """scripts/check.py を、このスクリプトと同じ Python で実行する。
+
+    返すのは（判定、確認した内容のツリーID、出力）。
 
     合格にするのは、終了コードが 0 で、実行の前後で内容が変わっていないときだけ。
     """
     before = tree_id(cwd)
+    if not (cwd / CHECK_SCRIPT).is_file():
+        return "error", before, f"{CHECK_SCRIPT} が無いので、確認を起動できない"
     try:
         proc = subprocess.run(
-            ["scripts/check.sh"], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", env=python_env(),
         )
     except OSError as exc:
-        return "error", before, f"scripts/check.sh を起動できない: {exc}"
+        return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
     output = proc.stdout + proc.stderr
     if proc.returncode != 0:
         return "fail", before, output
@@ -460,7 +619,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             gates = {}
         state = {
             "id": args.id,
-            "spec": str(spec.relative_to(root)),
+            "spec": spec.relative_to(root).as_posix(),
             "owner": header["owner"],
             "needs_ux": header["needs_ux"],
             "gates_required": header["gates_required"],
@@ -475,9 +634,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def agent_command(state: dict, gate: str, budget: float) -> list[str]:
-    role = state["owner"] if gate == "implement" else GATE_AGENT[gate]
-    prompt = GATE_PROMPT[gate].format(spec=state["spec"])
+def claude_command(prompt: str, role: str, budget: float, tools: str) -> list[str]:
+    """ヘッドレス実行のコマンド。結果は VERDICT_SCHEMA の形で受け取る。"""
     return [
         "claude", "-p", prompt,
         "--agent", role,
@@ -485,8 +643,13 @@ def agent_command(state: dict, gate: str, budget: float) -> list[str]:
         "--json-schema", json.dumps(VERDICT_SCHEMA, ensure_ascii=False),
         "--permission-mode", "acceptEdits",
         "--max-budget-usd", str(budget),
-        "--allowedTools", GATE_TOOLS[gate],
+        "--allowedTools", tools,
     ]
+
+
+def agent_command(state: dict, gate: str, budget: float) -> list[str]:
+    role = state["owner"] if gate == "implement" else GATE_AGENT[gate]
+    return claude_command(GATE_PROMPT[gate].format(spec=state["spec"]), role, budget, GATE_TOOLS[gate])
 
 
 def schema_problem(result: object) -> str:
@@ -552,22 +715,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     worktree = Path(state["worktree"])
     cmd = agent_command(state, args.gate, args.budget)
     if args.dry_run:
-        print(f"cd {shlex.quote(str(worktree))} && {shlex.join(cmd)}")
+        print(shell_line(worktree, cmd))
         return 0
-    if shutil.which(cmd[0]) is None:
-        raise CycleError(
-            "claude コマンドが見つからない。Claude Code の CLI を入れて PATH を通すか、"
-            "セッション内でエージェントを動かして record で記録する"
-        )
+    cmd = launchable(cmd)
 
     seen = record_count(state, args.gate)
     before = tree_id(worktree)
     log = runs_dir(root) / f"{args.id}-{args.gate}-{stamp()}.json"
     try:
-        proc = subprocess.run(
-            cmd, cwd=worktree, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=args.timeout,
-        )
+        proc = run_captured(cmd, worktree, args.timeout)
     except subprocess.TimeoutExpired:
         log.write_text("timeout", encoding="utf-8")
         verdict, summary, data = "error", f"{args.timeout} 秒で終わらなかったので打ち切った", {}
@@ -580,7 +736,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # 実装は「作った結果」を、確認系は「見た対象」（実行前の内容）を記録する
     tree = tree_id(worktree) if args.gate == "implement" else before
     by = str(data["session_id"]) if data.get("session_id") else "headless-unknown"
-    report = str(log.relative_to(root))
+    report = log.relative_to(root).as_posix()
     adopted = add_record(root, args.id, args.gate, verdict, tree, by, "headless", report, seen)
     cost = data.get("total_cost_usd")
     note = f" 費用の概算 ${cost}" if cost else ""
@@ -624,8 +780,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     verdict, tree, output = run_check(worktree)
     log = runs_dir(root) / f"{args.id}-check-{stamp()}.log"
     log.write_text(output, encoding="utf-8")
-    report = str(log.relative_to(root))
-    adopted = add_record(root, args.id, "check", verdict, tree, "scripts/check.sh", "script", report, seen)
+    report = log.relative_to(root).as_posix()
+    adopted = add_record(root, args.id, "check", verdict, tree, CHECK_SCRIPT, "script", report, seen)
     tail = output.strip().splitlines()[-1:] or [""]
     print(f"{args.id} check: {verdict}（{tail[0]}）")
     if not adopted:
@@ -883,7 +1039,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--report", help="報告を保存したファイル")
     p.set_defaults(func=cmd_record)
 
-    p = sub.add_parser("check", help="scripts/check.sh を実行して記録する")
+    p = sub.add_parser("check", help="scripts/check.py を実行して記録する")
     p.add_argument("id")
     p.set_defaults(func=cmd_check)
 
@@ -895,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("id")
     p.set_defaults(func=cmd_merge)
 
+    make_output_safe()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
