@@ -192,25 +192,14 @@ def cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subproce
     return subprocess.CompletedProcess(args, code, out.getvalue(), err.getvalue())
 
 
-# 試験が送る終了の合図。呼び出し元が無視に設定していても（nohup の下の SIGHUP、SIGINT を無視したシェルの
-# 下の SIGINT）、試験が起動するプロセスでは既定の扱いに戻す（無視のまま引き継ぐと、合図が届かない）
-STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP")
-
-
-def default_stop_signals() -> None:
-    """Linux / macOS で、起動する子プロセスの終了の合図を、既定の扱いに戻す（Popen の preexec_fn）。"""
-    for name in STOP_SIGNALS:
-        signal.signal(getattr(signal, name), signal.SIG_DFL)
-
-
 def start_cycle(
     root: Path, *args: str, env: dict[str, str] | None = None, stdin: int | None = None,
 ) -> subprocess.Popen:
     """cycle.py をコマンドラインから起動し、終わるのを待たずに返す（並行する実行、ロック、中断の確認用）。"""
     if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    else:           # 呼び出し元が終了の合図を無視していても、既定の扱いに戻す
-        options = {"preexec_fn": default_stop_signals}
+    else:           # 呼び出し元が SIGINT を無視していても、既定の扱い（KeyboardInterrupt）に戻す
+        options = {"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)}
     return subprocess.Popen(
         [sys.executable, str(CYCLE), *args], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", env=cycle_env(root, env), **options,

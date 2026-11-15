@@ -6,19 +6,15 @@ Windows の分岐のうち、OSの仕組みを模擬できるもの（msvcrt.loc
 模擬して流す（Linux で1か所ずつ壊す確認をしても、その分岐の壊し方が落ちるように）。
 """
 import os
-import signal
 import subprocess
-import sys
 from unittest import mock
 
 import pytest
 from conftest import SAFE_PATH_VAR
 from test_harness import (
     CYCLE_MODULE,
-    STOP_SIGNALS,
     commit,
     cycle,
-    default_stop_signals,
     headless,
     held_lock,
     implement,
@@ -144,29 +140,3 @@ def test_link_on_path_that_leads_inside_the_worktree_is_not_used(repo, tmp_path)
     result = cycle(repo, "run", "U1", "review", env={"PATH": str(outside)})
     assert result.returncode == 2 and "claude コマンドが見つからない" in result.stderr
     assert not was_run(planted) and "review" not in state(repo)["gates"]
-
-
-@only_posix("終了の合図を無視に設定して引き継ぐ仕組み（nohup）は、Linux / macOS のもの")
-def test_processes_started_by_the_tests_get_the_stop_signals_back_even_under_nohup():
-    """試験のプロセスが終了の合図を無視していても（nohup の下の SIGHUP など）、試験が起動するプロセスでは
-    既定の扱いに戻す（無視のまま引き継ぐと、合図で止める試験が、止まらないプロセスを待ち続けて落ちる）。"""
-    code = (
-        "import signal; "
-        "kinds = {signal.SIG_IGN: 'ign', signal.SIG_DFL: 'dfl', signal.default_int_handler: 'int'}; "
-        "print(' '.join(kinds[signal.getsignal(getattr(signal, n))] for n in %r))"
-    )
-    saved = {name: signal.signal(getattr(signal, name), signal.SIG_IGN) for name in STOP_SIGNALS}
-    try:
-        ignored = subprocess.run(
-            [sys.executable, "-c", code % (STOP_SIGNALS,)], capture_output=True, text=True, check=True,
-        )
-        restored = subprocess.run(
-            [sys.executable, "-c", code % (STOP_SIGNALS,)], capture_output=True, text=True, check=True,
-            preexec_fn=default_stop_signals,
-        )
-    finally:
-        for name, handler in saved.items():
-            signal.signal(getattr(signal, name), handler)
-    assert ignored.stdout.strip() == "ign ign ign"         # 何もしなければ、無視のまま引き継ぐ
-    # SIGINT は、Python が起動のときに KeyboardInterrupt に変える（既定の扱いに戻っているので）
-    assert restored.stdout.strip() == "int dfl dfl"

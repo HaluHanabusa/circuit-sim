@@ -8,6 +8,7 @@ PATH にあった本物を表す。どの試験も、身代わりが起動され
 import ctypes
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -171,9 +172,45 @@ def test_tests_turn_the_os_error_dialogs_off_on_windows(windows):
 
 def test_every_test_process_turns_the_os_error_dialogs_off():
     """設定は、試験の設定の読み込み（pytest_configure。並列実行の子でも呼ばれる）で行う。"""
-    with mock.patch.object(guard, "quiet_error_dialogs") as quiet:
+    with (
+        mock.patch.object(guard, "quiet_error_dialogs") as quiet,
+        mock.patch.object(guard, "catch_ignored_stop_signals") as caught,
+    ):
         guard.pytest_configure(None)
     quiet.assert_called_once_with()
+    caught.assert_called_once_with()
+
+
+# 起動されたプロセスの、終了の合図の扱い（無視、既定、KeyboardInterrupt に変える）
+DISPOSITIONS = (
+    "import signal; "
+    "kinds = {signal.SIG_IGN: 'ign', signal.SIG_DFL: 'dfl', signal.default_int_handler: 'int'}; "
+    "print(' '.join(kinds[signal.getsignal(getattr(signal, n))] for n in ('SIGINT', 'SIGTERM', 'SIGHUP')))"
+)
+
+
+@only_posix
+def test_stop_signals_ignored_by_the_caller_reach_the_processes_the_tests_start():
+    """nohup の下（SIGHUP が無視）や、ジョブ制御の無いシェルの &（SIGINT が無視）で流しても、試験が起動する
+    プロセスは、終了の合図を既定の扱いで受け取る（無視のまま引き継ぐと、合図で止める試験が落ちる。H2 の
+    独立検証）。試験のセッションそのものは、置き換えた後も合図で止まらない。無視でなかった合図は変えない。"""
+    names = ("SIGINT", "SIGTERM", "SIGHUP")
+    saved = {name: signal.getsignal(getattr(signal, name)) for name in names}
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)            # nohup と同じ
+        signal.signal(signal.SIGINT, signal.SIG_IGN)            # & と同じ
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        before = subprocess.run([sys.executable, "-c", DISPOSITIONS], capture_output=True, text=True)
+        assert before.stdout.split() == ["ign", "dfl", "ign"]   # 置き換えなければ、無視のまま引き継ぐ
+        assert guard.catch_ignored_stop_signals() == ["SIGINT", "SIGHUP"]
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+        after = subprocess.run([sys.executable, "-c", DISPOSITIONS], capture_output=True, text=True)
+        assert after.stdout.split() == ["int", "dfl", "dfl"]
+        signal.raise_signal(signal.SIGHUP)                      # 試験のセッションは止まらない
+        assert guard.catch_ignored_stop_signals() == []
+    finally:
+        for name, handler in saved.items():
+            signal.signal(getattr(signal, name), handler)
 
 
 INNER_TESTS = """\

@@ -28,7 +28,6 @@ from test_harness import (
     WINDOWS,
     commit,
     cycle,
-    default_stop_signals,
     implement,
     install_hook,
     make_repo,
@@ -184,8 +183,6 @@ def start_local_ci(root: Path, *args: str, env: dict[str, str] | None = None, **
     elsewhere.mkdir(exist_ok=True)
     if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:           # 呼び出し元が終了の合図を無視していても（nohup の SIGHUP など）、既定の扱いに戻す
-        options.setdefault("preexec_fn", default_stop_signals)
     return subprocess.Popen(
         [sys.executable, str(SCRIPT), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace", env=ci_env(root, env), cwd=elsewhere, **options,

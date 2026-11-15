@@ -27,12 +27,16 @@
 3. Windows で、OSのエラー画面（「サポートされていない 16 ビット アプリケーション」など。人が OK を押すまで
    止まる）を出させない。試験のプロセスに設定し、起動する子プロセスに引き継がれる。scripts/cycle.py の
    quiet_error_dialogs と同じ設定（この conftest は別の場所に写して使われるので、ここに持つ）。
+
+4. 無視に設定されて引き継いだ終了の合図（nohup の SIGHUP など）を、受け取って何もしない扱いに置き換える
+   （試験が起動するプロセスでは既定の扱いに戻り、合図で止める試験が、nohup の下でも同じに動く）。
 """
 from __future__ import annotations
 
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -256,9 +260,38 @@ def sentinel_calls(log: Path) -> list[str]:
 GUARD: dict = {}
 
 
+# 試験が送る、または試験の中で起こす終了の合図
+STOP_SIGNAL_NAMES = ("SIGINT", "SIGTERM", "SIGHUP")
+
+
+def leave_alone(signum: int, frame: object) -> None:
+    """受け取って何もしない扱い（無視と同じく、試験のセッションは続く）。"""
+
+
+def catch_ignored_stop_signals() -> list[str]:
+    """無視に設定されて引き継いだ終了の合図（nohup の SIGHUP、ジョブ制御の無いシェルの & の SIGINT）を、
+    受け取って何もしない扱い（leave_alone）に置き換える。置き換えた合図の名前を返す。Linux / macOS だけ。
+
+    無視のままだと、試験が起動するプロセスにも無視が引き継がれ、ハーネスは無視の合図を差し替えない（決まりの
+    とおり）ので、合図で止める試験が、止まらないプロセスを待ち続けて落ちる。試験のプロセスの中の枠
+    （termination_as_exception）も、合図を例外に変えない。Python の関数の扱いは、起動するプロセスには
+    引き継がれない（exec で既定の扱いに戻る）。試験のセッションそのものは、置き換えた後も合図で止まらない。
+    """
+    if WINDOWS:
+        return []
+    replaced = []
+    for name in STOP_SIGNAL_NAMES:
+        sig = getattr(signal, name)
+        if signal.getsignal(sig) is signal.SIG_IGN:
+            signal.signal(sig, leave_alone)
+            replaced.append(name)
+    return replaced
+
+
 def pytest_configure(config: pytest.Config) -> None:
     # 並列実行の子でも設定する（OSのエラー画面は、画面を出させたプロセスを止める）
     quiet_error_dialogs()
+    catch_ignored_stop_signals()
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
