@@ -23,12 +23,34 @@ from .mna import CircuitError, System, build_system, describe_state, state_condu
 DEFAULT_STEPS_PER_PERIOD = 200   # 搬送波1周期の分割数の既定値
 DEFAULT_DAMPING_STEPS = 2        # 計算の先頭と不連続点の直後に入れる減衰ステップの数の既定値
 MAX_STEPS = 20_000_000           # ステップ数の上限の既定値（スコープが扱う点数の目安と同じ 2000万）
-MAX_RESULT_BYTES = 2 * 2**30     # 結果の配列の大きさの上限 [バイト]（未知数の多い回路のため）
+MAX_RESULT_BYTES = 2 * 2**30     # 計算に使う配列（結果と作業用）の大きさの上限 [バイト]。8 GB の PC で、
+#                                  画面とブラウザの分を残して1回の計算に使ってよい目安。
+#                                  見積もりは _memory_bytes
 MIN_POINTS_PER_PERIOD = 10       # 正弦波や回路の振動の1周期に、これより点が少ないと注意を出す
 MAX_STEP_PER_TIME_CONSTANT = 2.0  # 刻みが回路の時定数のこの倍数を超えると注意を出す（台形則が振動し始める境）
+DAMP_STEP_PER_TIME_CONSTANT = 0.5  # スイッチの無い回路で、刻みが時定数のこの倍数を超えると
+#                                    減衰ステップを入れる。
+#                                    台形則だけの誤差は RC のステップ応答で h = τ/2 のとき 0.79%、τ で 3.5%、
+#                                    1.99τ で 13%（E1a-A.md）。減衰ステップを入れると τ/2〜2τ で 0.5% 以下
 DIODE_ON_VOLTAGE = 1e-9          # オフのダイオードをオンにする順方向電圧 [V]（丸め誤差での反転を防ぐ）
+DIODE_BAND_REL = 1e-8            # t = 0 の状態が落ち着かないとき、丸め誤差とみなす電圧の幅
+#                                  （節点電圧の最大値に対する比。_diode_band）。三相整流（r_on 1 mΩ、
+#                                  r_off 1 MΩ）の t=0 で測った丸め誤差は最大 6.5e-10 倍で、その約15倍。
+#                                  通常の判定には使わない
 SIMULTANEOUS_FLIPS = 4           # ダイオードの状態決定で、違反したものを同時に反転する回数
 _GRID_TOL = 1e-6                 # 周期が時間刻みの整数倍かどうかの判定（ステップ数に対する相対値）
+
+
+class StepLimitError(ValueError):
+    """計算が大きすぎて、計算の前に断ったときのエラー。
+
+    文面は「理由と直し方（h と t_end）」＋「simulate() の max_steps で上限を上げられること」。
+    without_api_hint は前半だけ（max_steps を渡せない仕様JSONやコマンドから使うとき）。
+    """
+
+    def __init__(self, reason: str, api_hint: str):
+        super().__init__(reason + api_hint)
+        self.without_api_hint = reason
 
 
 @dataclass
@@ -44,6 +66,9 @@ class Result:
     devices: list[str] = field(default_factory=list)               # S と D の素子ID（状態の符号のビット順）
     sample_state: np.ndarray | None = None    # 各時刻の値と整合する回路状態の符号（S と D の電流に使う）
     stats: dict[str, int] = field(default_factory=dict)            # 用意した回路状態の数など
+    # stats の欄: states（用意した回路状態の数）、state_changes（不連続点として扱ったステップ）、
+    #   retries（捨てた試行）、rescues_at_start（t = 0 でダイオードの状態が落ち着かず、違反が丸め誤差の
+    #   幅の中の状態を採った（救済した）なら 1。_initial_state を参照）
 
     @property
     def names(self) -> list[str]:
@@ -148,56 +173,132 @@ def _count_steps(t_end: float, h: float, max_steps: int | None, notes: list[str]
     limit = MAX_STEPS if max_steps is None else max_steps
     ratio = t_end / h
     if not math.isfinite(ratio) or ratio > limit + 0.5:
-        raise ValueError(
+        raise StepLimitError(
             f"ステップ数が約 {ratio:.3g}（t_end / h = {t_end:.6g} s / {h:.6g} s）になり、"
             f"上限の {limit} を超える。"
-            "時間刻み h を大きくするか、計算時間 t_end を短くする。"
-            "この大きさが本当に必要なら simulate(..., max_steps=...) で上限を上げる"
-            "（記憶量は、1ステップあたり 8 バイト × 未知数の数の数倍）"
+            "時間刻み h を大きくするか、計算時間 t_end を短くする",
+            "。この大きさが本当に必要なら simulate(..., max_steps=...) で上限を上げる"
+            "（記憶量は、1ステップあたり 8 バイト × 未知数の数の数倍）",
         )
     n_steps = int(round(ratio))
     if n_steps < 1:
         raise ValueError("t_end が h より短い")
     if abs(ratio - n_steps) > 1e-6:
+        given, used = _distinct(t_end, n_steps * h)
         notes.append(
-            f"計算時間 t_end={t_end:.6g} s は時間刻み h={h:.6g} s の整数倍でないので、"
-            f"{n_steps * h:.6g} s（{n_steps} ステップ）で終える"
+            f"計算時間 t_end={given} s は時間刻み h={h:.6g} s の整数倍でないので、"
+            f"{used} s（{n_steps} ステップ）で終える"
         )
     return n_steps
 
 
-def _check_result_size(n_steps: int, n_unknowns: int, max_steps: int | None) -> None:
-    """未知数の多い回路で、結果の配列が大きくなりすぎないか（上限を自分で指定したときは見ない）。"""
-    size = (n_steps + 1) * n_unknowns * 8
-    if max_steps is None and size > MAX_RESULT_BYTES:
-        raise ValueError(
-            f"結果の配列が約 {size / 2**30:.1f} GB（{n_steps} ステップ × 未知数 {n_unknowns} 個）になり、"
-            f"上限の {MAX_RESULT_BYTES / 2**30:.0f} GB を超える。h を大きくするか t_end を短くする。"
-            "この大きさが本当に必要なら simulate(..., max_steps=...) でステップ数の上限を指定する"
+def _distinct(a: float, b: float) -> tuple[str, str]:
+    """2つの値を、違いが見える桁数で書く（6桁で同じに見えるときは桁を増やす）。
+
+    a（利用者が指定した値）は、10桁までで書けるならその桁数まで書く（0.4999995 を 0.499999 と書かない）。
+    """
+    for digits in range(6, 18):
+        x, y = f"{a:.{digits}g}", f"{b:.{digits}g}"
+        if x != y and (float(x) == a or digits >= 10):
+            return x, y
+    return repr(a), repr(b)
+
+
+FIXED_BYTES = 2**20      # ステップ数によらない分（回路状態ごとの行列など。小さな回路の実測は 0.1 MB 未満）
+
+
+def _memory_bytes(
+    n_steps: int, n_unknowns: int, n_sources: int, *,
+    switched: bool = False, n_gates: int = 0, n_commands: int = 0, n_devices: int = 0,
+) -> tuple[int, int]:
+    """計算に使う配列の大きさの見積もり [バイト]。戻り値: （全体、そのうち結果の回路の変数 x）。
+
+    1ステップあたり（8 バイト = float64 / int64、1 バイト = bool）:
+      共通       : x 8·未知数、電源の値 8·電源数 × 2（区間の両端）、不連続の印 1、時刻 8、
+                   電源の波形や時刻を作る一時配列 8。ほかに、ステップ数によらない分 FIXED_BYTES
+      スイッチあり: 電源の値の平均 8·電源数、回路状態の記録 8 × 3（区間ごと、スイッチのビット、各時刻）、
+                   ゲート 1 + 8（bool と、結果に返す値）× ゲート数、指令 8 × 2 × 指令数、
+                   導通の信号 8 × 素子数、その計算の一時配列 8 × 2
+    実測（tracemalloc の最大値、40万ステップ）: 基準の降圧回路で 138 バイト（見積もり 146）、
+    直列RLC（スイッチなし）で 73 バイト（見積もり 73）。結果の x に対して 3.5 倍と 1.8 倍。
+    """
+    per_step = 8 * n_unknowns + 16 * n_sources + 1 + 8 + 8
+    if switched:
+        per_step += 8 * n_sources + 24 + 9 * n_gates + 16 * n_commands + 8 * n_devices + 16
+    return (n_steps + 1) * per_step + FIXED_BYTES, (n_steps + 1) * 8 * n_unknowns
+
+
+def _check_result_size(
+    n_steps: int, n_unknowns: int, max_steps: int | None, n_sources: int = 0, **switching
+) -> None:
+    """結果と作業用の配列が大きくなりすぎないか（ステップ数の上限を自分で指定したときは見ない）。"""
+    total, result = _memory_bytes(n_steps, n_unknowns, n_sources, **switching)
+    if max_steps is None and total > MAX_RESULT_BYTES:
+        raise StepLimitError(
+            f"結果の配列と計算の作業用の配列が約 {total / 2**30:.1f} GB"
+            f"（{n_steps} ステップ × 未知数 {n_unknowns} 個。"
+            f"結果の配列はそのうち {result / 2**30:.1f} GB）になり、"
+            f"上限の {MAX_RESULT_BYTES / 2**30:.0f} GB を超える。"
+            "h を大きくするか t_end を短くする",
+            "。この大きさが本当に必要なら simulate(..., max_steps=...) でステップ数の上限を指定する",
         )
 
 
 def _has_unresolved_rate(rates: np.ndarray, h: float) -> bool:
-    """刻みより速い成分があるか（台形則だけで進めると、その成分が符号を変えながら残る）。"""
+    """台形則だけでは誤差が大きくなる速い成分があるか（|λ|·h > DAMP_STEP_PER_TIME_CONSTANT）。
+
+    |λ|·h > 2 では、その成分が符号を変えながら残る。0.5〜2 では振動はしないが、計算の先頭や
+    電源のステップの直後の誤差が 1% を超える。
+    """
     rates = rates[np.isfinite(rates)]
-    return bool(rates.size) and float(np.abs(rates).max()) * h > MAX_STEP_PER_TIME_CONSTANT
+    return bool(rates.size) and float(np.abs(rates).max()) * h > DAMP_STEP_PER_TIME_CONSTANT
 
 
-def _resolution_notes(rates: np.ndarray, h: float, notes: list[str]) -> None:
-    """時間刻みが回路の速い成分を解像していなければ、何に対して粗いかを注意に書く。"""
+def _resolution_notes(
+    rates: np.ndarray, h: float, notes: list[str], damped: bool = True, *,
+    n_steps: int | None = None, limit: int = MAX_STEPS, who=None,
+) -> None:
+    """時間刻みが回路の速い成分を解像していなければ、何に対して粗いかを注意に書く。
+
+    damped : 計算の先頭と不連続点の直後に減衰ステップを入れているか（damping_steps > 0）。
+    n_steps, limit : 計算のステップ数と上限。勧める刻みでのステップ数が上限を超えるなら、刻みを
+             細かくする代わりに、その成分を作る素子を挙げて、値を見直すよう書く。
+    who    : 固有値 λ → その成分を作る素子の ID の一覧（_mode_elements）。
+    """
     rates = rates[np.isfinite(rates)]
     decaying = rates[np.abs(rates.imag) <= np.abs(rates.real)]
     ringing = rates[np.abs(rates.imag) > np.abs(rates.real)]
     if decaying.size:
-        fastest = float(np.abs(decaying).max())
+        k = int(np.argmax(np.abs(decaying)))
+        fastest = float(np.abs(decaying[k]))
         if fastest * h > MAX_STEP_PER_TIME_CONSTANT:
             tau = 1.0 / fastest
-            notes.append(
-                f"時間刻み h={h:.6g} s は、回路の最も速い時定数 {tau:.3g} s の {h / tau:.3g} 倍で、"
-                "この成分の変化は波形に現れない（計算の先頭と電源のステップ直後は、"
-                "数値振動が出ないように減衰させている）。"
-                f"この成分を見るには h を {tau / 10:.3g} s 以下にする"
-            )
+            head = f"時間刻み h={h:.6g} s は、回路の最も速い時定数 {tau:.3g} s の {h / tau:.3g} 倍で、"
+            needed = None if n_steps is None else n_steps * h / (tau / 10)
+            if needed is not None and needed > limit:
+                ids = who(decaying[k]) if who is not None else []
+                parts = f"（{', '.join(ids)} が作る成分）" if ids else ""
+                fix = (
+                    f"この成分{parts}を見るには h を {tau / 10:.3g} s 以下にする必要があるが、"
+                    f"この計算時間では約 {needed:.2g} ステップになり、上限の {limit} を超える。"
+                    "この成分を見る必要が無ければ、対処は要らない。見るには"
+                    + (f" {', '.join(ids)} の値を見直して" if ids else "")
+                    + "時定数を大きくする（インダクタと抵抗なら L / R、コンデンサと抵抗なら R·C）"
+                )
+            else:
+                fix = f"この成分を見るには h を {tau / 10:.3g} s 以下にする"
+            if damped:
+                notes.append(
+                    head + "この成分の変化は波形に現れない（計算の先頭と、電源のステップや"
+                    "スイッチの切り替えの直後は、数値振動が出ないように減衰させている）。" + fix
+                )
+            else:
+                notes.append(
+                    head + "この成分の変化は波形に現れない。"
+                    "減衰ステップを切っている（damping_steps=0）ので、"
+                    "計算の先頭と電源のステップの直後に、この成分が符号を変えながら残り、波形が振れる。"
+                    f"h を {tau / 10:.3g} s 以下にするか、damping_steps を 1 以上にする"
+                )
     if ringing.size:
         omega = float(np.abs(ringing.imag).max())
         points = 2.0 * math.pi / (omega * h)
@@ -209,6 +310,187 @@ def _resolution_notes(rates: np.ndarray, h: float, notes: list[str]) -> None:
                 "振動の周波数と減衰が正しく出ない。"
                 f"h を {period / 20:.3g} s 以下（1周期 20 点以上）にする"
             )
+
+
+MODE_SHARE = 0.1          # 成分のエネルギー（L、C）や損失（抵抗）の最大に対して、
+#                           この比以上の素子を「作る素子」とする
+
+
+def _mode_elements(system: System, G: np.ndarray, Rex: np.ndarray, lam: complex, code: int = 0) -> list[str]:
+    """固有値 lam の成分を作る素子の ID（蓄える素子 L・C と、損失の大きい抵抗・スイッチ・ダイオード）。
+
+    状態量 y = E x について y' = −G Rex y なので、−G Rex の固有ベクトル w から、その成分の
+    回路の変数 x = Rex w が分かる。インダクタは L·|i|²、コンデンサは C·|v|²、抵抗は |v|² / R
+    （スイッチとダイオードは回路状態 code のオン・オフの抵抗）で比べ、それぞれ最大の MODE_SHARE 倍
+    以上のものを挙げる。
+    """
+    values, vectors = np.linalg.eig(-G @ Rex)
+    x = Rex @ vectors[:, int(np.argmin(np.abs(values - lam)))]
+    netlist = system.netlist
+    idx = {name: i for i, name in enumerate(system.unknowns)}
+
+    def across(c) -> float:
+        a = 0.0 if c.nodes[0] == netlist.ground else x[idx[f"v({c.nodes[0]})"]]
+        b = 0.0 if c.nodes[1] == netlist.ground else x[idx[f"v({c.nodes[1]})"]]
+        return float(abs(a - b))
+
+    stored, lost = {}, {}
+    for c in netlist.components:
+        if c.type == "L":
+            stored[c.id] = c.value * abs(x[idx[f"i({c.id})"]]) ** 2
+        elif c.type == "C":
+            stored[c.id] = c.value * across(c) ** 2
+        elif c.type == "R":
+            lost[c.id] = across(c) ** 2 / c.value
+        elif c.type in ("S", "D"):
+            on = (code >> system.devices.index(c.id)) & 1
+            lost[c.id] = across(c) ** 2 / (c.r_on if on else c.r_off)
+    out = []
+    for group in (stored, lost):
+        top = max(group.values(), default=0.0)
+        out += [cid for cid, v in group.items() if top > 0 and v >= MODE_SHARE * top]
+    return out
+
+
+OFF_PROBE_SCALE = 0.1     # オフの素子のコンダクタンスをこの倍（オフ抵抗を10倍）にして、動く成分を見分ける
+SAME_RATE_TOL = 0.01      # オフ抵抗を変えても、この相対差より動かない成分を回路そのものの成分とみなす
+
+
+def _switched_rates(system: System, table: _StateTable, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """計算で使った回路状態ごとの固有値のうち、回路そのものの成分（オフ抵抗が作る見かけの成分を除く）。
+
+    オフの素子はオフ抵抗 r_off（既定 1 MΩ）の抵抗なので、インダクタの電流がオフの素子しか通れない状態では、
+    時定数 L / r_off（数 ps）の成分ができる。これは理想スイッチのモデルの都合で、
+    切り替えの直後の後退オイラーと
+    減衰ステップが消す。この成分の大きさは r_off に比例するので、r_off を10倍にして同じ大きさ |λ| の
+    固有値が（相対 SAME_RATE_TOL 以内で）残るものだけを返す。スイッチを抵抗に置き換えた回路と同じ注意になる。
+    戻り値: （固有値、それぞれの回路状態の符号）。
+    """
+    found, where = [], []
+    for code in codes:
+        code = int(code)
+        G = state_conductance(system, code)
+        rates = kernel.natural_rates(G, table.rex[table.index[code]])
+        rates = rates[np.isfinite(rates) & (rates != 0)]
+        if not rates.size:
+            continue
+        G_probe = state_conductance(system, code, off_scale=OFF_PROBE_SCALE)
+        try:
+            Rex_probe, _ = kernel.consistent_maps(system.E, G_probe, system.B)
+        except CircuitError:
+            found.append(rates)
+            where.append(np.full(rates.size, code))
+            continue
+        # 大きさ |λ| で比べる。オフ抵抗だけで減衰する振動（オフ・オフの区間の L とスイッチ節点の容量など）は、
+        # 減衰（実部）は r_off で動くが |λ| = 1/√(LC) は動かない。
+        # 見かけの成分 L / r_off は実数で、|λ| ごと動く
+        moved = np.abs(kernel.natural_rates(G_probe, Rex_probe))
+        same = np.array([np.min(np.abs(moved - abs(lam))) <= SAME_RATE_TOL * abs(lam) for lam in rates])
+        found.append(rates[same])
+        where.append(np.full(int(same.sum()), code))
+    if not found:
+        return np.zeros(0, dtype=complex), np.zeros(0, dtype=np.int64)
+    return np.concatenate(found), np.concatenate(where)
+
+
+INTERRUPT_FACTOR = 2.0    # インダクタ電流の遮断とみなす、L·|i| / h と回路の電圧の目安（電源とコンデンサ）の比
+
+
+def _forced_through_off(system: System, code: int) -> list[int]:
+    """回路状態 code で、電流の行き場がオフのスイッチ・ダイオードしか無いインダクタ（素子の並びの番号）。
+
+    インダクタの両端が、そのインダクタ自身とオフの素子と電流源を除いた素子でつながっていなければ、
+    電流はオフの素子（r_off）を通るしかない。
+    """
+    netlist = system.netlist
+    on = {cid for j, cid in enumerate(system.devices) if (code >> j) & 1}
+    forced = []
+    for k, ind in enumerate(netlist.components):
+        if ind.type != "L":
+            continue
+        paths = [
+            c.nodes for c in netlist.components
+            if c is not ind and c.type != "I" and not (c.type in ("S", "D") and c.id not in on)
+        ]
+        root = _node_groups(paths)
+        if root(ind.nodes[0]) != root(ind.nodes[1]):
+            forced.append(k)
+    return forced
+
+
+def _node_groups(edges: list[tuple[str, str]]):
+    """節点の組（枝）から、つながった節点を同じ代表に写す関数を作る。"""
+    parent: dict[str, str] = {}
+
+    def root(n: str) -> str:
+        parent.setdefault(n, n)
+        while parent[n] != n:
+            parent[n] = parent[parent[n]]
+            n = parent[n]
+        return n
+
+    for a, b in edges:
+        parent[root(a)] = root(b)
+    return root
+
+
+def _interruption_notes(
+    system: System, out: np.ndarray, before: np.ndarray, after: np.ndarray, u: np.ndarray, h: float,
+    notes: list[str],
+) -> None:
+    """インダクタ電流が、行き場の無いまま切り替えで遮断された点があれば注意に書く。
+
+    before[k], after[k]: ステップ k の直前と、ステップ k の回路状態。out[k] は切り替わる前の値。
+    遮断されると、電流はオフ抵抗を通って1刻みで消え、オフの素子の両端に L·|Δi| / h の大きさの
+    （刻みで決まる、意味の無い）電圧が1点記録される。ダイオードが電流 0 付近で切れる通常の切り替えでは、
+    L·|i| / h は回路の電圧の程度に収まる。そこで L·|i| / h が電源とコンデンサの電圧の最大の
+    INTERRUPT_FACTOR 倍を超え、かつ行き場がオフの素子しか無いときだけ知らせる。
+    """
+    netlist = system.netlist
+    steps = np.nonzero(before != after)[0]
+    if not steps.size:
+        return
+    idx = {cid: i for i, cid in enumerate(system.unknowns)}
+
+    def volt(node: str) -> np.ndarray | float:
+        return 0.0 if node == netlist.ground else out[:, idx[f"v({node})"]]
+
+    v_ref = 0.0
+    for j, cid in enumerate(system.sources):
+        if netlist.component(cid).type == "V" and u.size:
+            v_ref = max(v_ref, float(np.abs(u[:, j]).max()))
+    for c in netlist.components:
+        if c.type == "C":
+            v_ref = max(v_ref, float(np.abs(volt(c.nodes[0]) - volt(c.nodes[1])).max()))
+    events = []
+    for code in np.unique(after[steps]):
+        forced = _forced_through_off(system, int(code))
+        if not forced:
+            continue
+        at = steps[after[steps] == code]
+        for k in forced:
+            ind = netlist.components[k]
+            current = out[at, idx[f"i({ind.id})"]]
+            hit = ind.value * np.abs(current) / h > INTERRUPT_FACTOR * v_ref
+            events += [(int(step), ind, float(i)) for step, i in zip(at[hit], current[hit], strict=True)]
+    if not events:
+        return
+    events.sort(key=lambda e: e[0])
+    step, ind, current = events[0]
+    off = [cid for j, cid in enumerate(system.devices) if not (int(after[step]) >> j) & 1]
+    k_next = min(step + 1, out.shape[0] - 1)
+    peak = max(
+        abs(float(np.asarray(volt(c.nodes[0]) - volt(c.nodes[1]))[k_next]))
+        for c in netlist.components if c.id in off
+    )
+    others = f"（ほかに {len(events) - 1} 回）" if len(events) > 1 else ""
+    notes.append(
+        f"時刻 t={step * h:.6g} s で、インダクタ {ind.id} の電流 {current:.3g} A の行き場が、"
+        f"オフのスイッチやダイオード（{', '.join(off)}）しか無くなり、電流が1刻みで消えた{others}。"
+        f"その直後の点のオフの素子の電圧（最大 {peak:.3g} V）は刻みの大きさで決まる見かけの値で、"
+        "実際の回路ではサージ電圧になる。還流ダイオードやスナバを入れる"
+        "（還流ダイオードがあっても、逆向きに流れていた電流は遮断される。降圧回路で出力の初期値が入力より高いときなど）"
+    )
 
 
 def _initial_value_notes(system: System, x0: np.ndarray, notes: list[str]) -> None:
@@ -234,6 +516,50 @@ def _initial_value_notes(system: System, x0: np.ndarray, notes: list[str]) -> No
             )
 
 
+def _inductor_cutset_hints(netlist: Netlist) -> list[str]:
+    """インダクタ（と電流源）だけで回路の残りとつながる部分（2節点以上）を探して、直し方を添える。
+
+    抵抗・コンデンサ・電圧源・スイッチ・ダイオードでつながった節点を1つの部分とみなす。
+    基準節点を含まない部分が、インダクタと電流源だけで外とつながっていると、そこへ流れ込む
+    インダクタ電流の和が 0 に縛られ、部分全体の電位が式から決まらない（三相の整流器や負荷の
+    中性点・直流側を接地しない場合など）。1節点だけの場合は、呼び出し側の文面が扱う。
+    """
+    nodes = [netlist.ground] + netlist.nodes()
+    parent = {n: n for n in nodes}
+
+    def root(n: str) -> str:
+        while parent[n] != n:
+            parent[n] = parent[parent[n]]
+            n = parent[n]
+        return n
+
+    for c in netlist.components:
+        if c.type not in ("L", "I"):
+            parent[root(c.nodes[0])] = root(c.nodes[1])
+    groups: dict[str, list[str]] = {}
+    for n in nodes:
+        groups.setdefault(root(n), []).append(n)
+    hints = []
+    for members in groups.values():
+        if netlist.ground in members or len(members) < 2:
+            continue
+        links = [c for c in netlist.components if (c.nodes[0] in members) != (c.nodes[1] in members)]
+        inductors = [c.id for c in links if c.type == "L"]
+        if not inductors:
+            continue
+        hints.append(
+            f"節点 {', '.join(members)} の部分は、{', '.join(c.id for c in links)} だけで"
+            "回路の残りとつながっていて、"
+            "流れ込む電流の和が 0 に縛られるので、この部分の電位が決まらない。"
+            "この部分のどこか1点と基準節点の間に、回路のほかの抵抗より十分に大きな抵抗（例 1 MΩ）を入れる"
+            "（小さいと、この抵抗に流れる電流で回路の動きが変わる）。"
+            f"この抵抗と {', '.join(inductors)} で、"
+            "時定数（インダクタンス / 抵抗）がとても短い成分ができるが、"
+            "計算では減衰させるので波形には現れない（そのことは注意に出る）"
+        )
+    return hints
+
+
 def _explain_unsolvable(system: System, exc: CircuitError, state: str | None = None) -> CircuitError:
     """解けない回路のエラーに、手がかり（決まらない変数、インダクタだけの節点）を添える。"""
     netlist = system.netlist
@@ -251,12 +577,12 @@ def _explain_unsolvable(system: System, exc: CircuitError, state: str | None = N
                 f"節点 '{node}' には {ids} しかつながっていない（{kind}）。"
                 "直列のインダクタは1つにまとめる（値は和）"
             )
-    text = "。".join(parts)
+    cutsets = _inductor_cutset_hints(netlist)
+    text = "。".join(parts + cutsets)
     if state is not None:
-        text = (
-            f"回路状態（{state}）で: {text}。"
-            "オフ抵抗 r_off が極端に大きいと、オフのときに節点が浮いたのと同じになって解けない"
-        )
+        text = f"回路状態（{state}）で: {text}"
+        if not cutsets:
+            text += "。オフ抵抗 r_off が極端に大きいと、オフのときに節点が浮いたのと同じになって解けない"
     return CircuitError(text)
 
 
@@ -315,7 +641,7 @@ def _simulate_linear(
     n_steps = _count_steps(t_end, h, max_steps, notes)
 
     system = build_system(netlist)
-    _check_result_size(n_steps, len(system.unknowns), max_steps)
+    _check_result_size(n_steps, len(system.unknowns), max_steps, len(system.sources))
     u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
 
     try:
@@ -325,9 +651,13 @@ def _simulate_linear(
     x0 = ops.Rex @ system.ex0 + ops.Ru @ u_start[0]
     _initial_value_notes(system, x0, notes)
     rates = kernel.natural_rates(system.G, ops.Rex)
-    _resolution_notes(rates, h, notes)
-    # 減衰ステップは、刻みより速い成分があるときだけ入れる。刻みが回路を解像していれば台形則だけで
-    # 進め、2次精度をそのまま保つ（減衰ステップが要るのは、台形則が振動する成分があるときだけ）。
+    _resolution_notes(
+        rates, h, notes, damped=damping_steps > 0, n_steps=n_steps,
+        limit=MAX_STEPS if max_steps is None else max_steps,
+        who=lambda lam: _mode_elements(system, system.G, ops.Rex, lam),
+    )
+    # 減衰ステップは、刻みが最も速い時定数の半分を超えるときだけ入れる。刻みが回路を解像していれば
+    # 台形則だけで進め、2次精度をそのまま保つ。
     n_damp = damping_steps if _has_unresolved_rate(rates, h) else 0
 
     out = np.empty((n_steps + 1, len(system.unknowns)))
@@ -431,14 +761,22 @@ def _diode_voltage(system: System, x: np.ndarray, j: int) -> float:
 
 def _initial_state(
     system: System, table: _StateTable, sw_code: int, u0: np.ndarray, max_flips: int
-) -> tuple[int, np.ndarray]:
-    """t = 0 の回路状態と、整合した初期値 x(0)。
+) -> tuple[int, np.ndarray, bool]:
+    """t = 0 の回路状態と、整合した初期値 x(0)、救済したか（下の説明）。
 
     初期条件（コンデンサ電圧、インダクタ電流）を保ったまま、ダイオードの状態を
-    「オンなら順方向電流、オフなら逆電圧」になるまで反転して決める。
+    「オンなら順方向電流、オフなら逆電圧」になるまで反転して決める（判定は核と同じ）。
+    落ち着かないときは、試した状態のうち違反が最も小さいものを、違反が丸め誤差の幅
+    （_diode_band）以内なら採る（救済。stats の rescues_at_start に 1 が入る）。インダクタ電流がすべて 0 の
+    整流器のように、電流がちょうど 0 のダイオードは、オンでもオフでも電圧が丸め誤差だけになるため。
+    状態は最初のステップで核が決め直す。
     """
     n_sw, n_dev = system.n_switches, len(system.devices)
+    n_nodes = len(system.netlist.nodes())
     code = sw_code
+    flipped = [0] * n_dev
+    last: dict[int, float] = {}
+    best: tuple[float, int, np.ndarray] | None = None
     for flips in range(max_flips + 1):
         s = table.slot(code)
         x0 = table.rex[s] @ system.ex0 + table.Ru[s] @ u0
@@ -447,15 +785,64 @@ def _initial_state(
             vd = _diode_voltage(system, x0, j)
             if (vd < 0.0) if (code >> j) & 1 else (vd > DIODE_ON_VOLTAGE):
                 wrong.append(j)
+                last[j] = vd
         if not wrong:
-            return code, x0
+            return code, x0, False
+        violation = max(abs(last[j]) for j in wrong)
+        if best is None or violation < best[0]:
+            best = (violation, code, x0)
         for j in wrong if flips < SIMULTANEOUS_FLIPS else wrong[:1]:
             code ^= 1 << j
+            flipped[j] += 1
+    violation, best_code, best_x0 = best
+    band = _diode_band(best_x0, n_nodes)
+    if violation <= band:
+        return best_code, best_x0, True
     raise CircuitError(
         f"時刻 t=0 でダイオードの状態が {max_flips} 回の反転で落ち着かない。"
         f"最後に試した状態: {describe_state(system, code)}。"
-        "初期値（ic）と、ダイオードだけで閉じたループが無いかを確認する"
+        + _unsettled_hint(system, flipped, last, band)
     )
+
+
+def _diode_band(x: np.ndarray, n_nodes: int) -> float:
+    """t = 0 のダイオードの状態が落ち着かないときに、丸め誤差とみなす電圧の幅 [V]。
+
+    幅は max(DIODE_ON_VOLTAGE, DIODE_BAND_REL × 節点電圧の最大の絶対値)。ダイオードの電圧は、
+    大きさが節点電圧と同程度の2つの値の差なので、丸め誤差も節点電圧に比例する。インダクタ電流が
+    すべて 0 の点では、オンでもオフでも電圧が丸め誤差（初期値の整合の計算で 1e-9 倍程度）だけになり、
+    その符号で2つの状態を往復する。
+    """
+    scale = float(np.abs(x[:n_nodes]).max(initial=0.0))
+    return max(DIODE_ON_VOLTAGE, DIODE_BAND_REL * scale)
+
+
+def _unsettled_hint(
+    system: System, flipped: list[int], last: dict[int, float], band: float | None = None
+) -> str:
+    """ダイオードの状態が決まらないときの、手がかりと直し方。"""
+    parts = []
+    most = max(flipped, default=0)
+    if most > 0:
+        detail = ", ".join(
+            f"{system.devices[j]}（最後の電圧 {last[j]:.3g} V）"
+            for j, n in enumerate(flipped) if n == most and j in last
+        )
+        parts.append(f"オンとオフを繰り返したダイオード: {detail}")
+    ratio = max(
+        (float(system.dev_g_on[j] / system.dev_g_off[j])
+         for j in range(system.n_switches, len(system.devices))),
+        default=0.0,
+    )
+    band_text = f"（いまは ±{band:.3g} V）" if band is not None else ""
+    parts.append(
+        "オンにしてもオフにしても、ダイオードの電圧が判定と食い違い、その食い違いが丸め誤差とみなせる幅"
+        f"{band_text}より大きい。"
+        f"r_off / r_on の比（いまは最大 {ratio:.3g}）が大きいほど丸め誤差が大きくなる。"
+        "r_off を小さく（例 1e5 Ω）、または r_on を大きくして試す。"
+        "ダイオードどうしが向きをそろえずに並列・直列につながった部分が無いかも確認する"
+    )
+    return "。".join(parts)
 
 
 def _simulate_switched(
@@ -500,7 +887,10 @@ def _simulate_switched(
     n = len(system.unknowns)
     n_sw, n_dev = system.n_switches, len(system.devices)
     switch_gate = [gate_names.index(netlist.component(cid).gate) for cid in system.devices[:n_sw]]
-    _check_result_size(n_steps, n, max_steps)
+    _check_result_size(
+        n_steps, n, max_steps, len(system.sources), switched=True, n_gates=len(gates),
+        n_commands=sum(len(c.outputs) for c in controllers if isinstance(c, Controller)), n_devices=n_dev,
+    )
     u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
     u_mid = 0.5 * (u_start + u_end)
 
@@ -594,7 +984,7 @@ def _simulate_switched(
     max_flips = _flip_limit(n_dev - n_sw)
     k0, k1 = 0, next_stop(0)
     fill(k0, k1)
-    code0, x = _initial_state(system, table, int(sw_code[0]), u_start[0], max_flips)
+    code0, x, rescued_at_start = _initial_state(system, table, int(sw_code[0]), u_start[0], max_flips)
     out[0] = x
     _initial_value_notes(system, x, notes)
     ctl = np.zeros(kernel.CTL_SIZE, dtype=np.int64)
@@ -625,7 +1015,7 @@ def _simulate_switched(
             raise CircuitError(
                 f"時刻 t={k * h:.6g} s（ステップ {k}）でダイオードの状態が {max_flips} 回の反転で"
                 f"落ち着かない。最後に試した状態: {describe_state(system, code)}。"
-                "ダイオードだけで閉じたループが無いか、r_on と r_off が極端でないかを確認する"
+                + _unsettled_hint(system, [], {})
             )
         # k0 の測定値で演算する。結果は次の制御周期の頭から使う
         for c, m, ins, outs in zip(controllers, ctrl_steps, ctrl_inputs, ctrl_outputs, strict=True):
@@ -642,6 +1032,21 @@ def _simulate_switched(
         # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
         s_last = table.slot(int(ctl[kernel.CTL_STATE]))
         out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
+    # 刻みが回路の速い成分を解像しているか（計算で使った回路状態ごと。スイッチの無い回路と同じ注意）
+    used = np.unique(np.concatenate([[code0], code_out[:n_steps]]))
+    rates, rate_state = _switched_rates(system, table, used)
+
+    def who(lam: complex) -> list[str]:
+        code = int(rate_state[int(np.argmin(np.abs(rates - lam)))])
+        G_code, Rex_code = state_conductance(system, code), table.rex[table.index[code]]
+        return _mode_elements(system, G_code, Rex_code, lam, code)
+
+    _resolution_notes(
+        rates, h, notes, damped=damping_steps > 0, n_steps=n_steps,
+        limit=MAX_STEPS if max_steps is None else max_steps, who=who,
+    )
+    before = np.concatenate([[code0], code_out[: n_steps - 1]])
+    _interruption_notes(system, out, before, code_out[:n_steps], u_start, h, notes)
     # 最後の点から始まる区間は無いので、区間ごとの記録は最後の区間の値を繰り返す
     gate_out[n_steps] = gate_out[n_steps - 1]
     cmd_out[n_steps] = cmd_out[n_steps - 1]
@@ -673,5 +1078,6 @@ def _simulate_switched(
             "states": table.count,
             "state_changes": int(ctl[kernel.CTL_CHANGES]),
             "retries": int(ctl[kernel.CTL_RETRIES]),
+            "rescues_at_start": int(rescued_at_start),
         },
     )

@@ -89,16 +89,12 @@ def _solve_or_raise(M: np.ndarray, rhs: list[np.ndarray], h: float) -> list[np.n
     return out
 
 
-def prepare(
-    E: np.ndarray, G: np.ndarray, B: np.ndarray, h: float, backward_euler: bool = False
-) -> Operators:
-    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。
+def consistent_maps(E: np.ndarray, G: np.ndarray, B: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """整合の取れた値を作る行列 Rex, Ru:  x = Rex (E x) + Ru u。
 
     解けない回路では CircuitError。undetermined 属性に、決まらない未知数の番号が入る。
     """
-    n, n_u = B.shape
-
-    # --- 整合の取れた初期値・不連続点の処理 -----------------------------------
+    n = B.shape[0]
     # 状態（コンデンサ電圧・インダクタ電流）は E x で決まる。残りの変数は、
     # 方程式のうち微分を含まない部分  W^T G x = W^T B u  （W は E の左零空間）で決まる。
     W = _left_null_space(E)
@@ -120,6 +116,20 @@ def prepare(
     S_pinv = np.linalg.pinv(S)
     Rex = S_pinv[:, :n] * dE[None, :]
     Ru = (S_pinv[:, n:] * dA[None, :]) @ B_alg
+    return Rex, Ru
+
+
+def prepare(
+    E: np.ndarray, G: np.ndarray, B: np.ndarray, h: float, backward_euler: bool = False
+) -> Operators:
+    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。
+
+    解けない回路では CircuitError。undetermined 属性に、決まらない未知数の番号が入る。
+    """
+    n, n_u = B.shape
+
+    # --- 整合の取れた初期値・不連続点の処理 -----------------------------------
+    Rex, Ru = consistent_maps(E, G, B)
     Rx = Rex @ E
 
     # --- 台形則 ---------------------------------------------------------------
@@ -205,6 +215,7 @@ def run(
 
 
 # ---------------------------------------------------------------- スイッチング
+
 # run_switched() の戻り値
 DONE = 0           # k_stop まで進んだ
 NEED_STATE = 1     # 行列を用意していない回路状態に出会った（符号は ctl[CTL_CODE]）
@@ -258,6 +269,10 @@ def run_switched(
       2. 候補の状態で1ステップ試す。ステップの終わりで、オンのダイオードの電圧（= 電流 × r_on）が
          負、またはオフのダイオードの電圧が v_on を超えていたら、反転してやり直す。
          最初の n_simul 回は違反したものを同時に反転し、その後は番号の小さい1つだけを反転する。
+         max_flips 回で落ち着かないときは NOT_SETTLED を返す。
+         （計算の先頭の状態決定には丸め誤差の幅での救済があるが、ここには置かない。判定に使う値は
+         後退オイラーのステップの終わりの値で、電流がちょうど 0 の点でも、試した回路（1e10 V まで、
+         r_off / r_on = 1e18 まで）で往復が落ち着かなくなることが無かったため。E1c の報告を参照）
       3. 状態が直前の区間と変わったステップ（やり直したステップを含む）は、後退オイラーで進める。
          後退オイラーでの判定は「このステップの終わりまでダイオードが導通し続けるか」と同じになり、
          状態が1つに決まる。続く n_damp ステップは減衰ステップ（刻みより速い成分を消す。

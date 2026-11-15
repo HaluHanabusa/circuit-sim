@@ -168,12 +168,6 @@ def test_c12_above_the_threshold_the_result_is_accurate_and_noted(ratio):
     assert "以下にする" in res.notes[0]                                # 直し方
 
 
-@product_bug(
-    "軽微",
-    "注意と減衰の境目が『台形則が振動し始める点（h = 2τ）』にあり、精度の境目に無い。",
-    "h が時定数の 0.6〜2 倍のとき、振動はしないが誤差が 1% を超え（h=τ で 3.5%、",
-    "h=1.99τ で 13.4%）、注意が出ない。境目のすぐ上（h=2.01τ）は 0.25% で注意あり",
-)
 @pytest.mark.parametrize("ratio", [1.0, 1.5, 1.9, 1.99])
 def test_c12_just_below_the_threshold_is_accurate_or_noted(ratio):
     """境目のすぐ下: 真値と 1% 以内か、刻みが粗いことが注意で分かること。"""
@@ -440,24 +434,12 @@ def test_c14_slowly_decaying_oscillation_shortens_the_default_time_and_says_so()
     assert max_err(res["v(out)"][:2001], v[:2001], 10.0) < TOL             # 最初の 10 周期は 1% 以内
 
 
-@product_bug(
-    "軽微",
-    "不足減衰で減衰が遅い回路（ζ < 0.003）の既定（1 周期 200 点 × 100 周期）は、台形則の位相のずれが",
-    "積み上がり、計算の終わりで入力電圧の 3.8%（ζ=0.0005）〜5.2% ずれる。注意は計算時間を短くした旨だけ",
-)
 def test_c14_slowly_decaying_oscillation_default_is_within_one_percent():
     ex, res, notes = run_spec(rlc_spec(0.01))
     v, _ = rlc_exact(res.t, 10.0, 0.01, 1e-3, 10e-6)
     assert max_err(res["v(out)"], v, 10.0) < TOL or any("位相" in n or "精度" in n for n in notes)
 
 
-@product_bug(
-    "軽微",
-    "振動する回路（ζ=0.05、周期 0.63 ms）に simulation.t_end = 1 s だけを指定すると、既定の刻みが",
-    "1 周期 12.6 点まで粗くなり、振動が入力電圧の 15% ずれる。注意は『速い成分と遅い成分が離れているので",
-    "刻みを遅い側に合わせた』だけで、振動そのものが正しく出ていないことは分からない",
-    "（simulate の注意は 10 点未満で出る）",
-)
 def test_c14_long_user_time_on_oscillating_circuit_is_accurate_or_says_oscillation_is_unresolved():
     ex, res, notes = run_spec(rlc_spec(1.0, {"t_end": 1.0}))
     assert len(res.t) - 1 <= DEFAULT_STEP_BUDGET
@@ -598,11 +580,6 @@ def test_notes_name_the_cause_and_the_fix(name):
     assert any(all(word in note for word in words) for note in notes), f"{words} を含む注意が無い: {notes}"
 
 
-@product_bug(
-    "軽微",
-    "simulate(..., damping_steps=0) で減衰を切っても、注意の文面が『計算の先頭と電源のステップ直後は、",
-    "数値振動が出ないように減衰させている』のままで、実際の波形（入力の 1.67 倍まで振れる）と食い違う",
-)
 def test_notes_do_not_claim_damping_when_it_is_switched_off():
     res = simulate(rc_net(Step(final=1.0)), 4.0, 1e-2, damping_steps=0)
     assert res["v(out)"].max() > 1.5                                       # 台形則だけなので振れている

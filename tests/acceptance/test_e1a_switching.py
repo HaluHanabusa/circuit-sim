@@ -682,10 +682,6 @@ def test_x_long_run_stays_periodic():
     assert np.ptp(averages) < 1e-6 * VIN
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の制約（軽微、E1a-B.md の問題2）: 還流の経路が無いままインダクタ電流が遮断されると、"
-    "電流は1刻みで消え、v(sw) に刻みに依存する大きさの1点（L·Δi / h。この条件で 616 V、モデルの真値は"
-    " 312 kV）が記録される。結果の notes に何も出ないので、スコープでは原因が分からない"))
 def test_x_interrupted_inductor_current_is_reported():
     """出力を Vin より高く充電しておくと、オンの間に逆向きの電流が流れ、オフで行き場が無くなる。"""
     result = simulate(buck(R_CCM, v0=30.0), 1e-4, gates=pwm())
