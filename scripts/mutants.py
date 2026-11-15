@@ -20,8 +20,10 @@
   1. 壊す前の試験を1回流し、試験ごとに、スクリプトのどの行を通ったかを記録する（標準の sys.monitoring。
      試験が起動した Python の子プロセスも、PYTHONPATH に置いた sitecustomize で記録する）。結果は
      .cycle/mutants/ に控え、スクリプトと試験の内容が同じなら使い回す。
-  2. 壊した行を通る試験だけを、短い順に流す（-x。最初に落ちたところで止める）。
-  3. そこで生き残ったら、道具の試験の全体を流して確かめる（通った行の記録の漏れで、生き残りに数えない）。
+  2. 壊した行を通る試験だけを、短い順に流す（-x。最初に落ちたところで止める）。関数の外の代入（決まりの
+     一覧など）を壊したものは、その名前を使う関数を通る試験を流す。
+  3. --confirm を付けると、そこで生き残ったものを、道具の試験の全体でもう一度流す。付けなくても、生き残りを
+     見逃す側には倒れない（選び方の漏れは、生き残りを多めに数えるだけ）。
 各回の後で、その回が起動して残ったプロセス（親を失った偽の claude など）を止める（環境変数の印で探す。
 Linux の /proc を読む。ほかのOSでは、探せないことを表示する）。
 
@@ -70,6 +72,10 @@ NESTED_VAR = "CIRCUIT_SIM_PYTEST_RUNNING"
 KILLED_CODES = {1: "failed", 2: "collection", 71: "sentinel"}
 COVER_VAR = "CIRCUIT_SIM_MUTANT_COVER"  # 通った行を書く場所（壊す前の試験のときだけ）
 SELECT_VAR = "CIRCUIT_SIM_MUTANT_SELECT"  # 流す試験の一覧のファイル
+KILLER_VAR = "CIRCUIT_SIM_MUTANT_KILLER"  # 最初に落ちた試験の名前を書くファイル
+KILLERS_FILE = "killers.json"             # 壊し方ごとに、前回それを落とした試験（次の回は、それを先に流す）
+# 通った行の記録の仕方の版（記録の仕方を変えたら上げる。壊す前の試験の記録を使い回す鍵に入る）
+COVER_VERSION = 1
 RUN_TIMEOUT = 900                        # 1回の試験の上限（秒）。超えたら「止まった」として落ちた扱い
 
 NEGATED_COMPARE = {
@@ -94,6 +100,7 @@ class Mutant:
     start: int          # 置き換える範囲（ファイルの中の文字の位置）
     end: int
     module_level: bool  # 関数の外（読み込むだけで通る）
+    names: tuple[str, ...] = ()     # 関数の外の代入なら、その名前（その名前を使う関数を通る試験を選ぶ）
 
 
 # ------------------------------------------------------------------ 壊し方を作る
@@ -116,6 +123,7 @@ class Generator(ast.NodeVisitor):
         self.counts: dict[tuple[str, str], int] = {}
         self.mutants: list[Mutant] = []
         self.quiet = 0          # 表示だけの場所（print の中、f 文字列）の深さ
+        self.assigning: tuple[str, ...] = ()    # 関数の外で代入している名前
 
     def pos(self, line: int, col: int) -> int:
         # col_offset は UTF-8 のバイト数で数える
@@ -136,7 +144,7 @@ class Generator(ast.NodeVisitor):
         self.mutants.append(Mutant(
             id=f"{Path(self.path).stem}:{name}:{kind}:{number}", file=self.path, line=node.lineno,
             end_line=node.end_lineno, kind=kind, original=self.text[start:end], replacement=replacement,
-            start=start, end=end, module_level=not self.scope,
+            start=start, end=end, module_level=not self.scope, names=self.assigning,
         ))
 
     def segment(self, node: ast.AST) -> str:
@@ -251,8 +259,16 @@ class Generator(ast.NodeVisitor):
         self.statement(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        """関数の外の、大文字の名前の、文字列の並び（決まりの一覧）から、1つずつ外す。"""
         names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        if self.scope:
+            self.assign_items(node, names)
+            return
+        self.assigning = tuple(names)
+        self.assign_items(node, names)
+        self.assigning = ()
+
+    def assign_items(self, node: ast.Assign, names: list[str]) -> None:
+        """関数の外の、大文字の名前の、文字列の並び（決まりの一覧）から、1つずつ外す。"""
         value = node.value
         if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Set | ast.Tuple):
             value = value.args[0]                               # frozenset({...})
@@ -271,6 +287,20 @@ class Generator(ast.NodeVisitor):
                     self.add(item, "elem", "", span=(start, end))
                 return
         self.generic_visit(node)
+
+
+def name_users(root: Path, path: str) -> dict[str, list[tuple[int, int]]]:
+    """関数の外の名前ごとに、それを使う関数の行の範囲（その関数を通る試験が、壊した名前の影響を受けうる）。"""
+    tree = ast.parse((root / path).read_text(encoding="utf-8"))
+    users: dict[str, list[tuple[int, int]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name):
+                    users.setdefault(inner.id, []).append((node.lineno, node.end_lineno))
+                elif isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name):
+                    users.setdefault(inner.attr, []).append((node.lineno, node.end_lineno))   # cycle.NAME
+    return users
 
 
 def generated(root: Path, files: tuple[str, ...]) -> list[Mutant]:
@@ -358,7 +388,14 @@ import pytest
 
 SELECT = os.environ.get("{SELECT_VAR}")
 COVER = os.environ.get("{COVER_VAR}")
+KILLER = os.environ.get("{KILLER_VAR}")
 RECORD = []
+
+
+def pytest_runtest_logreport(report):
+    if KILLER and report.failed and not os.path.exists(KILLER):
+        with open(KILLER, "w", encoding="utf-8") as handle:
+            handle.write(report.nodeid)
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -455,11 +492,12 @@ def stop_leftovers(token: str) -> int:
 
 def run_tests(
     copy: Path, helpers: Path, tests: list[str], select: list[str] | None, cover: Path | None, timeout: float,
-    log: Path | None = None,
+    log: Path | None = None, killer: Path | None = None,
 ) -> tuple[str, float, int]:
     """写しの中で試験を流す。返すのは（結果: passed / failed / timeout、秒、後で止めた残りのプロセスの数）。
 
     log を渡すと、試験の出力をそこに書く（渡さなければ捨てる）。
+    killer を渡すと、最初に落ちた試験の名前を書く。
     """
     token = uuid.uuid4().hex
     env = {
@@ -470,6 +508,8 @@ def run_tests(
         MARK_VAR: token, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join([str(helpers), *filter(None, [env.get("PYTHONPATH")])]),
     })
+    if killer is not None:
+        env[KILLER_VAR] = str(killer)
     if cover is not None:
         env[COVER_VAR] = str(cover)
         env[f"{COVER_VAR}_TARGETS"] = json.dumps([str((copy / name).resolve()) for name in TARGETS])
@@ -509,8 +549,9 @@ def run_tests(
 # ------------------------------------------------------------------ 壊す前の試験
 
 def content_key(root: Path) -> str:
-    digest = hashlib.sha256()
-    for name in (*TARGETS, *TOOL_TESTS, "tests/conftest.py", LIST_FILE, "scripts/mutants.py"):
+    """壊す前の試験の記録を使い回してよいかの鍵（スクリプト、試験、記録の仕方が同じ）。"""
+    digest = hashlib.sha256(f"{COVER_VERSION}\0{SITECUSTOMIZE}".encode())
+    for name in (*TARGETS, *TOOL_TESTS, "tests/conftest.py"):
         path = root / name
         digest.update(name.encode() + b"\0" + (path.read_bytes() if path.is_file() else b"") + b"\0")
     return digest.hexdigest()[:16]
@@ -554,14 +595,21 @@ def baseline(root: Path, work: Path, helpers: Path, tests: list[str]) -> dict:
     return data
 
 
-def covering(base: dict, mutant: Mutant) -> list[str]:
-    """壊した行を通る試験（短い順）。関数の外を壊したなら、すべての試験。"""
+def covering(base: dict, mutant: Mutant, users: dict[str, list[tuple[int, int]]]) -> list[str]:
+    """壊した行を通る試験（短い順）。
+
+    関数の外の代入を壊したなら、その名前を使う関数を通る試験。名前が分からない（関数の外の、代入でない文）か、
+    どの関数も使わないなら、すべての試験。
+    """
     tests = base["tests"]
     if mutant.module_level:
-        chosen = list(tests)
+        ranges = [item for name in mutant.names for item in users.get(name, [])]
+        span = {line for first, last in ranges for line in range(first, last + 1)}
+        if not span:
+            return sorted(tests, key=lambda name: tests[name]["seconds"])
     else:
         span = set(range(mutant.line, mutant.end_line + 1))
-        chosen = [name for name, info in tests.items() if span & set(info["lines"].get(mutant.file, []))]
+    chosen = [name for name, info in tests.items() if span & set(info["lines"].get(mutant.file, []))]
     return sorted(chosen, key=lambda name: tests[name]["seconds"])
 
 
@@ -569,6 +617,7 @@ def covering(base: dict, mutant: Mutant) -> list[str]:
 
 def run_one(
     root: Path, copy: Path, helpers: Path, mutant: Mutant, base: dict | None, tests: list[str],
+    users: dict, confirm: bool, hint: str | None,
 ) -> dict:
     target = copy / mutant.file
     original = target.read_bytes()
@@ -580,22 +629,28 @@ def run_one(
     target.write_text(text, encoding="utf-8", newline="")
     try:
         total, leftovers, stage = 0.0, 0, "selected"
-        select = covering(base, mutant) if base is not None else None
+        select = covering(base, mutant, users.get(mutant.file, {})) if base is not None else None
+        if select and hint in select:           # 前回これを落とした試験を、先に流す
+            select = [hint, *(name for name in select if name != hint)]
+        killer = copy.parent / f"killer-{uuid.uuid4().hex}.txt"
         if select == []:
             outcome = "passed"
         else:
-            outcome, seconds, left = run_tests(copy, helpers, tests, select, None, RUN_TIMEOUT)
+            # 選んだ試験のあるファイルだけを集める（集める時間を省く）
+            files = sorted({name.split("::")[0] for name in select}) if select is not None else tests
+            outcome, seconds, left = run_tests(copy, helpers, files, select, None, RUN_TIMEOUT, None, killer)
             total, leftovers = total + seconds, leftovers + left
-        if outcome == "passed" and select is not None:      # 選んだ試験で生き残った。全体で確かめる
+        if outcome == "passed" and select is not None and confirm:      # 生き残った。全体で確かめる
             stage = "all"
-            outcome, seconds, left = run_tests(copy, helpers, tests, None, None, RUN_TIMEOUT)
+            outcome, seconds, left = run_tests(copy, helpers, tests, None, None, RUN_TIMEOUT, None, killer)
             total, leftovers = total + seconds, leftovers + left
     finally:
         target.write_bytes(original)
+    found = killer.read_text(encoding="utf-8") if killer.is_file() else None
     status = "survived" if outcome == "passed" else "error" if outcome.startswith("error") else "killed"
     return {
         "id": mutant.id, "status": status, "how": outcome, "stage": stage, "seconds": round(total, 1),
-        "leftovers": leftovers,
+        "leftovers": leftovers, "killer": found,
     }
 
 
@@ -647,10 +702,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         results: list[dict] = []
         started = time.monotonic()
 
+        users = {name: name_users(root, name) for name in files}
+        killers_path = root / STATE_DIR / KILLERS_FILE
+        killers = json.loads(killers_path.read_text(encoding="utf-8")) if killers_path.is_file() else {}
+
         def work_on(mutant: Mutant) -> dict:
             copy = free.pop()
             try:
-                return run_one(root, copy, helpers, mutant, base, tests)
+                hint = killers.get(mutant.id)
+                return run_one(root, copy, helpers, mutant, base, tests, users, args.confirm, hint)
             finally:
                 free.append(copy)
 
@@ -662,6 +722,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     print(f"[{done}/{len(mutants)}] {result['status']}: {describe(mutant)}", flush=True)
                 elif done % 25 == 0:
                     print(f"[{done}/{len(mutants)}] …", flush=True)
+    killers.update({r["id"]: r["killer"] for r in results if r.get("killer")})
+    killers_path.parent.mkdir(parents=True, exist_ok=True)
+    killers_path.write_text(json.dumps(killers, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     survived = [r for r in results if r["status"] == "survived"]
     errors = [r["id"] for r in results if r["status"] == "error"]
     unexpected = [r for r in survived if r["id"] not in equivalent]
@@ -712,6 +775,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tests", nargs="+", help="流す試験（既定は道具の試験）")
     p.add_argument("--no-select", action="store_true", help="通った行で試験を選ばない（毎回、全体を流す）")
     p.add_argument("--include-equivalent", action="store_true", help="同値として一覧にあるものも流す")
+    p.add_argument(
+        "--confirm", action="store_true",
+        help="選んだ試験で生き残ったものを、道具の試験の全体でもう一度流す（落ちれば、生き残りから外れる）",
+    )
     p.add_argument("--root", help=argparse.SUPPRESS)       # 試験用（別のリポジトリを対象にする）
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_run)
