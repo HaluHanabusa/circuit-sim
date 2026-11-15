@@ -1859,3 +1859,318 @@ def test_unreadable_merge_record_blocks_merge(repo):
     assert result.returncode == 1
     assert "前回の統合の控えを読めない" in result.stdout
     assert main_log(repo) == ["init"]
+
+
+# ------------------------------------------------------------ ツリーIDは、どのOSでも同じ
+
+def test_tree_id_matches_the_commit_where_the_executable_mark_cannot_be_shown(repo):
+    """実行できる印を表せないファイルシステム（Windows の既定）でも、同じ内容なら、コミットのツリーと同じID。
+
+    空の索引から組み直すと、git は、印の付いたファイルを「実行できない普通のファイル」として足し、
+    同じ内容なのに、コミットのツリーとも、Linux で求めたIDとも食い違う。
+    """
+    (repo / "tool.py").write_text("print(1)\n", encoding="utf-8")
+    sh(repo, "git", "add", "tool.py")
+    sh(repo, "git", "update-index", "--chmod=+x", "tool.py")
+    sh(repo, "git", "commit", "-q", "-m", "実行できる印の付いたファイル")
+    assert sh(repo, "git", "ls-files", "-s", "tool.py").startswith("100755 ")
+    # 実行できる印を信用しない設定にする（Windows では、もとからこの値）
+    sh(repo, "git", "config", "core.fileMode", "false")
+    committed = sh(repo, "git", "rev-parse", "HEAD^{tree}")
+    with mock.patch.dict(os.environ, TEST_ENV, clear=True):
+        assert CYCLE_MODULE.tree_id(repo) == committed
+        # 中身を変えれば別のIDになる。印は引き継ぐ
+        (repo / "tool.py").write_text("print(2)\n", encoding="utf-8")
+        changed = CYCLE_MODULE.tree_id(repo)
+    assert changed != committed
+    assert sh(repo, "git", "ls-tree", changed, "tool.py").startswith("100755 ")
+
+
+def test_tree_id_works_before_the_first_commit(tmp_path):
+    root = tmp_path / "new"
+    root.mkdir()
+    sh(root, "git", "init", "-q", "-b", "main")
+    (root / "a.txt").write_text("a\n", encoding="utf-8")
+    with mock.patch.dict(os.environ, TEST_ENV, clear=True):
+        tree = CYCLE_MODULE.tree_id(root)
+    assert sh(root, "git", "ls-tree", "--name-only", tree) == "a.txt"
+
+
+# ------------------------------------------------------------ Windows での確認（needs_windows、record-ci）
+
+def ci_result(tree: str, **changes: object) -> dict:
+    """手元の確認（scripts/local_ci.py）が Windows で書く形の、合格の結果。changes の項目は差し替える。"""
+    result = {
+        "schema": 1, "kind": "local-ci", "at": "2026-11-15T00:00:00Z", "mode": "checkout", "ref": "origin/U1",
+        "commit": "c" * 40, "tree": tree, "branch": "origin/U1", "dirty": False,
+        "os": {"system": "Windows", "release": "11", "version": "10.0.26100", "machine": "AMD64"},
+        "python": {"version": "3.13.1", "implementation": "CPython", "supported": True},
+        "encoding": {"stdout": "cp932", "locale": "cp932", "filesystem": "utf-8", "utf8_mode": False},
+        "check": {"script": "scripts/check.py", "returncode": 0, "seconds": 260.0, "timed_out": False},
+        "tests": {"total": 12, "passed": 10, "failed": 0, "errors": 0, "skipped": 2},
+        "failed": [], "changed": [], "verdict": "pass", "reason": "ok",
+    }
+    return {**result, **changes}
+
+
+def failed_result(tree: str) -> dict:
+    """試験が1件失敗した、Windows での結果。"""
+    result = ci_result(tree, verdict="fail", reason="tests_failed", failed=["tests/test_a.py::test_x"])
+    result["check"] = {**result["check"], "returncode": 1}
+    result["tests"] = {"total": 12, "passed": 9, "failed": 1, "errors": 0, "skipped": 2}
+    return result
+
+
+def record_ci(root: Path, result: object) -> subprocess.CompletedProcess:
+    """結果をファイルに書いて、record-ci で取り込む。result が文字列かバイト列なら、そのまま書く。"""
+    path = root.parent / "result.json"
+    data = result if isinstance(result, str | bytes) else json.dumps(result, ensure_ascii=False)
+    path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+    return cycle(root, "record-ci", "U1", "--result", str(path))
+
+
+def windows_unit(root: Path) -> tuple[Path, str]:
+    """Windows での確認が必要な作業単位を、その記録だけが無い状態まで進める。
+
+    作業ツリーと、内容のツリーIDを返す。
+    """
+    set_header(root, "needs_windows: true\n")
+    wt = implement(root)
+    pass_all(root)
+    commit(wt)
+    return wt, snap(root)
+
+
+@pytest.fixture(scope="module")
+def waiting_for_windows(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """Windows での記録だけが無い作業単位。取り込めない結果を、同じ状態から何通りも確かめるのに使い回す。"""
+    root = make_repo(tmp_path_factory.mktemp("waiting-for-windows"))
+    _, tree = windows_unit(root)
+    return root, tree
+
+
+def test_needs_windows_requires_a_windows_result_for_the_content(repo):
+    wt, tree = windows_unit(repo)
+    status = cycle(repo, "status", "U1").stdout
+    assert "windows    未実施" in status and "windows: まだ記録が無い" in status
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1 and "windows: まだ記録が無い" in refused.stdout
+    assert main_log(repo) == ["仕様の見出し", "init"]
+
+    result = ci_result(tree)
+    recorded = record_ci(repo, result)
+    assert recorded.returncode == 0, recorded.stderr
+    assert f"U1 windows: pass を記録（対象 {tree[:10]}、Windows）" in recorded.stdout
+    entry = state(repo)["gates"]["windows"]
+    assert (entry["verdict"], entry["tree"], entry["by"], entry["source"]) == (
+        "pass", tree, "scripts/local_ci.py", "ci",
+    )
+    assert (entry["os"], entry["commit"]) == ("Windows", "c" * 40)
+    # 取り込んだ結果の写しが、記録として残る（改行は LF、区切りは /）
+    assert entry["report"].startswith(".cycle/runs/U1-windows-") and entry["report"].endswith(".json")
+    assert json.loads((repo / entry["report"]).read_text(encoding="utf-8")) == result
+    assert b"\r" not in (repo / entry["report"]).read_bytes()
+    assert state(repo)["history"][-1]["gate"] == "windows"
+    assert "windows    pass  scripts/local_ci.py" in cycle(repo, "status", "U1").stdout
+
+    merged = cycle(repo, "merge", "U1")
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+    assert "windows: pass（scripts/local_ci.py）" in sh(repo, "git", "log", "-1", "--format=%B")
+
+
+def test_units_without_needs_windows_do_not_need_a_windows_result(repo):
+    set_header(repo, "needs_windows: false\n")
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    assert "windows" not in cycle(repo, "status", "U1").stdout
+    assert cycle(repo, "merge", "U1").returncode == 0
+
+
+def in_part(key: str, **changes: object):
+    """結果の中の項目（os、check、tests など）の一部を差し替える。"""
+    return lambda result: {**result, key: {**result[key], **changes}}
+
+
+def replaced(**changes: object):
+    return lambda result: {**result, **changes}
+
+
+def dropped(key: str):
+    return lambda result: {name: value for name, value in result.items() if name != key}
+
+
+# 取り込めない結果: （結果の作り方、エラーの文面）
+NOT_A_WINDOWS_PASS = {
+    "Linux での結果": (in_part("os", system="Linux"), "Windows での結果ではない（Linux）"),
+    "macOS での結果": (in_part("os", system="Darwin"), "Windows での結果ではない（Darwin）"),
+    "OSの名前の書き方が違う": (in_part("os", system="windows"), "Windows での結果ではない（windows）"),
+    "JSON でない": (lambda result: "{", "を読めない"),
+    "UTF-8 でない": (lambda result: json.dumps(result).encode("utf-16"), "を読めない"),
+    "JSON の一覧": (lambda result: "[]", "JSON のオブジェクトでない"),
+    "形の版が違う": (replaced(schema=2), "scripts/local_ci.py の結果ではない"),
+    "別の種類のファイル": (replaced(kind="doctor"), "scripts/local_ci.py の結果ではない"),
+    "commit が無い": (dropped("commit"), "commit か tree が、git のIDの形でない"),
+    "commit がIDの形でない": (replaced(commit="HEAD"), "commit か tree が、git のIDの形でない"),
+    "tree がIDの形でない": (replaced(tree="HEAD"), "commit か tree が、git のIDの形でない"),
+    "os が無い": (dropped("os"), "os.system が無い"),
+    "os.system が文字列でない": (in_part("os", system=None), "os.system が無い"),
+    "python が無い": (dropped("python"), "python.version が無い"),
+    "python.version が文字列でない": (in_part("python", version=3.13), "python.version が無い"),
+    "verdict が無い": (dropped("verdict"), "verdict が pass、fail、error のどれでもない"),
+    "verdict が知らない値": (replaced(verdict="passed"), "verdict が pass、fail、error のどれでもない"),
+    "check が無い": (dropped("check"), "check が無い"),
+    "件数が負": (in_part("tests", skipped=-1), "tests の件数が、0 以上の整数でない"),
+    "件数が真偽": (in_part("tests", failed=False), "tests の件数が、0 以上の整数でない"),
+    "件数が文字列": (in_part("tests", passed="10"), "tests の件数が、0 以上の整数でない"),
+    "件数の項目が足りない": (replaced(tests={"passed": 10}), "tests の件数が、0 以上の整数でない"),
+    "tests が一覧": (replaced(tests=[10]), "tests の件数が、0 以上の整数でない"),
+    "failed が一覧でない": (replaced(failed="none"), "failed が、名前の一覧でない"),
+    "failed に名前でないものがある": (replaced(failed=[1]), "failed が、名前の一覧でない"),
+    "合格だが、終了コードが 1": (in_part("check", returncode=1), "確認の終了コードが 0 でない"),
+    "合格だが、終了コードが無い": (in_part("check", returncode=None), "確認の終了コードが 0 でない"),
+    "合格だが、終了コードが真偽": (in_part("check", returncode=False), "確認の終了コードが 0 でない"),
+    "合格だが、試験の件数が無い": (replaced(tests=None), "試験の件数が無い"),
+    "合格だが、通過が 0": (in_part("tests", passed=0), "通過した試験が無いか、失敗した試験がある"),
+    "合格だが、失敗が 1": (in_part("tests", failed=1), "通過した試験が無いか、失敗した試験がある"),
+    "合格だが、エラーが 1": (in_part("tests", errors=1), "通過した試験が無いか、失敗した試験がある"),
+    "合格だが、失敗した試験の名前がある": (
+        replaced(failed=["tests/test_a.py::test_x"]), "通過した試験が無いか、失敗した試験がある",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", NOT_A_WINDOWS_PASS)
+def test_result_that_is_not_a_consistent_windows_result_is_not_recorded(waiting_for_windows, case):
+    root, tree = waiting_for_windows
+    change, message = NOT_A_WINDOWS_PASS[case]
+    result = record_ci(root, change(ci_result(tree)))
+    assert result.returncode == 2
+    assert message in result.stderr and "Traceback" not in result.stderr
+    assert "windows" not in state(root)["gates"]
+    assert not [entry for entry in state(root)["history"] if entry.get("gate") == "windows"]
+    assert not list((root / ".cycle" / "runs").glob("U1-windows-*"))
+
+
+def test_result_file_that_does_not_exist_is_reported(waiting_for_windows):
+    root, _ = waiting_for_windows
+    result = cycle(root, "record-ci", "U1", "--result", str(root.parent / "no-such-file.json"))
+    assert result.returncode == 2 and "を読めない" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_result_for_another_content_is_not_recorded(waiting_for_windows):
+    """別のコミットに対する結果は、使い回せない。"""
+    root, tree = waiting_for_windows
+    other = sh(root, "git", "rev-parse", "main^{tree}")         # 作業単位の変更が入る前の内容
+    result = record_ci(root, ci_result(other))
+    assert result.returncode == 2
+    assert f"結果のツリー（{other[:10]}）が、作業ツリーのいまの内容（{tree[:10]}）と" in result.stderr
+    assert "違うファイル: product.py" in result.stderr
+    result = record_ci(root, ci_result("1" * 40))               # このリポジトリに無い内容
+    assert result.returncode == 2 and "結果のツリー（1111111111）が、このリポジトリに無い" in result.stderr
+    assert "windows" not in state(root)["gates"]
+    refused = cycle(root, "merge", "U1")
+    assert refused.returncode == 1 and "windows: まだ記録が無い" in refused.stdout
+
+
+@pytest.mark.parametrize("verdict", ["fail", "error"])
+def test_windows_result_that_did_not_pass_is_recorded_and_blocks_merge(repo, verdict):
+    wt, tree = windows_unit(repo)
+    assert record_ci(repo, ci_result(tree)).returncode == 0
+    failed = failed_result(tree)
+    if verdict == "error":      # 結果を得られなかった実行
+        failed = {**failed, "verdict": "error", "reason": "no_test_results", "tests": None, "failed": []}
+    result = record_ci(repo, failed)
+    assert result.returncode == 1 and f"U1 windows: {verdict} を記録" in result.stdout
+    assert state(repo)["gates"]["windows"]["verdict"] == verdict        # 前の合格は、残らない
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1 and f"windows: {verdict}" in refused.stdout
+    assert main_log(repo) == ["仕様の見出し", "init"]
+
+
+def test_windows_result_goes_stale_when_the_content_changes(repo):
+    wt, tree = windows_unit(repo)
+    result = ci_result(tree)
+    assert record_ci(repo, result).returncode == 0
+    (wt / "product.py").write_text("x = 3\n", encoding="utf-8")         # 記録の後で、製品のコードが変わる
+    pass_all(repo)
+    commit(wt)
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1
+    assert "windows: 確認の後で変わったファイルがある（product.py）。やり直す" in refused.stdout
+    assert main_log(repo) == ["仕様の見出し", "init"]
+    again = record_ci(repo, result)                                      # 前の内容の結果は、取り込み直せない
+    assert again.returncode == 2 and "一致しない（違うファイル: product.py）" in again.stderr
+    assert record_ci(repo, ci_result(snap(repo))).returncode == 0
+    assert cycle(repo, "merge", "U1").returncode == 0
+
+
+def test_verifier_may_add_acceptance_tests_after_the_windows_result(repo):
+    """Windows での結果の後で増えてよいのは、ほかの確認系のゲートと同じ。例外の場所への新しいファイルだけ。"""
+    wt, tree = windows_unit(repo)
+    result = ci_result(tree)                    # この内容を、Windows で確かめた
+    (wt / "tests" / "acceptance").mkdir(parents=True)
+    (wt / "tests" / "acceptance" / "test_u1.py").write_text("def test_ok():\n    pass\n", encoding="utf-8")
+    assert cycle(repo, "check", "U1").returncode == 0
+    commit(wt)
+    recorded = record_ci(repo, result)          # 取り込みの時点で、受け入れ試験が増えている
+    assert recorded.returncode == 0, recorded.stderr
+    assert state(repo)["gates"]["windows"]["tree"] == tree != snap(repo)
+    assert "統合: できる" in cycle(repo, "status", "U1").stdout
+
+    # 例外の場所でも、結果の時点で既にあったファイルの書き換えは「変わった」と見なす
+    with_test = snap(repo)
+    assert record_ci(repo, ci_result(with_test)).returncode == 0    # 受け入れ試験を含む内容で、確かめ直した
+    changed = "def test_ok():\n    assert 1\n"
+    (wt / "tests" / "acceptance" / "test_u1.py").write_text(changed, encoding="utf-8")
+    status = cycle(repo, "status", "U1").stdout
+    assert "windows: 確認の後で変わったファイルがある（tests/acceptance/test_u1.py）。やり直す" in status
+    refused = record_ci(repo, ci_result(with_test))
+    assert refused.returncode == 2 and "違うファイル: tests/acceptance/test_u1.py" in refused.stderr
+
+
+def test_windows_gate_can_only_be_recorded_from_a_result_file(waiting_for_windows):
+    """Windows での合格は、record と run では記録できない（自己申告や、エージェントの判定では作れない）。"""
+    root, tree = waiting_for_windows
+    result = cycle(root, "record", "U1", "windows", "--verdict", "pass", "--by", "someone", "--tree", tree)
+    assert result.returncode == 2 and "invalid choice: 'windows'" in result.stderr
+    result = cycle(root, "run", "U1", "windows")
+    assert result.returncode == 2 and "invalid choice: 'windows'" in result.stderr
+    assert "windows" not in state(root)["gates"]
+
+
+def test_windows_gate_cannot_be_listed_in_the_gates_header(repo):
+    set_header(repo, "gates: implement, windows\n")
+    result = cycle(repo, "start", "U1")
+    assert result.returncode == 2 and "知らないゲート" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["yes", '"true"', "true  # Windows で確かめる", "1", ""])
+def test_unknown_needs_windows_value_is_rejected(repo, value):
+    set_header(repo, f"needs_windows: {value}\n")
+    result = cycle(repo, "start", "U1")
+    assert result.returncode == 2
+    assert "needs_windows は true か false だけ" in result.stderr
+    assert not (repo / ".cycle" / "state" / "U1.json").exists()
+
+
+@pytest.mark.parametrize("before, after", [("needs_windows: true\n", ""), ("", "needs_windows: true\n")])
+def test_needs_windows_cannot_be_changed_once_records_exist(repo, before, after):
+    """ゲートの記録がある作業単位で、Windows での確認の要る・要らないを変えるには、記録を消してやり直す。"""
+    if before:
+        set_header(repo, before)
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    if after:
+        set_header(repo, after)
+    else:
+        (repo / "docs" / "plan" / "U1-demo.md").write_text(SPEC, encoding="utf-8")
+        commit(repo, "仕様の見出しから needs_windows を外す")
+    result = cycle(repo, "start", "U1")
+    assert result.returncode == 2 and "start --reset" in result.stderr
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1 and "start の後で変わっている" in result.stdout
+    assert cycle(repo, "start", "U1", "--reset").returncode == 0
+    assert ("windows    未実施" in cycle(repo, "status", "U1").stdout) == bool(after)
+    assert state(repo)["needs_windows"] is bool(after)
