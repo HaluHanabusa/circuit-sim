@@ -20,12 +20,14 @@
 
 ## 動かし方
 
-Python 3.11 以上。Windows と Linux は、GitHub上の自動テストで毎回確かめている。
-コマンドはどのOSでも同じ（macOS も同じコマンドを使う。自動テストには入れていない）。
+Python 3.11 以上。Windows と Linux で確かめている（手元のPCで `python scripts/local_ci.py` を実行し、
+どのコミットが、どのOSで確認を通ったかを記録する。GitHub上の自動テストは、手で起動する補助）。
+コマンドはどのOSでも同じ（macOS も同じコマンドを使う。確認の対象には入れていない）。
 
 ```bash
 python -m pip install -e ".[dev]"
 python scripts/check.py                            # ruff と pytest（解析解との照合を含む）
+python scripts/local_ci.py                         # origin/main を取り出して確認し、結果を記録する
 python -m circuit_sim examples/rlc_series.json --csv out.csv
 ```
 
@@ -44,6 +46,10 @@ python -m circuit_sim examples\rlc_series.json --csv out.csv
   文字コードが cp932 になり、`µF` は `uF`、オーム記号は `ohm` と表示される。計算結果は変わらない。
 - `python scripts/doctor.py` は、開発の道具が動く環境かどうかを確かめる。結果は画面と
   `.cycle/doctor-result.json` に出る（`docs/design/harness.md` の7章）。
+- `python scripts/local_ci.py` は、指定したコミット（既定は `origin/main`）を、作業中のフォルダとは別の
+  場所に取り出して `scripts/check.py` を実行し、結果を `.cycle/ci/` に1回1ファイルで書く
+  （コミットID、OS、Python の版、件数、合否、失敗した試験の名前。`docs/design/harness.md` の8章）。
+  作業中のフォルダの未コミットの変更には左右されない。`--current` を付けると、いまの内容で確かめる。
 
 Pythonから:
 

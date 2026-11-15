@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """開発環境の確認。自分のPCで実行して、開発の道具が動く環境かどうかを確かめる。
 
-  python scripts/doctor.py               OS、Python、git、claude の有無と版、scripts/check.py の結果
+  python scripts/doctor.py               OS、Python、git、claude の有無と版、確かめた内容（コミットIDと
+                                         ツリーID）、scripts/check.py の結果
   python scripts/doctor.py --no-check    scripts/check.py（数分かかる）を省く
   python scripts/doctor.py --headless    加えて、本物の claude -p を最小の指示で1回だけ実行し、
                                          ハーネス（scripts/cycle.py run）が前提にしている出力の形かを確かめる
 
 --headless はClaudeの利用枠を少し使うので、付けたときだけ実行する。実行の前に、何をするかを表示する。
 
-結果は画面と .cycle/doctor-result.json に出す。書き出すのは、形（項目の有無と型）、真偽、版の番号だけ。
+結果は画面と .cycle/doctor-result.json に出す。書き出すのは、形（項目の有無と型）、真偽、版の番号、
+確かめた内容の git のID（コミット、ツリー）とブランチ名だけ。
 認証情報、環境変数の中身、claude の応答の本文は、画面にもファイルにも書き出さない。
 終了コードは、必要なもの（Python の版、git、確認、頼まれたヘッドレスの確認）に問題が無ければ 0。
 標準ライブラリだけで動く。
@@ -122,7 +124,9 @@ def check_info(root: Path, skip: bool) -> dict:
     print(f"{cycle.CHECK_SCRIPT} を実行します（ruff と pytest。数分かかることがあります）", flush=True)
     started = time.monotonic()
     try:
-        code = subprocess.run([sys.executable, cycle.CHECK_SCRIPT], cwd=root).returncode
+        # 呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（一部の試験だけの合格にしない）
+        env = cycle.check_env(dict(os.environ))
+        code = subprocess.run([sys.executable, cycle.CHECK_SCRIPT], cwd=root, env=env).returncode
     except OSError:
         return {"ran": False, "reason": "cannot_start"}
     seconds = round(time.monotonic() - started, 1)
@@ -344,6 +348,14 @@ def command_line(info: dict, missing: str) -> str:
     return f"{info['version'] or '版の表示を読めない'}（{info['file']}）"
 
 
+def content_line(content: dict) -> str:
+    if content["commit"] is None:
+        return "分からない（gitの作業ツリーの最上位ではないか、コミットがまだ無い）"
+    dirty = "、未コミットの変更あり" if content["dirty"] else ""
+    branch = content["branch"] or "ブランチから切り離されている"
+    return f"コミット {content['commit'][:10]}、ツリー {content['tree'][:10]}（{branch}{dirty}）"
+
+
 def check_line(check: dict) -> str:
     if check["ran"]:
         verdict = "合格" if check["passed"] else f"不合格（終了コード {check['returncode']}）"
@@ -412,6 +424,7 @@ def report(result: dict) -> list[str]:
         f"ファイル名 {encoding['filesystem']}",
         f"  git         : {command_line(result['git'], '見つからない（git を入れて PATH を通す）')}",
         f"  claude      : {claude}",
+        f"  内容        : {content_line(result['content'])}",
         f"  確認        : {check_line(result['check'])}",
         f"  ヘッドレス  : {first}",
         *(f"                {line}" for line in rest),
@@ -420,6 +433,7 @@ def report(result: dict) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cycle.quiet_error_dialogs()     # Windows で、OSのエラー画面で止まらないように（起動するものに引き継ぐ）
     parser = argparse.ArgumentParser(prog="doctor.py", description="開発環境の確認")
     parser.add_argument("--no-check", action="store_true", help="scripts/check.py を実行しない")
     parser.add_argument(
@@ -447,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
             **command_info("claude", root),
             "api_key_env_set": any(os.environ.get(name) for name in BILLING_VARS),
         },
+        # 確かめた内容（確認を始める前の時点）。ツリーIDは、ハーネス（cycle.py）と同じ求め方
+        "content": cycle.content_info(root),
         "check": check_info(root, args.no_check),
         "headless": {"ran": False, "reason": "not_requested"},
     }
@@ -459,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     print("\n".join(report(result)))
-    print(f"記録: {RESULT_FILE}（形と真偽だけ。認証情報と応答の本文は入っていない）")
+    print(f"記録: {RESULT_FILE}（形、真偽、git のIDだけ。認証情報と応答の本文は入っていない）")
     return 0 if result["ok"] else 1
 
 
