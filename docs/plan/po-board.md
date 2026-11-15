@@ -30,6 +30,14 @@ python scripts\doctor.py --headless
 - 最後の1行だけが、本物の `claude -p` を1回実行する（サブスクの利用枠を少し使う）。実行前に、何をするかが表示される。
 - Python は 3.11 以上が必要。
 
+## POのPCでの確認結果（2026-11-15）
+
+- Windows 11（日本語、既定の文字コード cp932）、Python 3.13.2、git 2.49.0、claude 2.1.227（claude.EXE）。
+- `python scripts\doctor.py`: 問題なし。確認は 831 件通過、スキップ4件（Windowsに無い仕組みを試すものと、Windowsでは別の試験が担うもの）。日本語Windowsの実機での確認が取れた。
+- `python scripts\doctor.py --headless`: 問題あり。`claude -p` が 0.2 秒で終了コード 1、`is_error` が真、`structured_output` なし、費用 0 で終わった。Claude Code の中で、問い合わせの前に失敗している形（クラウドの作業環境で認証できなかったときと同じ形）。原因の文面は記録しない作りなので、まだ分からない。
+- ハーネスの判定は error（合格にしない）で、正しく働いた。実物で分かった点: 失敗のときも `subtype` は `success` で、失敗は `is_error` と終了コードで分かる。
+- 成功したときの出力の形（`structured_output` の有無）は、まだ確かめられていない。
+
 ## 次にやること
 
 - H2: ハーネスの残課題（土台の付け替えで main の成果が消える経路、Windowsで作業フォルダのファイルが先に動く経路、ほか）
