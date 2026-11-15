@@ -39,6 +39,8 @@ python scripts/check.py                           # ruff + pytest。統合前に
 python -m circuit_sim examples/rlc_series.json    # 仕様JSONから計算
 python scripts/cycle.py status                    # 作業単位ごとのゲートの状況
 python scripts/doctor.py                          # 環境の確認（OS、Python、git、claude、確認の結果）
+python scripts/local_ci.py --ref origin/<ブランチ>  # 指定したコミットを取り出して確認し、.cycle/ci/ に記録（Windowsの確認もこれ）
+python scripts/cycle.py record-ci <ID> --result <ファイル>  # Windowsでの確認の結果をゲートに取り込む
 ```
 
 ## 守る決まり
@@ -53,6 +55,7 @@ python scripts/doctor.py                          # 環境の確認（OS、Pytho
 8. 画面の文言は直書きしない。日本語と英語を切り替えられる形で持つ。
 9. 利用者の設計書とデータは端末の外に出さない。例外はAIへの抽出依頼だけで、送る内容を事前に画面で示す。
 10. 速度は測ってから手を入れる。
+11. 試験から本物の `claude` を起動しない。試験の中で PATH を組むときは `CIRCUIT_SIM_SAFE_PATH` を使う（`tests/conftest.py` が PATH から claude を外し、見張り役を置く）。エージェントが手元で試験を流すときも、claude の無い PATH で流す。
 
 ## ブランチと完了の定義
 

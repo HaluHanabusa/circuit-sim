@@ -1,6 +1,6 @@
 # PO向けの掲示板
 
-最終更新: 2026-11-15
+最終更新: 2026-11-15（W2 の統合後）
 
 ## 現在地
 
@@ -8,27 +8,16 @@ v0.1「見える」に向けて、エンジン側のスイッチング回路（E
 
 ## 今回できたこと
 
-- **W1 完了（Windowsで動くこと）**: 本体、確認スクリプト、ハーネスがWindowsで動く。GitHub上の自動テストにWindows（Python 3.11 / 3.13）を加え、832件が通過。日本語Windowsの端末（cp932）でも表示で落ちない。
-  - レビューと独立検証は、初回はどちらも差し戻し（ヘッドレス実行の打ち切りがLinuxで効かなくなる後退、Windowsで作業フォルダの偽の `claude` が選ばれる経路など）。直してから、再レビューと再検証を通した。
-- **POのPC用の確認スクリプト** `scripts/doctor.py`: OS、Python、git、claude の有無、確認の結果を調べる。`--headless` を付けると、本物の `claude -p` を1回だけ実行して、ハーネスが前提にしている出力の形を記録する。
-- **訂正（前回分）**: ヘッドレス実行は、Claudeのプランでサインインしていればサブスクの利用枠から引かれる（D-024）。
+- **W2 完了（手元での確認）**: `python scripts\local_ci.py --ref origin/<ブランチ>` で、指定したコミットをPCの一時フォルダに取り出して確認し、結果を `.cycle\ci\` に記録する。GitHub上の自動テストの代わり。POのWindowsで 1075 件中 1034 通過、失敗0、648秒。
+  - 途中で、試験から本物の claude に行き着く経路が見つかり、仕組みで塞いだ（試験の開始時に PATH から外し、見張り役を置く。D-033）。
+  - Windowsのエラー画面（16ビットのアプリケーション）で試験が止まる問題も直した。
+- **E1c（エンジンの残課題）**: 三相整流器が止まる件などを実装。レビューは「統合してよい」、独立検証は「合格」。指摘の修正中。
+- **新しい課題 E1d**: 中性点を接地し直流側を浮かせた三相ブリッジは、まだ計算できない（E0 からの制約）。E3（三相インバータ）の前に必須。
 
 ## POにお願いしたいこと
 
-PowerShellで次を実行する（`C:\dev\circuit-sim` は空のフォルダ）。結果は `.cycle\doctor-result.json` に書き出され、オーケストレーターがフォルダ越しに読む。
-
-```powershell
-cd C:\dev\circuit-sim
-git clone https://github.com/HaluHanabusa/circuit-sim .
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-python scripts\doctor.py
-python scripts\doctor.py --headless
-```
-
-- 最後の1行だけが、本物の `claude -p` を1回実行する（サブスクの利用枠を少し使う）。実行前に、何をするかが表示される。
-- Python は 3.11 以上が必要。
+- PCを本線に戻す: `git switch main` と `git pull`。
+- （任意）試験が本物の claude を起動していたかの確認: `dir /b %USERPROFILE%\.claude\projects | findstr /i "pytest-of"`。何も出なければ起動されていない。
 
 ## POのPCでの確認結果（2026-11-15）
 
