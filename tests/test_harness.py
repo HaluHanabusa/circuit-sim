@@ -1341,6 +1341,14 @@ def test_place_reached_through_a_link_counts_as_the_place_it_leads_to(tmp_path):
 
 
 def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, tmp_path):
+    """起動できない claude は、エラー（記録は変えない）。
+
+    Windows では、実行ファイルの形をしていない claude.exe を起動すると、OSが「サポートされていない 16 ビット
+    アプリケーション」の画面を出すことがある（試験のプロセスの中で起動するので、画面が出ると試験の全体が
+    止まる）。ここでは、書き込み中で開けない claude.exe にして、画面の出ない形で起動に失敗させる。
+    壊れた中身の claude.exe で画面が出ずにエラーになることは、別のプロセスで、時間を限って確かめる
+    （tests/test_error_dialogs.py）。
+    """
     implement(repo)
     broken = tmp_path / "broken"
     broken.mkdir()
@@ -1348,7 +1356,8 @@ def test_cli_that_cannot_be_started_is_reported_without_changing_records(repo, t
     command.write_text("#!/no/such/interpreter\n", encoding="utf-8")      # 実行ファイルの形をしていない
     command.chmod(0o755)
     env = {"PATH": f"{broken}{os.pathsep}{os.environ['PATH']}"}
-    result = cycle(repo, "run", "U1", "review", env=env)
+    with open(command, "ab") if WINDOWS else contextlib.nullcontext():     # 書き込み中の exe は起動できない
+        result = cycle(repo, "run", "U1", "review", env=env)
     assert result.returncode == 2
     assert "claude を起動できない" in result.stderr and "Traceback" not in result.stderr
     assert "review" not in state(repo)["gates"]

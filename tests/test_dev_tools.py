@@ -307,6 +307,21 @@ def without(*missing: str):
     return find
 
 
+def test_doctor_turns_the_error_dialogs_off_first(root):
+    """doctor.py は、git や claude を探して起動する前に、Windows のエラー画面を出さない設定にする。"""
+    order = []
+    real = without("claude")
+
+    def noted_find(name: str, avoid: tuple = ()) -> str | None:
+        order.append(name)
+        return real(name, avoid)
+
+    with mock.patch.object(DOCTOR.cycle, "quiet_error_dialogs", lambda: order.append("quiet")):
+        code, _ = in_process(root, "--no-check", find=noted_find)
+    assert code == 0
+    assert order[0] == "quiet" and "git" in order
+
+
 def test_missing_claude_is_reported_but_is_not_a_problem(root, capsys):
     code, result = in_process(root, "--no-check", find=without("claude"))
     assert code == 0

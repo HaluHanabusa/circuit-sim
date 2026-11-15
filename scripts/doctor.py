@@ -433,6 +433,7 @@ def report(result: dict) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cycle.quiet_error_dialogs()     # Windows で、OSのエラー画面で止まらないように（起動するものに引き継ぐ）
     parser = argparse.ArgumentParser(prog="doctor.py", description="開発環境の確認")
     parser.add_argument("--no-check", action="store_true", help="scripts/check.py を実行しない")
     parser.add_argument(

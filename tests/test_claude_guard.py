@@ -5,6 +5,7 @@ PATH にあった本物を表す。どの試験も、身代わりが起動され
 レビューで見つかった3つの経路（偽が起動に失敗したシェル、実行できない一時フォルダ、Windows の拡張子）は、
 遮断の無い PATH で身代わりに届くこと（穴の再現）と、遮断した PATH では届かないことを、組で確かめる。
 """
+import ctypes
 import os
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from unittest import mock
 
 import conftest as guard
 import pytest
+from test_error_dialogs import FakeKernel32
 from test_harness import CYCLE_MODULE, cycle, headless, implement, install_claude, make_repo, state, was_run
 
 WINDOWS = os.name == "nt"
@@ -43,7 +45,7 @@ def test_this_session_runs_with_claude_taken_off_the_path():
     assert entries[-1] == sentinel
     assert os.environ[guard.SAFE_PATH_VAR] == os.pathsep.join(entries[:-1])
     names = guard.claude_names(os.environ.get("PATHEXT"))
-    assert not [entry for entry in entries[:-1] if guard.holds_claude(entry, names)]
+    assert not [entry for entry in entries[:-1] if guard.removal_reason(entry, names)]
     assert Path(shutil.which("claude")).parent == Path(sentinel)
 
 
@@ -89,6 +91,62 @@ def test_a_tool_found_only_next_to_claude_stops_the_session_on_windows(tmp_path)
     (both / "git.exe").write_bytes(b"")
     with pytest.raises(guard.GuardError, match="git が、claude と同じ場所"):
         guard.guard_path(str(both), None, tmp_path / "guard")
+
+
+def test_session_start_report_names_the_places_taken_off_and_the_tools_kept(tmp_path):
+    """セッションの始めに、PATH から外した場所と理由、リンクで残した道具を表示する（原因を追えるように）。
+    利用者のホームの下は ~ から書く。"""
+    has = tmp_path / "has"
+    has.mkdir()
+    (has / "claude.cmd").write_text("", encoding="utf-8")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    tools = tmp_path / "guard" / "tools"
+    tools.mkdir(parents=True)
+    kept = []
+    if not WINDOWS:                         # リンクを作れるOSでだけ、道具を残す（Windows では試験を始めない）
+        os.symlink(shutil.which("git"), tools / "git")
+        kept = [f"  リンクで残した道具: git → {shutil.which('git')}"]
+    path = os.pathsep.join([str(has), "", "rel", str(tmp_path / "missing"), str(plain)])
+    with mock.patch.object(Path, "home", return_value=tmp_path / "elsewhere"):
+        lines = guard.guard_report(path, None, tools)
+    assert lines == [
+        "試験の遮断（本物の claude を起動しないため。tests/conftest.py）:",
+        f"  PATH から外した場所: {has}（claude.cmd がある）",
+        "  PATH から外した場所: （空の項目）",
+        "  PATH から外した場所: rel（相対パスの項目）",
+        f"  PATH から外した場所: {tmp_path / 'missing'}（中を確かめられない場所）",
+        *kept,
+    ]
+    with mock.patch.object(Path, "home", return_value=tmp_path):
+        assert guard.guard_report(str(has), None, tmp_path / "none")[1:] == [
+            f"  PATH から外した場所: {Path('~', 'has')}（claude.cmd がある）",
+        ]
+        assert guard.guard_report(str(plain), None, tmp_path / "none")[1:] == ["  PATH から外した場所: なし"]
+
+
+@pytest.mark.parametrize("windows", [True, False], ids=["Windows", "ほかのOS"])
+def test_tests_turn_the_os_error_dialogs_off_on_windows(windows):
+    """試験のプロセスは、Windows では、OSのエラー画面を出さない印を、もとの印に足す（ハーネスと同じ印）。"""
+    kernel32 = FakeKernel32(mode=0x0004)
+    with (
+        mock.patch.object(ctypes, "WinDLL", kernel32, create=True),
+        mock.patch.object(guard, "WINDOWS", windows),
+    ):
+        guard.quiet_error_dialogs()
+    if windows:
+        assert kernel32.loaded == ["kernel32"]
+        assert kernel32.set_calls == [0x0004 | CYCLE_MODULE.QUIET_ERROR_MODE]
+        assert guard.QUIET_ERROR_MODE == CYCLE_MODULE.QUIET_ERROR_MODE == 0x8003
+    else:
+        assert kernel32.loaded == [] and kernel32.set_calls == []
+
+
+def test_every_test_process_turns_the_os_error_dialogs_off():
+    """設定は、試験の設定の読み込み（pytest_configure。並列実行の子でも呼ばれる）で行う。"""
+    with mock.patch.object(guard, "quiet_error_dialogs") as quiet:
+        guard.pytest_configure(None)
+    quiet.assert_called_once_with()
 
 
 INNER_TESTS = """\
@@ -137,6 +195,10 @@ def test_session_fails_when_the_sentinel_is_started_even_if_every_test_passes(tm
     proc = run_session(tmp_path)
     assert "2 passed" in proc.stdout, proc.stdout + proc.stderr
     assert proc.returncode == guard.SENTINEL_EXIT_CODE, proc.stdout + proc.stderr
+    # 始めに、身代わりのある場所を外したことを表示している
+    real = guard.shown_place(str(tmp_path / "real"))
+    shown = [line for line in proc.stderr.splitlines() if line.startswith(f"  PATH から外した場所: {real}（")]
+    assert shown, proc.stderr
     assert "見張り役の claude が 1 回起動された" in proc.stderr
     assert "起動した試験: test_inner.py::test_calls_claude" in proc.stderr
 

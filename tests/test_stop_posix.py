@@ -12,8 +12,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from test_harness import (
@@ -133,3 +135,80 @@ def test_timeout_does_not_wait_for_a_child_that_moved_to_another_session(tmp_pat
     finally:
         release.touch()                                 # 残った子を終わらせる
     assert waited < 15
+
+
+# 止められるまでいる claude の代わり。始まったら印（.pid）を置き、最後まで進んだら .finished を置く
+STAYS_UNTIL_STOPPED = """\
+import os, pathlib, sys, time
+pathlib.Path(sys.argv[1] + ".pid").write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(float(sys.argv[2]))
+pathlib.Path(sys.argv[1] + ".finished").touch()
+"""
+STAYS_SECONDS = 6.0
+
+
+@pytest.mark.parametrize(
+    ("name", "second"),
+    [("SIGHUP", "SIGHUP"), ("SIGTERM", "SIGTERM"), ("SIGHUP", "SIGTERM"), ("SIGTERM", "SIGHUP")],
+)
+def test_second_stop_signal_while_stopping_the_cli_does_not_leave_it_running(tmp_path, name, second):
+    """端末を閉じると、前面のジョブに SIGHUP が続けて2回届く（W2 の3回目のレビュー）。1回目の合図で、起動した
+    claude を止めている途中に2回目が届いても、claude を止め終えてから終わる（claude の終わりを待たない）。
+
+    2回目の合図は、止める処理（kill_tree）の始めに起こす（届く時刻の幅は、実物では 100〜500 マイクロ秒）。
+    1回目と違う種類の合図（SIGHUP の後の SIGTERM など）も無視する。合図の扱いは、終わった後に元に戻る。
+    """
+    sig, again = getattr(signal, name), getattr(signal, second)
+    marker = tmp_path / "cli"
+    command = [sys.executable, "-c", STAYS_UNTIL_STOPPED, str(marker), str(STAYS_SECONDS)]
+    kill_tree = CYCLE_MODULE.kill_tree
+
+    def hit_again_while_stopping(proc):
+        signal.raise_signal(again)
+        kill_tree(proc)
+
+    def first_signal():
+        wait_for(Path(f"{marker}.pid"))
+        signal.pthread_kill(threading.main_thread().ident, sig)      # 待っている、こちらのスレッドに届ける
+
+    before = {stop: signal.getsignal(stop) for stop in (sig, again)}
+    sender = threading.Thread(target=first_signal)
+    began = time.monotonic()
+    sender.start()
+    with (
+        mock.patch.object(CYCLE_MODULE, "kill_tree", hit_again_while_stopping),
+        pytest.raises(SystemExit) as stopped_by,
+    ):
+        CYCLE_MODULE.run_captured(command, tmp_path, None)
+    sender.join()
+    assert stopped_by.value.code == 128 + sig
+    assert time.monotonic() - began < STAYS_SECONDS, "claude が終わるまで待っていた（止められていない）"
+    assert not Path(f"{marker}.finished").exists()
+    assert {stop: signal.getsignal(stop) for stop in (sig, again)} == before
+
+
+def test_stop_signal_stays_ignored_until_the_outermost_clean_up_is_done():
+    """終了の合図を例外に変える枠が入れ子でも、合図を受けた後は、外側の枠の後始末が終わるまで、続く合図を無視する。"""
+    sig = signal.SIGHUP
+    before = signal.getsignal(sig)
+    done = []
+    with pytest.raises(SystemExit) as stopped_by, CYCLE_MODULE.termination_as_exception():
+        try:
+            with CYCLE_MODULE.termination_as_exception():
+                signal.raise_signal(sig)            # 1回目: 内側の枠で例外になる
+        finally:
+            signal.raise_signal(sig)                # 2回目: 外側の後始末の途中（無視される）
+            done.append("外側の後始末")
+    assert stopped_by.value.code == 128 + sig
+    assert done == ["外側の後始末"]
+    assert signal.getsignal(sig) == before
+
+
+def test_inner_frame_left_without_a_stop_signal_gives_the_outer_frame_its_handling_back():
+    """合図を受けずに内側の枠を出たら、外側の枠の扱い（合図を例外に変える）に戻る。"""
+    sig = signal.SIGTERM
+    with pytest.raises(SystemExit) as stopped_by, CYCLE_MODULE.termination_as_exception():
+        with CYCLE_MODULE.termination_as_exception():
+            pass
+        signal.raise_signal(sig)
+    assert stopped_by.value.code == 128 + sig

@@ -17,6 +17,11 @@
      （終了コード SENTINEL_EXIT_CODE。どの試験の間に起動されたかを表示する）。
    - 取り除いた場所にしか git が無い場合（Homebrew の bin など）は、git へのリンクを別の場所に置いて残す。
      リンクを作れない Windows では、試験を始めずに止める。
+   - セッションの始めに、取り除いた場所（理由つき）と、リンクで残した道具を表示する（原因を追えるように）。
+
+3. Windows で、OSのエラー画面（「サポートされていない 16 ビット アプリケーション」など。人が OK を押すまで
+   止まる）を出させない。試験のプロセスに設定し、起動する子プロセスに引き継がれる。scripts/cycle.py の
+   quiet_error_dialogs と同じ設定（この conftest は別の場所に写して使われるので、ここに持つ）。
 """
 from __future__ import annotations
 
@@ -45,8 +50,23 @@ CLAUDE_SUFFIXES = ("", ".exe", ".cmd", ".bat", ".com", ".ps1")
 KEPT_TOOLS = ("git",)
 
 
+# Windows の SetErrorMode の印（scripts/cycle.py の QUIET_ERROR_MODE と同じ）。起動できない実行ファイルや
+# 見つからない DLL の画面、異常終了の画面、ファイルを開けない画面を出さない
+QUIET_ERROR_MODE = 0x0001 | 0x0002 | 0x8000
+
+
 class GuardError(Exception):
     """遮断を組めない（取り除いた場所にしか無い道具を、残せない）。"""
+
+
+def quiet_error_dialogs() -> None:
+    """Windows で、OSのエラー画面を出させずに、エラーとして返させる。起動する子プロセスにも引き継がれる。"""
+    if not WINDOWS:
+        return
+    import ctypes  # Windows でだけ読む（ctypes の無い Python の作りでも、ほかのOSで動くように）
+
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.SetErrorMode(kernel32.GetErrorMode() | QUIET_ERROR_MODE)
 
 
 def claude_names(pathext: str | None) -> frozenset[str]:
@@ -55,20 +75,50 @@ def claude_names(pathext: str | None) -> frozenset[str]:
     return frozenset("claude" + suffix for suffix in suffixes)
 
 
-def holds_claude(entry: str, names: frozenset[str]) -> bool:
-    """その場所に、claude として起動されうるファイルがあるか。中を確かめられなければ、あるものとして扱う。"""
+def claude_files(entry: str, names: frozenset[str]) -> list[str] | None:
+    """その場所にある、claude として起動されうるファイルの名前。中を確かめられなければ None。"""
     try:
         found = os.listdir(entry)
     except OSError:
-        return True
-    return any(name.lower() in names for name in found)
+        return None
+    return sorted(name for name in found if name.lower() in names)
+
+
+def removal_reason(entry: str, names: frozenset[str]) -> str | None:
+    """PATH の項目を取り除く理由。残してよければ None。中を確かめられない場所は、claude があるものとする。"""
+    if not os.path.isabs(entry):
+        return "相対パスの項目" if entry else "空の項目"
+    found = claude_files(entry, names)
+    if found is None:
+        return "中を確かめられない場所"
+    return f"{'、'.join(found)} がある" if found else None
 
 
 def without_claude(path: str, pathext: str | None) -> list[str]:
     """PATH の項目のうち、残してよいもの（絶対パスで、claude として起動されうるファイルが無い場所）。"""
     names = claude_names(pathext)
-    entries = path.split(os.pathsep)
-    return [entry for entry in entries if os.path.isabs(entry) and not holds_claude(entry, names)]
+    return [entry for entry in path.split(os.pathsep) if removal_reason(entry, names) is None]
+
+
+def shown_place(path: str) -> str:
+    """表示する場所。利用者のホームの下は ~ から書く（確認の記録に残っても、利用者名が出ないように）。"""
+    try:
+        return str(Path("~") / Path(path).relative_to(Path.home()))
+    except (ValueError, RuntimeError):      # ホームの下ではない、ホームを決められない
+        return path
+
+
+def guard_report(path: str, pathext: str | None, tools: Path) -> list[str]:
+    """遮断で取り除いた PATH の項目（理由つき）と、リンクで残した道具（tools の中）を、表示の行にする。"""
+    names = claude_names(pathext)
+    removed = [(entry, removal_reason(entry, names)) for entry in path.split(os.pathsep)]
+    lines = [f"  PATH から外した場所: {shown_place(entry)}（{why}）" for entry, why in removed if why]
+    links = sorted(tools.iterdir()) if tools.is_dir() else []
+    lines += [f"  リンクで残した道具: {link.name} → {shown_place(os.readlink(link))}" for link in links]
+    return [
+        "試験の遮断（本物の claude を起動しないため。tests/conftest.py）:",
+        *(lines or ["  PATH から外した場所: なし"]),
+    ]
 
 
 def keep_lost_tools(before: list[str], kept: list[str], place: Path) -> list[str]:
@@ -150,6 +200,11 @@ def sentinel_calls(log: Path) -> list[str]:
 GUARD: dict = {}
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    # 並列実行の子でも設定する（OSのエラー画面は、画面を出させたプロセスを止める）
+    quiet_error_dialogs()
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     config = session.config
     if hasattr(config, "workerinput"):      # 並列実行の子（pytest-xdist）は、同じ1回の実行の一部
@@ -160,11 +215,14 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             returncode=NESTED_EXIT_CODE,
         )
     place = Path(tempfile.mkdtemp(prefix="circuit-sim-guard-"))
+    path, pathext = os.environ.get("PATH", ""), os.environ.get("PATHEXT")
     try:
-        safe, guarded = guard_path(os.environ.get("PATH", ""), os.environ.get("PATHEXT"), place)
+        safe, guarded = guard_path(path, pathext, place)
     except GuardError as exc:
         shutil.rmtree(place, ignore_errors=True)
         pytest.exit(str(exc), returncode=SENTINEL_EXIT_CODE)
+    # 標準エラーは、出せない文字を置き換えて書くので、UTF-8 でない端末でも落ちない（Python の決まり）
+    print("\n".join(guard_report(path, pathext, place / "tools")), file=sys.stderr, flush=True)
     GUARD.update(place=place, log=place / "sentinel" / SENTINEL_LOG, tests=[])
     os.environ["PATH"] = guarded            # ここから起動するプロセスに引き継がれる
     os.environ[SAFE_PATH_VAR] = safe

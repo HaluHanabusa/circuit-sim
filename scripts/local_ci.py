@@ -369,6 +369,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cycle.quiet_error_dialogs()     # Windows で、OSのエラー画面で止まらないように（確認にも引き継ぐ）
     parser = argparse.ArgumentParser(
         prog="local_ci.py", description="手元の確認（確認を走らせて、結果を記録する）",
     )

@@ -4,6 +4,7 @@
 試験用の確認スクリプトを置く。本物の ruff と pytest を通す試験は、一時リポジトリの小さな試験だけを対象にする。
 どの試験も、決まりを1つ外すと落ちるように書く。
 """
+import codecs
 import contextlib
 import importlib.util
 import io
@@ -85,10 +86,14 @@ note = {
     "pythonpath": os.environ.get("PYTHONPATH", "").split(os.pathsep),
 }
 if plan.get("import_product"):
-    where = "import product; print(product.__file__)"
+    # 場所は JSON の ASCII で受け渡す。起動した Python の出力の文字コード（PYTHONIOENCODING）と、ここで読む
+    # 既定の文字コード（日本語 Windows では cp932）が違っても、日本語の場所が化けない
+    where = "import json, product; print(json.dumps(product.__file__))"
     elsewhere = os.path.dirname(os.environ["NOTES"])
-    found = subprocess.run([sys.executable, "-B", "-c", where], cwd=elsewhere, capture_output=True, text=True)
-    note["product"] = found.stdout.strip()
+    found = subprocess.run(
+        [sys.executable, "-B", "-c", where], cwd=elsewhere, capture_output=True, encoding="ascii",
+    )
+    note["product"] = json.loads(found.stdout)
 notes = pathlib.Path(os.environ["NOTES"])
 runs = json.loads(notes.read_text(encoding="utf-8")) if notes.exists() else []
 notes.write_text(json.dumps(runs + [note]), encoding="utf-8")
@@ -324,20 +329,42 @@ def test_callers_pytest_settings_do_not_choose_the_tests(tmp_path, case):
     assert len(results(root)) == 1
 
 
-def test_python_started_elsewhere_reads_the_checked_content_first(repo):
+@pytest.mark.parametrize("output_encoding", ["utf-8", "cp932"])
+def test_python_started_elsewhere_reads_the_checked_content_first(repo, output_encoding):
     """pip install -e . の環境では、作業フォルダが、どこから起動した Python にも読み込まれる。
 
     試験が別の場所から起動した Python も、確かめる場所の版を先に読む（Python が読み込む場所の先頭に置く）。
     ここでは、作業フォルダを PYTHONPATH に入れて、入れた状態の代わりにする。
+    作業用の場所には、日本語と空白が入る（work_dir）。起動した Python の出力の文字コードが、試験用の確認
+    スクリプトの既定の文字コードと違っても、場所が化けずに届くこと（POのPC: 出力は UTF-8、既定は cp932。
+    Linux では、出力を cp932 にして、同じ食い違いを逆向きに作る）。
     """
     set_plan(repo, junit=PASSING, import_product=True)
     (repo / "product.py").write_text("x = 99\n", encoding="utf-8")       # 作業フォルダの、未コミットの変更
-    result = local_ci(repo, "--no-fetch", "--ref", "main", env={"PYTHONPATH": str(repo)})
+    env = {"PYTHONPATH": str(repo), "PYTHONIOENCODING": output_encoding}
+    result = local_ci(repo, "--no-fetch", "--ref", "main", env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     [note] = notes(repo)
     place = Path(note["cwd"])
     assert Path(note["product"]).resolve() == (place / "product.py").resolve()
     assert [Path(entry) for entry in note["pythonpath"]] == [place, repo]   # 呼び出し元の値は、後に続く
+
+
+def test_local_ci_turns_the_error_dialogs_off_first(repo):
+    """local_ci.py は、git や確認を起動する前に、Windows のエラー画面を出さない設定にする。"""
+    order = []
+    run_git = HARNESS.run_git
+
+    def noted_git(*args, **kwargs):
+        order.append("git")
+        return run_git(*args, **kwargs)
+
+    with (
+        mock.patch.object(HARNESS, "quiet_error_dialogs", lambda: order.append("quiet")),
+        mock.patch.object(HARNESS, "run_git", noted_git),
+    ):
+        assert local_ci(repo, "--no-fetch", "--ref", "main").returncode == 0
+    assert order[0] == "quiet" and "git" in order
 
 
 def test_report_file_option_survives_the_way_pytest_splits_it_on_windows():
@@ -774,15 +801,48 @@ def altered(**changes: object):
     return change
 
 
+def other_encoding(name: str | None) -> str:
+    """name とは別の文字コード（どのPCで実行しても、記録された値と必ず違う）。
+
+    決め打ちにすると、その値のPC（POのPCの既定の cp932 など）では違いにならず、使い回される。
+    """
+    def same(candidate: str) -> bool:
+        try:
+            return codecs.lookup(candidate).name == codecs.lookup(name or "").name
+        except LookupError:
+            return candidate == name
+    return next(candidate for candidate in ("cp932", "utf-8", "iso8859-15") if not same(candidate))
+
+
+def altered_encoding(field: str):
+    """文字コードの項目（field）を、記録された値と違うものにする書き換え。"""
+    def change(written: dict) -> str:
+        recorded = written["encoding"][field]
+        value = not recorded if field == "utf8_mode" else other_encoding(recorded)
+        assert value != recorded                    # 試験の前提: 違いになっている
+        written["encoding"] = {**written["encoding"], field: value}
+        return json.dumps(written)
+    return change
+
+
+def test_other_encoding_always_differs():
+    names = ("cp932", "CP932", "ms932", "shift_jis", "utf-8", "UTF-8", "utf8", "ascii", None, "x-unknown")
+    for name in names:
+        assert other_encoding(name) != name
+        if name not in (None, "x-unknown"):
+            assert codecs.lookup(other_encoding(name)).name != codecs.lookup(name).name
+
+
 NOT_THE_SAME_CHECK = {
     "別のOSの結果": altered(os={"system": "SomeOtherOS"}),
     "別の Python の結果": altered(python={"version": "3.0.0"}),
     "別のツリーの結果": altered(tree="1" * 40),
     "別のコミットの結果": altered(commit="1" * 40),
     "取り出さずに実行した結果": altered(mode="current"),
-    "既定の文字コードが違う結果": altered(encoding={"locale": "cp932"}),
-    "UTF-8 モード（PYTHONUTF8）が違う結果": altered(encoding={"utf8_mode": not sys.flags.utf8_mode}),
-    "画面の文字コードが違う結果": altered(encoding={"stdout": "cp932"}),
+    "既定の文字コードが違う結果": altered_encoding("locale"),
+    "UTF-8 モード（PYTHONUTF8）が違う結果": altered_encoding("utf8_mode"),
+    "画面の文字コードが違う結果": altered_encoding("stdout"),
+    "ファイル名の文字コードが違う結果": altered_encoding("filesystem"),
     "文字コードの記録が空の結果": lambda written: json.dumps({**written, "encoding": None}),
     "文字コードの項目が無い結果": lambda written: json.dumps(
         {key: value for key, value in written.items() if key != "encoding"},

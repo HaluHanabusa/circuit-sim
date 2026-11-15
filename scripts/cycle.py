@@ -209,6 +209,30 @@ DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 BUSY_WAIT_SECONDS = 5.0 if WINDOWS else 0.0
 POLL_SECONDS = 0.05
 
+# Windows の、OSのエラー画面（人が OK を押すまで、起動した側を止める）を出さない設定（SetErrorMode の印）。
+# SEM_FAILCRITICALERRORS: 起動できない実行ファイル（壊れた claude.exe で出る「サポートされていない 16 ビット
+# アプリケーション」など）や、見つからない DLL の画面。SEM_NOGPFAULTERRORBOX: 異常終了の画面。
+# SEM_NOOPENFILEERRORBOX: ファイルを開けない画面。
+SEM_FAILCRITICALERRORS = 0x0001
+SEM_NOGPFAULTERRORBOX = 0x0002
+SEM_NOOPENFILEERRORBOX = 0x8000
+QUIET_ERROR_MODE = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+
+
+def quiet_error_dialogs() -> None:
+    """Windows で、OSのエラー画面を出させずに、エラーとして返させる（人が見ていない実行が止まらないように）。
+
+    このプロセスに設定する。起動する子プロセス（git、claude、確認の python と pytest）にも引き継がれる
+    （Popen に CREATE_DEFAULT_ERROR_MODE を付けると引き継がれないので、どこにも付けない）。もとの印は残す。
+    scripts/cycle.py、scripts/local_ci.py、scripts/doctor.py の main が、最初に呼ぶ。
+    """
+    if not WINDOWS:
+        return
+    import ctypes  # Windows でだけ読む（ctypes の無い Python の作りでも、ほかのOSで動くように）
+
+    kernel32 = ctypes.WinDLL("kernel32")        # 印は 16 ビットに収まるので、ctypes の既定の型（int）で渡せる
+    kernel32.SetErrorMode(kernel32.GetErrorMode() | QUIET_ERROR_MODE)
+
 
 def lock_handle(handle: IO[str]) -> None:
     """開いたファイルにロックを掛ける。他の実行が持っていれば、外れるまで待つ。"""
@@ -612,19 +636,34 @@ def pending_file(root: Path) -> Path:
 
 @contextlib.contextmanager
 def termination_as_exception() -> Iterator[None]:
-    """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。"""
+    """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。
+
+    合図を受けたら、例外を送出する前に、終了の合図をすべて無視に切り替え、この枠を出るときに元に戻す。
+    端末を閉じると、前面のジョブに SIGHUP が続けて2回届く。2回目で後始末（起動した claude を止める、
+    取り込みを取り消す）が途中で切られると、claude が動き続け、こちらはその終わりを待ち続ける
+    （W2 の3回目のレビュー）。枠が入れ子なら、外側の枠を出るまで無視を続ける（外側の後始末も切らせない）。
+    """
+    signals = stop_signals()
+    stopping = False
+
     def stop(signum: int, frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
+    stop.raises_on_stop = True      # 入れ子の内側が、外側の枠の扱いだと見分ける印
     try:
-        saved = {sig: signal.signal(sig, stop) for sig in stop_signals()}
+        saved = {sig: signal.signal(sig, stop) for sig in signals}
     except ValueError:          # メインのスレッド以外からは設定できない
         saved = {}
     try:
         yield
     finally:
         for sig, handler in saved.items():
-            signal.signal(sig, handler)
+            outer_stop = getattr(handler, "raises_on_stop", False)
+            signal.signal(sig, signal.SIG_IGN if stopping and outer_stop else handler)
 
 
 def tree_id(worktree: Path) -> str:
@@ -1323,6 +1362,7 @@ def merge_unit(root: Path, uid: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    quiet_error_dialogs()
     parser = argparse.ArgumentParser(prog="cycle.py", description="開発サイクルのゲートを運ぶ")
     sub = parser.add_subparsers(dest="command", required=True)
 
