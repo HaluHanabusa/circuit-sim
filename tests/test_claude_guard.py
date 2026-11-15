@@ -16,7 +16,17 @@ from unittest import mock
 import conftest as guard
 import pytest
 from test_error_dialogs import FakeKernel32
-from test_harness import CYCLE_MODULE, cycle, headless, implement, install_claude, make_repo, state, was_run
+from test_harness import (
+    CYCLE_MODULE,
+    cycle,
+    define_role,
+    headless,
+    implement,
+    install_claude,
+    make_repo,
+    state,
+    was_run,
+)
 
 WINDOWS = os.name == "nt"
 only_posix = pytest.mark.skipif(WINDOWS, reason="Linux / macOS の仕組み（実行の印、/bin/sh、リンク）を試す")
@@ -262,7 +272,7 @@ def test_run_with_a_fake_that_cannot_be_executed_does_not_reach_the_real_one(tmp
     """(b) 一時フォルダが実行不可（noexec）だと、find_command は偽を飛ばして先を探す（実行の印を外して模擬）。
     遮断が無いと本物（身代わり）が動いて合格が記録され、遮断した PATH では見張り役が動いて error になる。"""
     repo = make_repo(tmp_path)
-    implement(repo)
+    define_role(implement(repo))
     fake = tmp_path / "fake"
     install_claude(fake, headless(session="fake"))
     (fake / "claude").chmod(0o644)

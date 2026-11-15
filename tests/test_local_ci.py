@@ -439,7 +439,9 @@ def test_fetch_cannot_wait_for_input_or_run_forever(repo):
     assert result.returncode == 2
     assert "最新を取得できなかった（時間内に終わらなかった）" in result.stderr
     [(cmd, cwd, timeout, env)] = calls
-    assert cmd[:2] == ["git", "-C"] and cmd[3:] == ["fetch", "--quiet", "origin"]
+    # git は、名前ではなく、探した場所（絶対パス）で起動する（実行した場所の git を使わない）
+    assert Path(cmd[0]).name in ("git", "git.exe") and Path(cmd[0]).is_absolute()
+    assert cmd[1] == "-C" and cmd[3:] == ["fetch", "--quiet", "origin"]
     assert Path(cmd[2]).resolve() == repo.resolve() == Path(cwd).resolve()
     assert timeout == 300
     assert env["GIT_TERMINAL_PROMPT"] == "0" and "GIT_DIR" not in env and env["CYCLE_ROOT"] == str(repo)

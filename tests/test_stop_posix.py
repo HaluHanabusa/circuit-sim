@@ -212,3 +212,37 @@ def test_inner_frame_left_without_a_stop_signal_gives_the_outer_frame_its_handli
             pass
         signal.raise_signal(sig)
     assert stopped_by.value.code == 128 + sig
+
+
+def test_signal_ignored_before_the_frame_stays_ignored_inside_it():
+    """無視に設定されていた合図（nohup の SIGHUP）は、枠に入っても差し替えない。届いても、そのまま続ける。"""
+    sig = signal.SIGHUP
+    before = signal.signal(sig, signal.SIG_IGN)
+    try:
+        with CYCLE_MODULE.termination_as_exception():
+            assert signal.getsignal(sig) is signal.SIG_IGN
+            signal.raise_signal(sig)                # 例外にならない
+            assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL      # ほかの合図は、例外に変える
+        assert signal.getsignal(sig) is signal.SIG_IGN
+    finally:
+        signal.signal(sig, before)
+
+
+def test_headless_run_started_with_nohup_keeps_running_when_the_terminal_closes(tmp_path):
+    """nohup で起動した run は、端末を閉じても（SIGHUP）、claude の終わりを待って記録する。"""
+    repo = make_repo(tmp_path)
+    implement(repo)
+    env, started, go = blocking_claude(tmp_path, "rev-s")
+    proc = subprocess.Popen(
+        [sys.executable, str(CYCLE), "run", "U1", "review"], stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=cycle_env(repo, env), process_group=0,
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),       # nohup と同じ
+    )
+    wait_for(started)
+    os.killpg(proc.pid, signal.SIGHUP)
+    time.sleep(0.5)
+    assert proc.poll() is None, "SIGHUP で終わった"
+    go.touch()
+    proc.communicate(timeout=30)
+    assert proc.returncode == 0
+    assert state(repo)["gates"]["review"]["verdict"] == "pass"

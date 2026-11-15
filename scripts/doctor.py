@@ -4,10 +4,13 @@
   python scripts/doctor.py               OS、Python、git、claude の有無と版、確かめた内容（コミットIDと
                                          ツリーID）、scripts/check.py の結果
   python scripts/doctor.py --no-check    scripts/check.py（数分かかる）を省く
-  python scripts/doctor.py --headless    加えて、本物の claude -p を最小の指示で1回だけ実行し、
-                                         ハーネス（scripts/cycle.py run）が前提にしている出力の形かを確かめる
+  python scripts/doctor.py --headless    加えて、本物の claude -p を最小の指示で、ゲートで使う役割ごとに
+                                         1回ずつ実行し、ハーネス（scripts/cycle.py run）が前提にしている
+                                         出力の形かを確かめる（--role で役割を絞れる。確認は省く。--check で流す）
 
 --headless はClaudeの利用枠を少し使うので、付けたときだけ実行する。実行の前に、何をするかを表示する。
+失敗したときは、原因の種類（サインインしていない、利用枠の上限、モデルを使えない、など）を、文面を記録せずに
+分類して出す。
 
 結果は画面と .cycle/doctor-result.json に出す。書き出すのは、形（項目の有無と型）、真偽、版の番号、
 確かめた内容の git のID（コミット、ツリー）とブランチ名だけ。
@@ -38,13 +41,14 @@ RESULT_FILE = ".cycle/doctor-result.json"
 MIN_PYTHON = (3, 11)
 VERSION_TIMEOUT = 60
 
-# ヘッドレスの確認で渡す、最小の指示
+# ヘッドレスの確認で渡す、最小の指示（独立検証の合格には基準が1つ以上要るので、基準を1つ返させる）
 PROBE_PROMPT = (
     "これは開発環境の確認です。ファイルを読んだり書いたりせず、道具も使わないでください。"
-    "verdict を pass、summary を ok、criteria と issues を空の一覧にした結果だけを返してください。"
+    "verdict を pass、summary を ok、criteria を name が probe、measured が ok、pass が true の項目1つだけの"
+    "一覧、issues を空の一覧にした結果だけを返してください。"
 )
-PROBE_ROLE = "code-reviewer"
-PROBE_TOOLS = "Read"
+# ゲートで使う役割（確認系のゲートの担当）。ほかの役割の定義（.claude/agents/ の中）は、実装の担当として確かめる
+AGENTS_DIR = ".claude/agents"
 
 # 設定されていると、ヘッドレス実行が利用枠ではなくAPIの料金になる環境変数（中身は見ない。有無だけ）
 BILLING_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
@@ -56,15 +60,35 @@ WORD = re.compile(r"[a-z][a-z_]{0,39}")
 # ハーネスが読む項目（cycle.headless_verdict と cmd_run）と、形を知っておきたい項目
 FIELDS = (
     "type", "subtype", "is_error", "session_id", "result", "structured_output",
-    "total_cost_usd", "num_turns", "duration_ms",
+    "total_cost_usd", "num_turns", "duration_ms", "stop_reason", "terminal_reason",
 )
 NUMBER_FIELDS = ("total_cost_usd", "num_turns", "duration_ms")
-WORD_FIELDS = ("type", "subtype")
+# 失敗の切り分けに使う、種類を表す語（値まで記録する）
+WORD_FIELDS = ("type", "subtype", "stop_reason", "terminal_reason")
+
+# 失敗の原因の種類。応答（result）とエラーの文面を、この順に照らして、最初に当たったものにする。
+# 文面そのものは記録しない（種類の名前だけ）。
+FAILURE_KINDS = (
+    ("usage_limit", r"usage limit|rate limit|limit reached|quota|too many requests|credit balance|out of credits"),
+    ("model_unavailable", (
+        r"model[^\n]{0,80}(not found|not available|unavailable|does not exist|not supported|no access|"
+        r"not allowed|invalid)|(invalid|unknown) model"
+    )),
+    ("not_logged_in", r"not logged in|log ?in|sign ?in|authenticat|unauthori[sz]ed|api key|credential|oauth"),
+    ("budget_exceeded", r"budget"),
+)
+FAILURE_TEXT = {
+    "usage_limit": "Claudeの利用枠の上限に達している（時間をおいてやり直す）",
+    "model_unavailable": "指定のモデルを使えない（プランか、モデルの指定を確かめる）",
+    "not_logged_in": "サインインしていない（claude を起動して /login する）",
+    "budget_exceeded": "1回の上限額（--budget）に達した",
+    "other": "原因の種類を分類できなかった",
+}
 
 # 結果に名前を残してよい項目。ここに無い名前は、個数だけを記録する
 # （項目の名前の位置に秘密のような文字列が入っていても、結果には残さない）
 KNOWN_KEYS = frozenset({
-    *FIELDS, "duration_api_ms", "usage", "modelUsage", "permission_denials", "uuid", "errors", "stop_reason",
+    *FIELDS, "duration_api_ms", "usage", "modelUsage", "permission_denials", "uuid", "errors",
 })
 KNOWN_RESULT_KEYS = frozenset(cycle.VERDICT_SCHEMA["properties"])
 
@@ -251,11 +275,23 @@ def describe_messages(text: str, options: list[str]) -> dict:
     }
 
 
-def describe_output(returncode: int, stdout: str, stderr: str, options: list[str]) -> dict:
-    """ヘッドレス実行の結果の形。unexpected は、ハーネスの前提と違っていた点（空なら前提どおり）。"""
+def failure_kind(text: str) -> str:
+    """失敗の文面（応答とエラーの出力）から、原因の種類の名前を決める（FAILURE_KINDS）。文面は残さない。"""
+    lowered = text.lower()
+    for name, pattern in FAILURE_KINDS:
+        if re.search(pattern, lowered):
+            return name
+    return "other"
+
+
+def describe_output(returncode: int, stdout: str, stderr: str, options: list[str], gate: str) -> dict:
+    """ヘッドレス実行の結果の形。unexpected は、ハーネスの前提と違っていた点（空なら前提どおり）。
+
+    failure は、ハーネスの判定が合格でないときの、原因の種類（FAILURE_KINDS。合格なら None）。
+    """
     form, data = result_object(stdout)
     fields = describe_fields(data) if data is not None else {}
-    verdict = cycle.headless_verdict(returncode, stdout)[0]
+    verdict = cycle.headless_verdict(returncode, stdout, gate)[0]
     structured = fields.get("structured_output", {})
     expected = {
         "returncode": returncode == 0,
@@ -269,6 +305,8 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
     # 出力が JSON でないときは、そこにエラーの文面が出ていることがある
     messages = stderr if data is not None else "\n".join(part for part in (stdout, stderr) if part)
     keys, other_keys = key_names(data, KNOWN_KEYS)
+    answer = data.get("result") if data is not None and isinstance(data.get("result"), str) else ""
+    failure = None if verdict == "pass" else failure_kind(answer + "\n" + messages)
     return {
         "returncode": returncode,
         "stdout": {"form": form, "characters": len(stdout)},
@@ -278,14 +316,45 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
         "fields": fields,
         "result_as_json": result_as_json(data) if data is not None else None,
         "harness_verdict": verdict,
+        "failure": failure,
         "unexpected": [name for name, ok in expected.items() if not ok],
     }
 
 
-def headless_info(root: Path, budget: float, timeout: int, allow_api_billing: bool) -> dict:
-    """本物の claude -p を、ハーネスと同じ組み立てで1回だけ実行して、出力の形を調べる。"""
-    cmd = cycle.claude_command(PROBE_PROMPT, PROBE_ROLE, budget, PROBE_TOOLS)
-    options = cmd[1::2]
+def gate_roles(root: Path) -> list[tuple[str, str]]:
+    """ゲートで使う役割と、そのゲート: 確認系のゲートの担当と、.claude/agents/ にあるほかの役割（実装の担当）。"""
+    checkers = [(role, gate) for gate, role in cycle.GATE_AGENT.items()]
+    agents = root / AGENTS_DIR
+    others = sorted(path.stem for path in agents.glob("*.md")) if agents.is_dir() else []
+    return checkers + [(name, "implement") for name in others if name not in cycle.GATE_AGENT.values()]
+
+
+def restricts_tools(root: Path, role: str) -> bool:
+    """役割の定義の見出しに、使える道具の一覧（tools:）があるか。あると、構造化された結果が返らない（D-030）。"""
+    path = root / AGENTS_DIR / f"{role}.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    if not lines or lines[0].strip() != "---":
+        return False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if line.partition(":")[0].strip() == "tools":
+            return True
+    return False
+
+
+def headless_info(
+    root: Path, budget: float, timeout: int, allow_api_billing: bool, only: list[str] | None = None,
+) -> dict:
+    """本物の claude -p を、ハーネスと同じ組み立てで、ゲートで使う役割ごとに1回ずつ実行して、出力の形を調べる。"""
+    roles = [(role, gate) for role, gate in gate_roles(root) if not only or role in only]
+    unknown = sorted(set(only or ()) - {role for role, _ in roles})
+    if unknown:
+        print(f"ヘッドレスの確認は実行しませんでした。知らない役割: {'、'.join(unknown)}")
+        return {"ran": False, "reason": "unknown_role"}
     billing = [name for name in BILLING_VARS if os.environ.get(name)]
     if billing and not allow_api_billing:
         print(
@@ -295,20 +364,42 @@ def headless_info(root: Path, budget: float, timeout: int, allow_api_billing: bo
         )
         return {"ran": False, "reason": "api_key_set"}
     try:
-        launch = cycle.launchable(cmd, (root,))
+        cycle.launchable(cycle.claude_command(PROBE_PROMPT, roles[0][0], budget, roles[0][1]), (root,))
     except cycle.CommandNotFound:
         return {"ran": False, "reason": "claude_not_found"}
     except cycle.CycleError:
         return {"ran": False, "reason": "cannot_pass_arguments"}
 
     print("ヘッドレスの確認（--headless）。これから次のことをします。")
-    print(f"  - claude -p を1回だけ実行します（役割 {PROBE_ROLE}、使える道具は {PROBE_TOOLS} だけ、"
-          f"上限 {budget} 米ドル、最長 {timeout} 秒）")
+    print(f"  - claude -p を、役割ごとに1回ずつ、{len(roles)} 回実行します（役割 "
+          f"{'、'.join(role for role, _ in roles)}。上限は1回 {budget} 米ドル、最長 {timeout} 秒）")
     print(f"  - 指示: {PROBE_PROMPT}")
     print("  - Claudeの利用枠を少し使います（プランでサインインしている場合。対話と同じ枠です）")
     print("  - 記録するのは、出力の形（項目の有無と型）と真偽だけです。応答の本文と認証情報は記録しません")
-    print(f"  - 実行するコマンド: {cycle.shell_line(root, cmd)}", flush=True)
+    probes = []
+    for role, gate in roles:
+        cmd = cycle.claude_command(PROBE_PROMPT, role, budget, gate)
+        restricted = restricts_tools(root, role)
+        if restricted:
+            print(f"  - 注意: 役割 {role} の定義に、使える道具の一覧（tools:）がある。構造化された結果が返らない"
+                  "ことがある（D-030）。使えない道具（disallowedTools:）で絞る")
+        print(f"  - 実行するコマンド（{role}）: {cycle.shell_line(root, cmd)}", flush=True)
+        probes.append({
+            "role": role, "gate": gate, "restricts_tools": restricted, **probe(root, cmd, timeout, gate),
+        })
+    return {
+        "ran": True, "roles": probes,
+        "unexpected": [f"{item['role']}: {name}" for item in probes for name in item["unexpected"]],
+    }
 
+
+def probe(root: Path, cmd: list[str], timeout: int, gate: str) -> dict:
+    """1つの役割で claude -p を1回実行して、出力の形を調べる。判定は、その役割を使うゲート（gate）のもの。"""
+    options = cmd[1::2]
+    try:
+        launch = cycle.launchable(cmd, (root,))
+    except cycle.CycleError:
+        return {"ran": False, "reason": "cannot_pass_arguments", "unexpected": ["cannot_pass_arguments"]}
     info: dict[str, object] = {"ran": True, "launcher": Path(launch[0]).name, "options": options}
     started = time.monotonic()
     try:
@@ -316,10 +407,10 @@ def headless_info(root: Path, budget: float, timeout: int, allow_api_billing: bo
     except subprocess.TimeoutExpired:
         return {**info, "timed_out": True, "unexpected": ["timed_out"]}
     except OSError:
-        return {"ran": False, "reason": "cannot_start", "launcher": info["launcher"]}
+        return {"ran": False, "reason": "cannot_start", "launcher": info["launcher"], "unexpected": ["cannot_start"]}
     info["timed_out"] = False
     info["seconds"] = round(time.monotonic() - started, 1)
-    return {**info, **describe_output(proc.returncode, proc.stdout, proc.stderr, options)}
+    return {**info, **describe_output(proc.returncode, proc.stdout, proc.stderr, options, gate)}
 
 
 # ------------------------------------------------------------------ まとめ
@@ -368,27 +459,45 @@ def check_line(check: dict) -> str:
     return reasons[check["reason"]]
 
 
+NOT_RUN = {
+    "not_requested": "実行していない（--headless で、役割ごとに claude -p を1回ずつ実行して出力の形を確かめる）",
+    "api_key_set": "実行していない（APIキーの環境変数が設定されている）",
+    "unknown_role": "実行していない（--role に、知らない役割がある）",
+    "claude_not_found": "実行できない（claude コマンドが見つからない）",
+    "cannot_pass_arguments": "実行できない（claude の起動用のファイルに、指示をそのまま渡せない）",
+    "cannot_start": "実行できない（claude を起動できない）",
+}
+
+
 def headless_lines(headless: dict) -> list[str]:
-    reasons = {
-        "not_requested": "実行していない（--headless で、claude -p を1回だけ実行して出力の形を確かめる）",
-        "api_key_set": "実行していない（APIキーの環境変数が設定されている）",
-        "claude_not_found": "実行できない（claude コマンドが見つからない）",
-        "cannot_pass_arguments": "実行できない（claude の起動用のファイルに、指示をそのまま渡せない）",
-        "cannot_start": "実行できない（claude を起動できない）",
-    }
     if not headless["ran"]:
-        return [reasons[headless["reason"]]]
+        return [NOT_RUN[headless["reason"]]]
+    lines = []
+    for item in headless["roles"]:
+        first, *rest = probe_lines(item)
+        lines += [f"{item['role']}: {first}", *(f"  {line}" for line in rest)]
+    return lines
+
+
+def probe_lines(headless: dict) -> list[str]:
+    """1つの役割の確認の結果の表示。"""
+    notes = ["役割の定義に tools: がある（D-030。disallowedTools: で絞る）"] if headless["restricts_tools"] else []
+    if not headless["ran"]:
+        return [NOT_RUN[headless["reason"]], *notes]
     if headless["timed_out"]:
-        return ["時間内に終わらなかった（--timeout で延ばせる）"]
+        return ["時間内に終わらなかった（--timeout で延ばせる）", *notes]
     if not headless["unexpected"]:
-        return ["ハーネスの前提どおりの形で返ってきた"]
+        return ["ハーネスの前提どおりの形で返ってきた", *notes]
     fields = headless["fields"]
     present = [name for name in FIELDS if fields.get(name, {}).get("present")]
+    words = [f"{name} {fields[name]['value']}" for name in WORD_FIELDS[1:] if "value" in fields.get(name, {})]
     lines = [
         f"ハーネスの前提と違う点がある: {'、'.join(headless['unexpected'])}",
+        f"原因の種類: {FAILURE_TEXT.get(headless['failure'], '—')}",
         f"終了コード {headless['returncode']}、出力の形 {headless['stdout']['form']}、"
-        f"ハーネスの判定 {headless['harness_verdict']}",
+        f"ハーネスの判定 {headless['harness_verdict']}{''.join(f'、{word}' for word in words)}",
         f"あった項目: {'、'.join(present) or 'なし'}",
+        *notes,
     ]
     as_json = headless["result_as_json"]
     if as_json is not None:
@@ -434,12 +543,18 @@ def report(result: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     cycle.quiet_error_dialogs()     # Windows で、OSのエラー画面で止まらないように（起動するものに引き継ぐ）
+    cycle.no_current_directory_search()
     parser = argparse.ArgumentParser(prog="doctor.py", description="開発環境の確認")
     parser.add_argument("--no-check", action="store_true", help="scripts/check.py を実行しない")
     parser.add_argument(
-        "--headless", action="store_true",
-        help="本物の claude -p を1回だけ実行して、出力の形を確かめる（Claudeの利用枠を少し使う）",
+        "--check", action="store_true", help="--headless のときも scripts/check.py を実行する（既定では省く）",
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="本物の claude -p を、ゲートで使う役割ごとに1回ずつ実行して、出力の形を確かめる"
+        "（Claudeの利用枠を少し使う）",
+    )
+    parser.add_argument("--role", action="append", help="ヘッドレスの確認をする役割（くり返せる。既定はすべて）")
     parser.add_argument("--budget", type=float, default=1.0, help="ヘッドレスの確認の上限額（米ドル）")
     parser.add_argument("--timeout", type=int, default=300, help="ヘッドレスの確認を打ち切るまでの秒数")
     parser.add_argument(
@@ -463,11 +578,12 @@ def main(argv: list[str] | None = None) -> int:
         },
         # 確かめた内容（確認を始める前の時点）。ツリーIDは、ハーネス（cycle.py）と同じ求め方
         "content": cycle.content_info(root),
-        "check": check_info(root, args.no_check),
+        # --headless のときは、確認（数分かかる）を省くのが既定（ヘッドレスの失敗を、すぐに切り分けられるように）
+        "check": check_info(root, args.no_check or (args.headless and not args.check)),
         "headless": {"ran": False, "reason": "not_requested"},
     }
     if args.headless:
-        result["headless"] = headless_info(root, args.budget, args.timeout, args.allow_api_billing)
+        result["headless"] = headless_info(root, args.budget, args.timeout, args.allow_api_billing, args.role)
     result["problems"] = problems(result, args.headless)
     result["ok"] = not result["problems"]
 

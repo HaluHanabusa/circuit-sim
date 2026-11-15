@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fnmatch
 import json
 import os
 import re
@@ -56,9 +57,17 @@ GATE_AGENT = {"review": "code-reviewer", "verify": "verifier", "ux": "ux-designe
 # 確認の対象（ツリーID）を、確認の前に控えておく必要があるゲート
 TREE_REQUIRED_GATES = ("review", "verify", "ux")
 
-# レビューや検証の後で足してよい場所（検証担当の受け入れ試験と記録）。
+# レビューや検証の後で足してよい場所（検証担当の受け入れ試験と記録）と、そこに足してよいファイルの名前。
 # 許すのは、ゲートの時点で無かったファイルの追加だけ。それ以外の変更があれば、そのゲートは古いものとして扱う。
-AFTER_GATE_PATHS = ("tests/acceptance/", "docs/verification/")
+# 名前を絞るのは、試験の集め方を変えるファイル（conftest.py、pytest.ini など）を後から足させないため
+# （conftest.py ひとつで、受け入れ試験を全部外せる）。
+AFTER_GATE_FILES = (("tests/acceptance/", "test_*.py"), ("docs/verification/", "*.md"))
+
+# 統合先のブランチ。ゲートの記録に、その時点の main との分かれ目（git merge-base）を控える
+MAIN_REF = "refs/heads/main"
+
+# 役割の定義の場所（ヘッドレスで起動する役割は、ここに定義が要る）
+AGENTS_DIR = ".claude/agents"
 
 HEADER_KEYS = ("id", "owner", "needs_ux", "gates", "needs_windows")
 # 見出しのうち、true か false だけで書くもの
@@ -106,6 +115,11 @@ GATE_TOOLS = {
     "verify": "Read,Edit,Write,Bash,Grep,Glob",
     "ux": "Read,Edit,Write,Bash,Grep,Glob",
 }
+# レビューは、起動の側でも編集の道具を禁じる（役割の定義の disallowedTools: だけに頼らない）。
+# 編集を自動で受け入れる設定（acceptEdits）にもしない（ヘッドレスでは、許していない操作は断られる）。
+GATE_DISALLOWED = {"review": "Edit,Write,NotebookEdit,MultiEdit"}
+GATE_PERMISSION = {"review": "default"}
+DEFAULT_PERMISSION = "acceptEdits"
 
 ADD_ONLY = (
     "既にあるファイルは書き換えたり消したりせず、新しいファイルとして足してください"
@@ -175,6 +189,7 @@ VERDICT_SCHEMA = {
 NOT_ADOPTED = "実行中に同じゲートの別の記録が入ったので、この合格は採用しない。やり直す"
 HEADER_DRIFT = (
     "仕様の見出し（owner、needs_ux、needs_windows、gates）が start の後で変わっている。start をやり直す"
+    "（必要なゲートが増えただけなら、記録は残る）"
 )
 
 
@@ -300,8 +315,13 @@ def find_command(name: str, avoid: Iterable[Path] = ()) -> str | None:
             continue
         for file_name in command_file_names(name):
             candidate = os.path.join(entry, file_name)
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return candidate
+            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+                continue
+            # 置き場所が使ってよい場所でも、リンクの先（ファイルの実体）が避ける場所の中なら採らない
+            target = real_path(candidate)
+            if target.parent == here or any(is_inside(target, tree) for tree in trees):
+                continue
+            return candidate
     return None
 
 
@@ -327,6 +347,22 @@ def launchable(cmd: list[str], avoid: Iterable[Path] = ()) -> list[str]:
     return [found, *cmd[1:]]
 
 
+# Windows の cmd.exe と CreateProcess は、名前だけで書かれたコマンドを、PATH より先に実行した場所（カレント）で
+# 探す（npm 版の claude.cmd が中で呼ぶ node、名前で起動する git など）。この環境変数があると、探さない。
+# 起動する子プロセスにも引き継ぐ。ほかのOSでは、読む仕組みが無いので何も変わらない。
+NO_CURRENT_DIRECTORY_SEARCH = "NoDefaultCurrentDirectoryInExePath"
+
+
+def no_current_directory_search() -> None:
+    """名前だけのコマンドを、実行した場所で探させない（このプロセスと、起動する子プロセス）。main が最初に呼ぶ。"""
+    os.environ[NO_CURRENT_DIRECTORY_SEARCH] = "1"
+
+
+def system_command(name: str) -> str:
+    """Windows に付いてくるコマンド（taskkill）の場所。名前だけで起動しない（実行した場所のものを使わない）。"""
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", f"{name}.exe")
+
+
 def shell_line(cwd: Path, cmd: list[str]) -> str:
     """人が端末に貼って実行できる形の1行（Windows では、コマンド プロンプト用の書き方）。"""
     if WINDOWS:
@@ -350,7 +386,7 @@ def kill_tree(proc: subprocess.Popen) -> None:
     Linux / macOS では、プロセスのまとまりごと止める（起動したプロセスが先に終わっていても、残りを止める）。
     """
     if WINDOWS:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        subprocess.run([system_command("taskkill"), "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
     else:
         with contextlib.suppress(ProcessLookupError):       # まとまりが、もう無い（どれも終わっている）
             os.killpg(proc.pid, signal.SIGKILL)
@@ -446,6 +482,14 @@ def pinned_git_options(folder: Path) -> list[str]:
     return [option for key, value in settings for option in ("-c", f"{key}={value}")]
 
 
+def git_program() -> str:
+    """起動する git の場所。claude と同じ探し方（find_command）で、実行した場所と本体の中のものは使わない。"""
+    found = find_command("git", (repo_root(),))
+    if found is None:
+        raise CycleError("git が見つからない（実行した場所と本体の中にあるものは使わない）。git を入れて PATH を通す")
+    return found
+
+
 def run_git(
     cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None, pinned: Path | None = None,
 ) -> subprocess.CompletedProcess:
@@ -459,7 +503,7 @@ def run_git(
     if index is not None:
         env["GIT_INDEX_FILE"] = str(index)
     return subprocess.run(
-        ["git", *options, "-C", str(cwd), *args],
+        [git_program(), *options, "-C", str(cwd), *args],
         input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
     )
 
@@ -578,6 +622,16 @@ def header_changed(header: dict, state: dict) -> bool:
     return header["owner"] != state.get("owner") or required_gates(header) != required_gates(state)
 
 
+def header_loosened(header: dict, state: dict) -> bool:
+    """見出しの変更が、担当を変えるか、必要なゲートを減らすか（記録を消してやり直す必要がある変更）。
+
+    必要なゲートが増えるだけの変更（needs_ux: true を足す、など）は、記録を残したまま start で取り込める
+    （増えたゲートは、まだ記録が無いので、統合はそのゲートを待つ）。
+    """
+    removed = set(required_gates(state)) - set(required_gates(header))
+    return header["owner"] != state.get("owner") or bool(removed)
+
+
 def state_file(root: Path, uid: str) -> Path:
     return root / ".cycle" / "state" / f"{uid}.json"
 
@@ -654,10 +708,14 @@ def termination_as_exception() -> Iterator[None]:
         raise SystemExit(128 + signum)
 
     stop.raises_on_stop = True      # 入れ子の内側が、外側の枠の扱いだと見分ける印
+    saved = {}
     try:
-        saved = {sig: signal.signal(sig, stop) for sig in signals}
+        for sig in signals:
+            # 無視に設定されていた合図（nohup の SIGHUP など）は、差し替えない（無視のまま続ける）
+            if signal.getsignal(sig) is not signal.SIG_IGN:
+                saved[sig] = signal.signal(sig, stop)
     except ValueError:          # メインのスレッド以外からは設定できない
-        saved = {}
+        pass
     try:
         yield
     finally:
@@ -707,6 +765,18 @@ def resolve_tree(worktree: Path, value: str) -> str:
     if not is_tree_id(tree):        # 解決できなければ、何も出力されない
         raise CycleError(f"--tree の値（{value}）をツリーとして読めない。snapshot が表示したIDを渡す")
     return tree
+
+
+def main_base(worktree: Path, commit: str = "HEAD") -> str | None:
+    """commit と main との分かれ目（git merge-base）。求められなければ None。
+
+    ゲートの記録に控え、統合のときに比べる。ツリーIDが同じでも、分かれ目が変わっていれば
+    （`git reset --soft main && git commit`、`git merge -s ours main` で土台を付け替えた）、
+    取り込みは main に入った他の成果を消すので、ゲートは古いものとして扱う。
+    """
+    proc = run_git(worktree, "merge-base", MAIN_REF, commit)
+    base = proc.stdout.strip()
+    return base if proc.returncode == 0 and is_tree_id(base) else None
 
 
 def worktree_branch(worktree: Path) -> str:
@@ -790,16 +860,20 @@ def record_count(state: dict, gate: str) -> int:
 
 
 def add_record(
-    root: Path, uid: str, gate: str, verdict: str, tree: str, by: str, source: str,
+    root: Path, uid: str, gate: str, verdict: str, tree: str, base: str | None, by: str, source: str,
     report: str = "", seen: int | None = None, extra: dict | None = None,
 ) -> bool:
     """ゲートの結果を記録する。ロックを取り、状態を読み直してから書く（並行する実行の記録を失わない）。
 
+    base は、確かめた時点の main との分かれ目（main_base）。
     seen は、実行を始めたときの record_count。実行中に同じゲートの別の記録が入っていたら、
     この結果が合格でも採用しない（先に始めた実行の合格で、後から入った結果を上書きしない）。
     採用したら True を返す。採用しなかった結果も履歴には残す。extra は、記録に付け足す項目。
     """
-    entry = {"verdict": verdict, "tree": tree, "by": by, "source": source, "report": report, "at": now()}
+    entry = {
+        "verdict": verdict, "tree": tree, "base": base, "by": by, "source": source, "report": report,
+        "at": now(),
+    }
     entry.update(extra or {})
     with locked(unit_lock(root, uid)):
         state = load_state(root, uid)
@@ -817,30 +891,32 @@ def runs_dir(root: Path) -> Path:
     return path
 
 
-def run_check(cwd: Path) -> tuple[str, str, str]:
+def run_check(cwd: Path) -> tuple[str, str, str, str]:
     """scripts/check.py を、このスクリプトと同じ Python で実行する。
 
-    返すのは（判定、確認した内容のツリーID、出力）。
+    返すのは（判定、確認した内容のツリーID、出力、標準出力の最後の行）。
 
     合格にするのは、終了コードが 0 で、実行の前後で内容が変わっていないときだけ。
     呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（check_env。試験を選び直させない）。
     """
     before = tree_id(cwd)
     if not (cwd / CHECK_SCRIPT).is_file():
-        return "error", before, f"{CHECK_SCRIPT} が無いので、確認を起動できない"
+        return "error", before, f"{CHECK_SCRIPT} が無いので、確認を起動できない", ""
     try:
         proc = subprocess.run(
             [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
             text=True, encoding="utf-8", errors="replace", env=check_env(python_env()),
         )
     except OSError as exc:
-        return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
+        return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}", ""
     output = proc.stdout + proc.stderr
+    # 1行の表示には、標準出力の最後の行（pytest の件数）を使う。標準エラーの最後は、試験の遮断の表示のことがある
+    last = (proc.stdout.strip().splitlines() or [""])[-1]
     if proc.returncode != 0:
-        return "fail", before, output
+        return "fail", before, output, last
     if tree_id(cwd) != before:
-        return "error", before, output + "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない"
-    return "pass", before, output
+        return "error", before, output + "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない", last
+    return "pass", before, output, last
 
 
 # ---------------------------------------------------------------- コマンド
@@ -856,10 +932,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         old = load_state(root, args.id) if state_file(root, args.id).exists() else {}
         if old.get("merged_at"):
             raise CycleError(f"{args.id} は統合済み。start はやり直せない")
-        if old.get("gates") and not args.reset and header_changed(header, old):
+        if old.get("gates") and not args.reset and header_loosened(header, old):
             raise CycleError(
-                f"{args.id}: ゲートの記録があるのに、見出し（owner、needs_ux、needs_windows、gates）が"
-                "変わっている。"
+                f"{args.id}: ゲートの記録があるのに、見出しで担当が変わったか、必要なゲートが減っている。"
                 "やり直すなら start --reset で記録を消す（消したことは履歴に残る）"
             )
         if worktree.exists():
@@ -876,6 +951,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "gates_before": required_gates(old), "gates_after": required_gates(header),
             })
             gates = {}
+        elif old and header_changed(header, old):     # 必要なゲートが増えただけ。記録は残す
+            history.append({
+                "event": "gates_added", "at": now(),
+                "gates_before": required_gates(old), "gates_after": required_gates(header),
+            })
         state = {
             "id": args.id,
             "spec": spec.relative_to(root).as_posix(),
@@ -894,22 +974,25 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def claude_command(prompt: str, role: str, budget: float, tools: str) -> list[str]:
-    """ヘッドレス実行のコマンド。結果は VERDICT_SCHEMA の形で受け取る。"""
-    return [
+def claude_command(prompt: str, role: str, budget: float, gate: str) -> list[str]:
+    """ヘッドレス実行のコマンド。道具と許可の扱いは、ゲート（gate）で決まる。結果は VERDICT_SCHEMA の形で受け取る。"""
+    cmd = [
         "claude", "-p", prompt,
         "--agent", role,
         "--output-format", "json",
         "--json-schema", json.dumps(VERDICT_SCHEMA, ensure_ascii=False),
-        "--permission-mode", "acceptEdits",
+        "--permission-mode", GATE_PERMISSION.get(gate, DEFAULT_PERMISSION),
         "--max-budget-usd", str(budget),
-        "--allowedTools", tools,
+        "--allowedTools", GATE_TOOLS[gate],
     ]
+    if gate in GATE_DISALLOWED:
+        cmd += ["--disallowedTools", GATE_DISALLOWED[gate]]
+    return cmd
 
 
 def agent_command(state: dict, gate: str, budget: float) -> list[str]:
     role = state["owner"] if gate == "implement" else GATE_AGENT[gate]
-    return claude_command(GATE_PROMPT[gate].format(spec=state["spec"]), role, budget, GATE_TOOLS[gate])
+    return claude_command(GATE_PROMPT[gate].format(spec=state["spec"]), role, budget, gate)
 
 
 def schema_problem(result: object) -> str:
@@ -938,11 +1021,12 @@ def schema_problem(result: object) -> str:
     return ""
 
 
-def headless_verdict(returncode: int, stdout: str) -> tuple[str, str, dict]:
-    """ヘッドレス実行の結果から（判定、要約、出力の中身）を決める。
+def headless_verdict(returncode: int, stdout: str, gate: str = "") -> tuple[str, str, dict]:
+    """ヘッドレス実行の結果から（判定、要約、出力の中身）を決める。gate は、実行したゲート。
 
     合格にするのは、実行が正常に終わり、構造化された結果に欠けも矛盾も無いときだけ。
     結果を得られなかった場合は error、結果の中身が合格と矛盾する場合は fail にする。
+    独立検証（verify）の合格は、確かめた基準が1つ以上あるときだけ（基準ゼロ件の合格は、何も測っていない）。
     """
     if returncode != 0:
         return "error", f"claude が終了コード {returncode} で終わった", {}
@@ -966,6 +1050,8 @@ def headless_verdict(returncode: int, stdout: str) -> tuple[str, str, dict]:
         unmet = [item["name"] for item in result["criteria"] if not item["pass"]]
         if unmet:
             return "fail", f"verdict は pass だが、満たしていない基準がある（{'、'.join(unmet[:5])}）", data
+        if gate == "verify" and not result["criteria"]:
+            return "fail", "verdict は pass だが、確かめた基準（criteria）が1つも無い", data
     return result["verdict"], result["summary"], data
 
 
@@ -977,10 +1063,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(shell_line(worktree, cmd))
         return 0
+    # 実装の担当（見出しの owner）は、役割の定義があるものだけをヘッドレスで起動する（無い名前で起動すると、
+    # CLI は役割の指示なしで動く）。確認系のゲートの担当（GATE_AGENT）は、決まった名前
+    owner = state["owner"]
+    if args.gate == "implement" and not (worktree / AGENTS_DIR / f"{owner}.md").is_file():
+        raise CycleError(
+            f"担当 {owner} の役割の定義（{AGENTS_DIR}/{owner}.md）が作業ツリーに無いので、ヘッドレスで起動できない。"
+            "仕様の見出しの owner には、定義のある役割の名前を書く（セッション内で動かした結果は record で記録できる）"
+        )
     cmd = launchable(cmd, (root, worktree))
 
     seen = record_count(state, args.gate)
-    before = tree_id(worktree)
+    before, base = tree_id(worktree), main_base(worktree)
     log = runs_dir(root) / f"{args.id}-{args.gate}-{stamp()}.json"
     try:
         proc = run_captured(cmd, worktree, args.timeout)
@@ -991,13 +1085,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise CycleError(f"claude を起動できない: {exc}") from exc
     else:
         log.write_text(proc.stdout or proc.stderr, encoding="utf-8")
-        verdict, summary, data = headless_verdict(proc.returncode, proc.stdout)
+        verdict, summary, data = headless_verdict(proc.returncode, proc.stdout, args.gate)
 
     # 実装は「作った結果」を、確認系は「見た対象」（実行前の内容）を記録する
     tree = tree_id(worktree) if args.gate == "implement" else before
     by = str(data["session_id"]) if data.get("session_id") else "headless-unknown"
     report = log.relative_to(root).as_posix()
-    adopted = add_record(root, args.id, args.gate, verdict, tree, by, "headless", report, seen)
+    adopted = add_record(root, args.id, args.gate, verdict, tree, base, by, "headless", report, seen)
     cost = data.get("total_cost_usd")
     note = f" 費用の概算 ${cost}" if cost else ""
     print(f"{args.id} {args.gate}: {verdict}（{summary}）記録 {log.name}{note}")
@@ -1027,7 +1121,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         )
     else:
         tree = tree_id(worktree)
-    add_record(root, args.id, args.gate, args.verdict, tree, by, "session", args.report or "")
+    add_record(root, args.id, args.gate, args.verdict, tree, main_base(worktree), by, "session", args.report or "")
     print(f"{args.id} {args.gate}: {args.verdict} を記録（対象 {tree[:10]}、担当 {by}）")
     return 0
 
@@ -1037,13 +1131,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     state = load_state(root, args.id)
     worktree = Path(state["worktree"])
     seen = record_count(state, "check")
-    verdict, tree, output = run_check(worktree)
+    base = main_base(worktree)
+    verdict, tree, output, last = run_check(worktree)
     log = runs_dir(root) / f"{args.id}-check-{stamp()}.log"
     log.write_text(output, encoding="utf-8")
     report = log.relative_to(root).as_posix()
-    adopted = add_record(root, args.id, "check", verdict, tree, CHECK_SCRIPT, "script", report, seen)
-    tail = output.strip().splitlines()[-1:] or [""]
-    print(f"{args.id} check: {verdict}（{tail[0]}）")
+    adopted = add_record(root, args.id, "check", verdict, tree, base, CHECK_SCRIPT, "script", report, seen)
+    print(f"{args.id} check: {verdict}（{last or output.strip()[-200:]}）")
     if not adopted:
         print(NOT_ADOPTED)
     return 0 if verdict == "pass" and adopted else 1
@@ -1103,8 +1197,10 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
     copy = runs_dir(root) / f"{args.id}-{WINDOWS_GATE}-{stamp()}.json"
     copy.write_bytes(data)                      # 取り込んだ結果の写し（中身は変えない）
     extra = {"os": system, "commit": result["commit"]}
+    # 分かれ目は、確かめたコミットのもの（取り込む時点の HEAD では、結果の後の付け替えを見逃す）
+    base = main_base(worktree, result["commit"])
     add_record(
-        root, args.id, WINDOWS_GATE, result["verdict"], tree, LOCAL_CI_SCRIPT, "ci",
+        root, args.id, WINDOWS_GATE, result["verdict"], tree, base, LOCAL_CI_SCRIPT, "ci",
         copy.relative_to(root).as_posix(), extra=extra,
     )
     print(f"{args.id} {WINDOWS_GATE}: {result['verdict']} を記録（対象 {tree[:10]}、{system}）")
@@ -1114,7 +1210,7 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
 def changed_after_gate(worktree: Path, gate_tree: str, current: str) -> list[str]:
     """ゲートの後で変わったファイルのうち、許されないもの。
 
-    許すのは、例外の場所（AFTER_GATE_PATHS）への、ゲートの時点で無かったファイルの追加だけ。
+    許すのは、例外の場所（AFTER_GATE_FILES）への、決まった名前の、ゲートの時点で無かったファイルの追加だけ。
     名前の変更は「削除と追加」に分けて見る。ファイル名は -z で受け取り、引用符つきの表記にさせない。
     """
     proc = run_git(worktree, "diff", "--no-renames", "--name-status", "-z", gate_tree, current)
@@ -1124,13 +1220,20 @@ def changed_after_gate(worktree: Path, gate_tree: str, current: str) -> list[str
         raise CycleError(f"git diff の結果を読めない: {proc.stderr.strip()}")
     return [
         path for status, path in zip(fields[0::2], fields[1::2], strict=True)
-        if not (status == "A" and path.startswith(AFTER_GATE_PATHS))
+        if not (status == "A" and may_add_after_gate(path))
     ]
+
+
+def may_add_after_gate(path: str) -> bool:
+    """ゲートの後で足してよいファイルか（AFTER_GATE_FILES）。名前は、場所の中のどの階層でも同じ決まり。"""
+    name = path.rpartition("/")[2]
+    return any(path.startswith(place) and fnmatch.fnmatchcase(name, pattern) for place, pattern in AFTER_GATE_FILES)
 
 
 def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list[str]:
     """統合を妨げる理由の一覧。空なら、内容 current（ツリーID）を統合してよい。"""
     problems = []
+    base = main_base(worktree)
     try:
         if header_changed(read_header(root / state["spec"]), state):
             problems.append(HEADER_DRIFT)
@@ -1149,6 +1252,12 @@ def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list
             continue
         if not is_tree_id(entry.get("tree")):
             problems.append(f"{gate}: 記録の対象がツリーIDでない（{entry.get('tree')}）。やり直す")
+            continue
+        if entry.get("base") is None or entry["base"] != base:
+            problems.append(
+                f"{gate}: 確認の後で、main との分かれ目（土台）が変わっている。土台を付け替えた内容を取り込むと、"
+                "main に入った他の成果が消える。main を取り込み直して（git merge main）からやり直す"
+            )
             continue
         if gate == "check":
             if entry["tree"] != current:
@@ -1271,6 +1380,7 @@ def recover_merge(root: Path) -> str:
         finished = bool(load_state(root, uid).get("merged_at"))
     except (ValueError, KeyError, TypeError, CycleError):
         return f"前回の統合の控えを読めない。{manual}"
+    manual += f"（取り込み前のコミット {before}、取り込もうとしたコミット {head}）"
     if not finished:
         if not on_main(root):
             return f"前回の {uid} の統合が途中で終わっているが、本体が main にいない。{manual}"
@@ -1334,7 +1444,7 @@ def merge_unit(root: Path, uid: str) -> int:
     pending.write_text(json.dumps({"id": uid, "before": before, "head": head}), encoding="utf-8")
     try:
         git(root, "merge", "--no-ff", head, "-m", message)
-        verdict, _, output = run_check(root)
+        verdict, _, output, _ = run_check(root)
         (runs_dir(root) / f"{uid}-merge-check-{stamp()}.log").write_text(output, encoding="utf-8")
     except BaseException as exc:
         # 競合、中断（Ctrl-C、終了の合図）、記録を書けないなど。どの場合も本体を元に戻す。
@@ -1363,6 +1473,7 @@ def merge_unit(root: Path, uid: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     quiet_error_dialogs()
+    no_current_directory_search()
     parser = argparse.ArgumentParser(prog="cycle.py", description="開発サイクルのゲートを運ぶ")
     sub = parser.add_subparsers(dest="command", required=True)
 

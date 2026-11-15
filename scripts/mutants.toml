@@ -1,0 +1,11 @@
+# 1か所ずつ壊す確認（scripts/mutants.py）の一覧。
+#
+# [[mutant]]: 機械的には作れない壊し方を、手で書く。original は、file の中にちょうど1つある文字列。
+# [[equivalent]]: 壊しても動作が変わらない（同値の）ため、試験で落とせない壊し方。番号は
+#   `python scripts/mutants.py list` が表示するもの。理由を必ず書く。
+
+[[mutant]]
+id = "hand:lock-shared"
+file = "scripts/cycle.py"
+original = "fcntl.flock(handle, fcntl.LOCK_EX)"
+replacement = "fcntl.flock(handle, fcntl.LOCK_SH)"

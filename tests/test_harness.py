@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from conftest import SAFE_PATH_VAR
 
 WINDOWS = os.name == "nt"
 if WINDOWS:
@@ -129,7 +130,11 @@ sys.stderr.buffer.write((here / "err.txt").read_bytes())
 sys.exit({exit_code})
 """
 
-PASS = {"verdict": "pass", "summary": "ok", "criteria": [], "issues": []}
+# 合格の結果（独立検証の合格には、確かめた基準が1つ以上要る）
+PASS = {
+    "verdict": "pass", "summary": "ok", "criteria": [{"name": "基準1", "measured": "1", "pass": True}],
+    "issues": [],
+}
 
 
 def sh(cwd: Path, *args: str) -> str:
@@ -209,14 +214,17 @@ def run_cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subp
 
 
 @contextlib.contextmanager
-def held_lock(path: Path) -> Iterator[None]:
-    """別の実行がロックを持っている状態を作る（スクリプトの実装を通さず、OSの仕組みを直接使う）。"""
+def held_lock(path: Path, shared: bool = False) -> Iterator[None]:
+    """別の実行がロックを持っている状態を作る（スクリプトの実装を通さず、OSの仕組みを直接使う）。
+
+    shared なら、共有のロック（読む側のロック）を持つ。スクリプトが排他のロックを取っていれば、それでも待つ。
+    """
     with open(path, "a", encoding="utf-8") as handle:
         if WINDOWS:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         yield
 
 
@@ -670,6 +678,30 @@ def test_exception_is_limited_to_acceptance_tests_and_verification_records(repo)
     assert f"verify: 確認の後で変わったファイルがある（{', '.join(outside)}）。やり直す" in result.stdout
 
 
+def test_exception_paths_take_only_test_files_and_records(repo):
+    """例外の場所に後から足せるのは、受け入れ試験（test_*.py）と記録（*.md）だけ。
+
+    conftest.py ひとつで、受け入れ試験を全部外せる（試験の集め方を変える）。
+    """
+    wt = implement(repo)
+    pass_all(repo)
+    refused = [
+        "docs/verification/notes.txt", "docs/verification/run.py", "tests/acceptance/__init__.py",
+        "tests/acceptance/conftest.py", "tests/acceptance/data.json", "tests/acceptance/pytest.ini",
+        "tests/acceptance/sub/conftest.py", "tests/acceptance/test_x.py.bak",
+    ]
+    allowed = ["docs/verification/sub/U1-2.md", "tests/acceptance/sub/test_more.py", "tests/acceptance/test_u1.py"]
+    for path in [*refused, *allowed]:
+        (wt / path).parent.mkdir(parents=True, exist_ok=True)
+        (wt / path).write_text("\n", encoding="utf-8")
+    assert cycle(repo, "check", "U1").returncode == 0
+    commit(wt)
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1
+    assert "review: 確認の後で変わったファイルがある（docs/verification/notes.txt" in result.stdout
+    assert CYCLE_MODULE.changed_after_gate(wt, state(repo)["gates"]["review"]["tree"], snap(repo)) == refused
+
+
 @pytest.mark.parametrize("change, reported", [
     ("rewrite", "tests/acceptance/test_old.py"),
     ("delete", "tests/acceptance/test_old.py"),
@@ -689,7 +721,7 @@ def test_exception_paths_allow_only_files_that_did_not_exist_at_the_gate(repo, c
     elif change == "rename":
         old.rename(old.with_name("test_renamed.py"))
     else:                                                         # 製品ファイルを例外の場所へ移す
-        (wt / "product.py").rename(old.with_name("product.py"))
+        (wt / "product.py").rename(old.with_name("test_product.py"))
     assert cycle(repo, "check", "U1").returncode == 0
     commit(wt)
     result = cycle(repo, "merge", "U1")
@@ -817,6 +849,18 @@ def test_check_does_not_hand_the_callers_pytest_settings_to_the_tests(repo):
     assert "pytest settings: []" in log
 
 
+def test_check_line_shows_the_last_line_of_the_standard_output(repo):
+    """1行の表示は、標準出力の最後の行（件数）。標準エラーの最後の行（試験の遮断の表示）ではない。"""
+    wt = implement(repo)
+    (wt / "scripts" / "check.py").write_text(
+        "import sys\nprint('12 passed in 3.0s')\nprint('  PATH から外した場所: なし', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    result = cycle(repo, "check", "U1")
+    assert result.returncode == 0
+    assert "U1 check: pass（12 passed in 3.0s）" in result.stdout
+
+
 def test_check_runs_with_the_python_that_runs_the_harness(repo):
     wt = implement(repo)
     script = "import sys\nprint('python:' + sys.executable)\n"
@@ -875,8 +919,28 @@ def test_implementer_is_remembered_after_implement_is_recorded_again(repo):
     assert "実装した本人が検証している" in result.stdout
 
 
+def define_role(wt: Path, role: str = "solver-engineer") -> None:
+    """作業ツリーに役割の定義を置く（ヘッドレスの implement は、担当の役割の定義が要る）。"""
+    (wt / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
+    (wt / ".claude" / "agents" / f"{role}.md").write_text(f"---\nname: {role}\n---\n", encoding="utf-8")
+
+
+def test_implement_is_not_started_for_an_owner_without_a_role_definition(repo, tmp_path):
+    """見出しの owner に、役割の定義が無い名前（ハーネスの修正担当など）は、ヘッドレスでは起動しない。"""
+    wt = implement(repo)
+    before = state(repo)
+    env = fake_claude(tmp_path, headless())
+    result = cycle(repo, "run", "U1", "implement", env=env)
+    assert result.returncode == 2 and ".claude/agents/solver-engineer.md" in result.stderr
+    assert state(repo) == before and not was_run(tmp_path / "bin")
+    define_role(wt)
+    assert cycle(repo, "run", "U1", "implement", env=env).returncode == 0
+    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0      # 確認系の担当は、決まった名前
+
+
 def test_headless_runs_without_session_id_count_as_the_same_person(repo, tmp_path):
     wt = implement(repo)
+    define_role(wt)
     env = fake_claude(tmp_path, {"structured_output": PASS})        # session_id が無い
     assert cycle(repo, "run", "U1", "implement", env=env).returncode == 0
     assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
@@ -986,6 +1050,17 @@ def test_headless_result_with_gaps_or_contradictions_is_not_a_pass(implemented, 
     assert result.returncode == 1
     assert f"review: {expected}" in result.stdout
     assert state(implemented)["gates"]["review"]["verdict"] == expected
+
+
+@pytest.mark.parametrize("gate, expected", [("verify", "fail"), ("review", "pass"), ("ux", "pass")])
+def test_verification_pass_without_any_criterion_is_not_a_pass(implemented, tmp_path, gate, expected):
+    """独立検証の合格は、確かめた基準が1つ以上あるときだけ。基準ゼロ件は、何も測っていない。"""
+    env = fake_claude(tmp_path, headless({**PASS, "criteria": []}))
+    result = cycle(implemented, "run", "U1", gate, env=env)
+    assert f"{gate}: {expected}" in result.stdout
+    assert state(implemented)["gates"][gate]["verdict"] == expected
+    if expected == "fail":
+        assert "確かめた基準（criteria）が1つも無い" in result.stdout
 
 
 def test_headless_pass_with_minor_findings_is_a_pass(repo, tmp_path):
@@ -1176,7 +1251,7 @@ def test_missing_claude_is_reported_clearly(repo, tmp_path):
 ])
 def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path, gate, agent, tools):
     """役割、指示、結果の形の指定が、起動用のファイル（Windows では claude.cmd）を通っても崩れない。"""
-    implement(repo)
+    define_role(implement(repo))
     env = fake_claude(tmp_path, headless())
     assert cycle(repo, "run", "U1", gate, "--budget", "2.5", env=env).returncode == 0
     entry = state(repo)["gates"][gate]
@@ -1187,9 +1262,11 @@ def test_headless_command_reaches_the_cli_unchanged(repo, tmp_path, gate, agent,
     assert argv[1] == CYCLE_MODULE.GATE_PROMPT[gate].format(spec="docs/plan/U1-demo.md")
     options = dict(zip(argv[2::2], argv[3::2], strict=True))
     assert json.loads(options.pop("--json-schema")) == CYCLE_MODULE.VERDICT_SCHEMA
+    # レビューは、起動の側でも編集の道具を禁じ、編集を自動で受け入れない
+    review = {"--permission-mode": "default", "--disallowedTools": "Edit,Write,NotebookEdit,MultiEdit"}
     assert options == {
         "--agent": agent, "--output-format": "json", "--permission-mode": "acceptEdits",
-        "--max-budget-usd": "2.5", "--allowedTools": tools,
+        "--max-budget-usd": "2.5", "--allowedTools": tools, **(review if gate == "review" else {}),
     }
 
 
@@ -1287,6 +1364,50 @@ def test_claude_inside_the_worktree_or_the_main_checkout_is_not_used(repo, tmp_p
     assert result.returncode == 2
     assert "claude コマンドが見つからない" in result.stderr
     assert not was_run(entry) and "review" not in state(repo)["gates"]
+
+
+def test_link_on_path_that_leads_inside_the_worktree_is_not_used(repo, tmp_path):
+    """PATH の場所が使ってよい所でも、そこにあるリンクの先が作業ツリーの中なら、使わない（ファイルの実体を見る）。"""
+    wt = implement(repo)
+    planted = wt / "node_modules" / ".bin"
+    install_claude(planted, headless(session="planted"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "claude").symlink_to(planted / "claude")
+    result = cycle(repo, "run", "U1", "review", env={"PATH": str(outside)})
+    assert result.returncode == 2 and "claude コマンドが見つからない" in result.stderr
+    assert not was_run(planted) and "review" not in state(repo)["gates"]
+
+
+def test_git_inside_the_main_checkout_is_not_started(repo, tmp_path):
+    """git も claude と同じ探し方で、絶対パスで起動する（本体の中や、実行した場所の git を動かさない）。"""
+    implement(repo)
+    expected = snap(repo)
+    planted = repo / "tools" / "bin"
+    planted.mkdir(parents=True)
+    marker = tmp_path / "planted-git-ran"
+    install_command(planted, "git", f"import pathlib\npathlib.Path({str(marker)!r}).touch()\nraise SystemExit(1)\n")
+    env = {"PATH": f"{planted}{os.pathsep}{os.environ[SAFE_PATH_VAR]}"}       # 見張り役を含まない PATH
+    assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == expected
+    assert not marker.exists()
+    with mock.patch.dict(os.environ, {"PATH": str(planted), "CYCLE_ROOT": str(repo)}):
+        with pytest.raises(CYCLE_MODULE.CycleError, match="git が見つからない"):
+            CYCLE_MODULE.git_program()
+
+
+def test_commands_started_by_the_harness_are_told_not_to_search_the_place_of_execution(repo, tmp_path):
+    """Windows の cmd.exe は、名前だけのコマンド（claude.cmd の中の node）を、PATH より先に実行した場所で探す。
+
+    NoDefaultCurrentDirectoryInExePath があると探さない。起動する claude（と、その先）に引き継ぐ。
+    """
+    implement(repo)
+    seen = tmp_path / "seen.txt"
+    script = (
+        "import os\n"
+        f"pathlib.Path({str(seen)!r}).write_text(os.environ.get('NoDefaultCurrentDirectoryInExePath', '-'))"
+    )
+    assert cycle(repo, "run", "U1", "review", env=fake_claude(tmp_path, headless(), script=script)).returncode == 0
+    assert seen.read_text() == "1"
 
 
 def test_claude_on_path_is_used_when_another_one_is_in_the_place_of_execution(repo, tmp_path, monkeypatch):
@@ -1503,6 +1624,22 @@ def test_writing_commands_wait_for_the_lock(repo, command, lock):
     assert state(repo) != before
 
 
+@only_posix("Windows の msvcrt.locking には共有のロックが無い（LK_NBRLCK も排他のロックと同じ）")
+@pytest.mark.parametrize("lock", ["state/U1.lock", "merge.lock"])
+def test_lock_is_exclusive_and_waits_even_for_a_shared_holder(repo, lock):
+    """記録と統合のロックは排他。共有のロックで済ませると、2つの実行が同時に状態を読み書きできてしまう。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    before = state(repo)
+    with held_lock(repo / ".cycle" / lock, shared=True):
+        proc = start_cycle(repo, "merge", "U1")
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
+        assert state(repo) == before and main_log(repo) == ["init"]
+    assert proc.wait(timeout=30) == 0
+
+
 def busy_wait(seconds: float) -> contextlib.AbstractContextManager:
     """ファイルが使われている間、待ってやり直す秒数（Windows 以外では、ふだんは 0）を差し替える。"""
     return mock.patch.object(CYCLE_MODULE, "BUSY_WAIT_SECONDS", seconds)
@@ -1619,6 +1756,46 @@ def test_reading_and_recording_leave_the_index_alone(repo, tmp_path):
     ]
 
 
+def other_repo(tmp_path: Path) -> Path:
+    other = tmp_path / "other"
+    other.mkdir()
+    sh(other, "git", "init", "-q")
+    (other / "q.txt").write_text("q\n", encoding="utf-8")
+    sh(other, "git", "add", "q.txt")
+    return other
+
+
+def location_case(name: str, wt: Path, other: Path) -> dict[str, str]:
+    """呼び出し元に置かれていると、対象でないリポジトリ、索引、オブジェクトを見せる値。"""
+    objects = other / ".git" / "objects"
+    return {
+        "GIT_DIR": {"GIT_DIR": str(other / ".git")},
+        "GIT_WORK_TREE": {"GIT_WORK_TREE": str(other)},
+        "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(other / ".git" / "index")},
+        "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(objects)},
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(objects)},
+    }[name]
+
+
+@pytest.mark.parametrize("name", [
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+])
+def test_each_git_location_variable_of_the_caller_is_ignored(repo, tmp_path, name):
+    """変数ごとに、置かれていても、対象の作業ツリーの内容を見る（別のリポジトリの内容を受け入れない）。"""
+    wt = implement(repo)
+    (wt / "forced.log").write_text("f\n", encoding="utf-8")
+    sh(wt, "git", "add", "-f", "forced.log")
+    (wt / ".gitignore").write_text(".cycle/\n*.log\n", encoding="utf-8")
+    expected = snap(repo)
+    other = other_repo(tmp_path)
+    foreign = sh(other, "git", "write-tree")                 # 別のリポジトリにだけあるツリー
+    env = location_case(name, wt, other)
+    assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == expected
+    args = ["record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", foreign]
+    assert cycle(repo, *args, env=env).returncode == 2
+    assert name in CYCLE_MODULE.GIT_LOCATION_VARS
+
+
 def test_git_location_variables_of_the_caller_are_ignored(repo, tmp_path):
     """git のフックの中などから呼ばれても、対象の作業ツリーと、その本物でない索引を見る。"""
     implement(repo)
@@ -1629,6 +1806,25 @@ def test_git_location_variables_of_the_caller_are_ignored(repo, tmp_path):
     env = {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_INDEX_FILE": str(index)}
     assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == snap(repo)
     assert not index.exists()
+
+
+def test_failure_of_git_listing_files_is_an_error_not_an_empty_list(repo):
+    """ファイルの一覧を返す git が失敗したら、空の一覧（変更なし、強制追加なし）として扱わない。"""
+    wt = implement(repo)
+    (wt / "forced.log").write_text("f\n", encoding="utf-8")
+    sh(wt, "git", "add", "-f", "forced.log")                # 無視の対象だが、追跡しているファイル
+    (wt / ".gitignore").write_text(".cycle/\n*.log\n", encoding="utf-8")
+    with pytest.raises(CYCLE_MODULE.CycleError, match="ls-files"):
+        CYCLE_MODULE.git_paths(wt, "ls-files", "-z", "--no-such-option")
+    index = Path(sh(wt, "git", "rev-parse", "--absolute-git-dir")) / "index"
+    saved = index.read_bytes()
+    index.write_bytes(b"broken")                            # 作業ツリーの索引が壊れている
+    try:
+        result = cycle(repo, "snapshot", "U1")
+        assert result.returncode == 2 and "ls-files" in result.stderr
+    finally:
+        index.write_bytes(saved)
+    assert "forced.log" in sh(wt, "git", "ls-tree", "-r", "--name-only", snap(repo))
 
 
 def test_snapshot_during_conflict_does_not_mark_it_resolved(repo):
@@ -1850,6 +2046,74 @@ def test_merge_conflict_leaves_main_as_it_was(repo):
     assert_main_untouched(repo, before)
 
 
+# ------------------------------------------------------------ 土台の付け替え（main との分かれ目）
+
+def main_moves_on(root: Path) -> None:
+    """main に、この作業単位とは別の成果が入る。"""
+    (root / "other.py").write_text("other = 1\n", encoding="utf-8")
+    commit(root, "別の成果")
+
+
+@pytest.mark.parametrize("rebase", [
+    ["reset", "--soft", "main"],                    # 付け替えて、同じツリーのままコミットし直す
+    ["merge", "-q", "-s", "ours", "main", "-m", "main を取り込む（中身は採らない）"],
+])
+def test_gates_go_stale_when_the_branch_is_moved_onto_main_without_its_changes(repo, rebase):
+    """ツリーIDが同じでも、土台を付け替えた内容を取り込むと、main に入った他の成果が消える。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    main_moves_on(repo)
+    sh(wt, "git", *rebase)
+    if rebase[0] == "reset":
+        sh(wt, "git", "commit", "-q", "-m", "付け替え")
+    assert sh(wt, "git", "rev-parse", "HEAD^{tree}") == state(repo)["gates"]["review"]["tree"]
+    before = sh(repo, "git", "rev-parse", "HEAD")
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1
+    for gate in ("check", "review", "verify"):
+        assert f"{gate}: 確認の後で、main との分かれ目（土台）が変わっている" in result.stdout
+    assert "統合: まだできない" in cycle(repo, "status", "U1").stdout
+    assert_main_untouched(repo, before)
+    assert (repo / "other.py").exists()
+
+
+def test_branch_that_is_only_behind_main_is_merged_as_before(repo):
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    main_moves_on(repo)
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / "other.py").exists() and (repo / "product.py").read_text(encoding="utf-8") == "x = 2\n"
+
+
+def test_gate_recorded_without_the_base_is_stale(repo):
+    """分かれ目を控えていない記録（H2 より前の記録など）は、比べられないので古いものとして扱う。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    data = state(repo)
+    data["gates"]["verify"].pop("base")
+    (repo / ".cycle" / "state" / "U1.json").write_text(json.dumps(data), encoding="utf-8")
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1
+    assert "verify: 確認の後で、main との分かれ目（土台）が変わっている" in result.stdout
+    assert "review: 確認の後で、main との分かれ目" not in result.stdout
+
+
+def test_base_of_each_gate_is_the_one_seen_when_it_was_recorded(repo, tmp_path):
+    """記録ごとに、その時点の分かれ目を控える（run、record、check、record-ci のどれでも）。"""
+    wt = implement(repo)
+    base = sh(wt, "git", "merge-base", "main", "HEAD")
+    pass_all(repo)
+    assert cycle(repo, "run", "U1", "review", env=fake_claude(tmp_path, headless())).returncode == 0
+    assert {gate: entry["base"] for gate, entry in state(repo)["gates"].items()} == dict.fromkeys(
+        ["implement", "review", "verify", "check"], base,
+    )
+    assert CYCLE_MODULE.main_base(tmp_path) is None        # git の作業ツリーでない場所では、求められない
+
+
 def test_merge_is_undone_when_check_cannot_be_started_on_main(repo):
     wt = implement(repo)
     pass_all(repo)
@@ -1944,6 +2208,8 @@ def test_recovery_leaves_main_alone_when_it_changed_after_the_kill(repo, tmp_pat
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1
     assert "前回の U1 の統合が途中で終わっているが" in result.stdout
+    pending = json.loads((repo / ".cycle" / "merge-pending.json").read_text(encoding="utf-8"))
+    assert f"取り込み前のコミット {pending['before']}、取り込もうとしたコミット {pending['head']}" in result.stdout
     assert sh(repo, "git", "for-each-ref") == refs                 # 人が確かめるまで、何も動かさない
     assert sh(repo, "git", "status", "--porcelain") == files
     assert (repo / ".cycle" / "merge-pending.json").exists()
@@ -2196,6 +2462,8 @@ def record_ci(root: Path, result: object) -> subprocess.CompletedProcess:
     書き方は、scripts/local_ci.py と同じ（字下げつき、最後に改行）。
     """
     path = root.parent / "result.json"
+    if isinstance(result, dict) and result.get("commit") == "c" * 40:   # 確かめたコミットは、作業ツリーの HEAD
+        result = {**result, "commit": sh(root.parent / "wt" / "U1", "git", "rev-parse", "HEAD")}
     if not isinstance(result, str | bytes):
         result = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     path.write_bytes(result if isinstance(result, bytes) else result.encode("utf-8"))
@@ -2230,7 +2498,7 @@ def test_needs_windows_requires_a_windows_result_for_the_content(repo):
     assert refused.returncode == 1 and "windows: まだ記録が無い" in refused.stdout
     assert main_log(repo) == ["仕様の見出し", "init"]
 
-    result = ci_result(tree)
+    result = ci_result(tree, commit=sh(wt, "git", "rev-parse", "HEAD"))
     recorded = record_ci(repo, result)
     assert recorded.returncode == 0, recorded.stderr
     assert f"U1 windows: pass を記録（対象 {tree[:10]}、Windows）" in recorded.stdout
@@ -2238,7 +2506,7 @@ def test_needs_windows_requires_a_windows_result_for_the_content(repo):
     assert (entry["verdict"], entry["tree"], entry["by"], entry["source"]) == (
         "pass", tree, "scripts/local_ci.py", "ci",
     )
-    assert (entry["os"], entry["commit"]) == ("Windows", "c" * 40)
+    assert (entry["os"], entry["commit"]) == ("Windows", sh(wt, "git", "rev-parse", "HEAD"))
     # 取り込んだ結果の写しが、中身を変えずに、記録として残る（記録するパスの区切りは /）
     assert entry["report"].startswith(".cycle/runs/U1-windows-") and entry["report"].endswith(".json")
     assert (repo / entry["report"]).read_bytes() == (repo.parent / "result.json").read_bytes()
@@ -2397,6 +2665,27 @@ def test_windows_result_goes_stale_when_the_content_changes(repo):
     assert cycle(repo, "merge", "U1").returncode == 0
 
 
+@pytest.mark.parametrize("when", ["before_record", "after_record"])
+def test_windows_result_goes_stale_when_the_branch_is_moved_onto_main(repo, when):
+    """分かれ目は、確かめたコミットのものを控える（取り込む時点の HEAD のものではない）。"""
+    wt, tree = windows_unit(repo)
+    result = ci_result(tree, commit=sh(wt, "git", "rev-parse", "HEAD"))
+    if when == "after_record":
+        assert record_ci(repo, result).returncode == 0
+    main_moves_on(repo)
+    sh(wt, "git", "reset", "--soft", "main")
+    sh(wt, "git", "commit", "-q", "-m", "付け替え")
+    if when == "before_record":
+        assert record_ci(repo, result).returncode == 0
+    pass_all(repo)                          # ほかのゲートは、付け替えた後の内容で取り直す
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1
+    assert "windows: 確認の後で、main との分かれ目（土台）が変わっている" in refused.stdout
+    assert [line for line in refused.stdout.splitlines() if line.startswith("  - ")] == [
+        line for line in refused.stdout.splitlines() if line.startswith("  - windows:")
+    ]
+
+
 def test_verifier_may_add_acceptance_tests_after_the_windows_result(repo):
     """Windows での結果の後で増えてよいのは、ほかの確認系のゲートと同じ。例外の場所への新しいファイルだけ。"""
     wt, tree = windows_unit(repo)
@@ -2462,23 +2751,43 @@ def test_unknown_needs_windows_value_is_rejected(repo, value):
     assert not (repo / ".cycle" / "state" / "U1.json").exists()
 
 
-@pytest.mark.parametrize("before, after", [("needs_windows: true\n", ""), ("", "needs_windows: true\n")])
-def test_needs_windows_cannot_be_changed_once_records_exist(repo, before, after):
-    """ゲートの記録がある作業単位で、Windows での確認の要る・要らないを変えるには、記録を消してやり直す。"""
-    if before:
-        set_header(repo, before)
+def test_needs_windows_cannot_be_dropped_once_records_exist(repo):
+    """ゲートの記録がある作業単位で、Windows での確認を外すには、記録を消してやり直す。"""
+    set_header(repo, "needs_windows: true\n")
     wt = implement(repo)
     pass_all(repo)
     commit(wt)
-    if after:
-        set_header(repo, after)
-    else:
-        (repo / "docs" / "plan" / "U1-demo.md").write_text(SPEC, encoding="utf-8")
-        commit(repo, "仕様の見出しから needs_windows を外す")
+    (repo / "docs" / "plan" / "U1-demo.md").write_text(SPEC, encoding="utf-8")
+    commit(repo, "仕様の見出しから needs_windows を外す")
     result = cycle(repo, "start", "U1")
     assert result.returncode == 2 and "start --reset" in result.stderr
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1 and "start の後で変わっている" in result.stdout
     assert cycle(repo, "start", "U1", "--reset").returncode == 0
-    assert ("windows    未実施" in cycle(repo, "status", "U1").stdout) == bool(after)
-    assert state(repo)["needs_windows"] is bool(after)
+    assert "windows" not in cycle(repo, "status", "U1").stdout
+    assert state(repo)["needs_windows"] is False
+
+
+@pytest.mark.parametrize("extra, added", [("needs_windows: true\n", "windows"), ("needs_ux: true\n", "ux")])
+def test_header_that_only_adds_gates_keeps_the_records(repo, extra, added):
+    """必要なゲートが増えるだけの見出しの変更は、記録を残したまま start で取り込める。統合は増えたゲートを待つ。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    before = state(repo)
+    set_header(repo, extra)
+    result = cycle(repo, "merge", "U1")                 # start をやり直すまでは、統合できない
+    assert result.returncode == 1 and "start の後で変わっている" in result.stdout
+    assert cycle(repo, "start", "U1").returncode == 0
+    after = state(repo)
+    assert after["gates"] == before["gates"]
+    assert after["history"][:-1] == before["history"]
+    assert after["history"][-1]["event"] == "gates_added"
+    assert after["history"][-1]["gates_after"] == [*after["history"][-1]["gates_before"], added]
+    status = cycle(repo, "status", "U1").stdout
+    assert f"{added:<10} 未実施" in status and "review     pass" in status
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1
+    assert [line for line in result.stdout.splitlines() if line.startswith("  - ")] == [
+        f"  - {added}: まだ記録が無い",
+    ]

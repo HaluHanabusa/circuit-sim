@@ -74,7 +74,7 @@ def fetch(root: Path) -> None:
     人が見ていない実行で、認証の入力を待って止まり続けないようにする（端末での入力を求めさせず、時間で打ち切る）。
     git の出力は表示しない（リモートのURLに、認証情報が入っていることがある）。
     """
-    cmd = ["git", "-C", str(root), "fetch", "--quiet", REMOTE]
+    cmd = [cycle.git_program(), "-C", str(root), "fetch", "--quiet", REMOTE]
     env = {**cycle.git_env(), "GIT_TERMINAL_PROMPT": "0"}
     try:
         code = cycle.run_captured(cmd, root, FETCH_TIMEOUT, env).returncode
@@ -370,6 +370,7 @@ def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     cycle.quiet_error_dialogs()     # Windows で、OSのエラー画面で止まらないように（確認にも引き継ぐ）
+    cycle.no_current_directory_search()
     parser = argparse.ArgumentParser(
         prog="local_ci.py", description="手元の確認（確認を走らせて、結果を記録する）",
     )
