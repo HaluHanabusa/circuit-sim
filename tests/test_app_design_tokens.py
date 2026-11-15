@@ -23,6 +23,9 @@ PROTAN = ((0.152286, 1.052583, -0.204868), (0.114503, 0.786281, 0.099216), (-0.0
 DEUTAN = ((0.367322, 0.860646, -0.227968), (0.280085, 0.672501, 0.047413), (-0.011820, 0.042940, 0.968881))
 
 
+TOKEN = re.compile(r"--([\w-]+):\s*(#[0-9a-fA-F]{6})\s*;")
+
+
 def css_tokens() -> dict[str, dict[str, str]]:
     text = TOKENS.read_text(encoding="utf-8")
     blocks = {
@@ -30,7 +33,7 @@ def css_tokens() -> dict[str, dict[str, str]]:
         "dark": re.search(r':root\[data-theme="dark"\]\s*\{(.*?)\n\}', text, re.S).group(1),
     }
     return {
-        theme: {m.group(1): m.group(2).lower() for m in re.finditer(r"--([\w-]+):\s*(#[0-9a-fA-F]{6})\s*;", body)}
+        theme: {m.group(1): m.group(2).lower() for m in TOKEN.finditer(body)}
         for theme, body in blocks.items()
     }
 
@@ -145,7 +148,7 @@ def test_contrast_pairs_meet_the_threshold(label, names, threshold, light, dark)
         if names == ["fg", "bg-selected"]:  # 状態の fg / bg-selected（最小の組）
             values = [min(contrast(tokens[f"{s}-fg"], tokens["bg-selected"]) for s in STATES)]
         elif len(names) == 3:  # `x-fg` / `bg-panel` ・ `x-bg`
-            values = [contrast(tokens[names[0]], tokens[names[1]]), contrast(tokens[names[0]], tokens[names[2]])]
+            values = [contrast(tokens[names[0]], tokens[bg]) for bg in names[1:]]
         else:
             values = [contrast(tokens[names[0]], tokens[names[1]])]
         expected = [float(v) for v in re.findall(r"\d+\.\d+", documented)]

@@ -1,4 +1,7 @@
-"""アプリ本体のサーバー（circuit_sim/app/server.py）の試験。本物の uvicorn を別のスレッドで動かし、urllib で叩く。"""
+"""アプリ本体のサーバー（circuit_sim/app/server.py）の試験。
+
+本物の uvicorn を別のスレッドで動かし、urllib で要求を送る。
+"""
 from __future__ import annotations
 
 import json
@@ -42,7 +45,8 @@ class Running:
 
     def call(self, path: str, body: dict | None = None, method: str | None = None, host: str | None = None):
         data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method=method or ("POST" if data else "GET"))
+        method = method or ("POST" if data else "GET")
+        req = urllib.request.Request(self.base + path, data=data, method=method)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         if host:
@@ -172,5 +176,6 @@ def test_built_page_has_no_external_references():
     for path in STATIC_DIR.rglob("*"):
         if path.suffix in (".html", ".css"):
             text = path.read_text(encoding="utf-8")
-            for marker in ('src="http', "src='http", 'href="http', "url(http", 'src="//', 'href="//', "@import"):
+            markers = ('src="http', "src='http", 'href="http', "url(http", 'src="//', 'href="//', "@import")
+            for marker in markers:
                 assert marker not in text, f"{path.name}: {marker}"

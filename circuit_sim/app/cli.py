@@ -35,7 +35,8 @@ def bind(port: int) -> socket.socket:
     """127.0.0.1 の番号 port（0 なら空いている番号）に、待ち受けのソケットを作る。使われていれば OSError。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if not WINDOWS:
-        # 止めた直後に同じ番号で起動し直せるように（Windows のこの設定は、使用中の番号を奪えてしまうので付けない）
+        # 止めた直後に同じ番号で起動し直せるように
+        # （Windows のこの設定は、使用中の番号を奪えてしまうので付けない）
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((HOST, port))
@@ -95,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-browser", action="store_true", help="ブラウザを開かない")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
-        print(f"--port には 0〜65535 の番号を指定してください（指定された値: {args.port}）。", file=sys.stderr)
+        print(f"--port には 0〜65535 の番号を指定してください（指定: {args.port}）。", file=sys.stderr)
         return 2
     for stream in (sys.stdout, sys.stderr):  # UTF-8 でない端末（日本語 Windows の cp932 など）でも落ちない
         reconfigure = getattr(stream, "reconfigure", None)
@@ -116,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
 
     workspace = Workspace()
     app = create_app(workspace=workspace)
-    config = uvicorn.Config(app, log_level="warning", access_log=False, lifespan="off", timeout_graceful_shutdown=2)
+    config = uvicorn.Config(
+        app, log_level="warning", access_log=False, lifespan="off", timeout_graceful_shutdown=2
+    )
     server = GuardedServer(config, workspace, say)
 
     say(f"circuit-sim を起動しました: {url}")

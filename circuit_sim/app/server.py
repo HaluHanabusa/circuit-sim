@@ -1,9 +1,9 @@
 """アプリ本体のサーバー（FastAPI）。画面（static/）と、画面が使う API を出す。
 
 API（画面仕様 12章の番号）:
-  GET  /api/health          D8 つながっているかの確かめ。起動ごとに変わる instance を返す（起動し直しに気づく）
+  GET  /api/health          D8 つながっているかの確かめ。起動ごとに変わる instance を返す（起動し直しを知る）
   GET  /api/samples         D1 サンプルの一覧（名前と説明は辞書のキー）
-  POST /api/open            仕様JSONを開く（4.2 の 5〜8 の確かめ。1〜4 は画面が行う）。開けたら作業の状態に入れる
+  POST /api/open            仕様JSONを開く（4.2 の 5〜8 を確かめる。1〜4 は画面）。開けたら作業の状態に入れる
   GET  /api/session         D9 作業の状態（ブラウザを再読み込みしても、開いている仕様が戻る）
   PUT  /api/session         作業の状態を送り直す（起動し直した後。保存していない変更があるかも受け取る）
 
@@ -82,7 +82,7 @@ def notice(code: str, details: str | None = None, items: list[dict] | None = Non
 
 
 def check_spec(file: str, text: str) -> tuple[dict | None, dict | None]:
-    """仕様JSONの文字列を確かめる（4.2 の 5〜8）。（開いた仕様の要約、開けない理由のお知らせ）の片方を返す。"""
+    """仕様JSONの文字列を確かめる（4.2 の 5〜8）。（開いた仕様の要約、開けない理由）の片方を返す。"""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:

@@ -1,7 +1,7 @@
 """実際のブラウザでの通し試験（A0。画面仕様 1章、3章、9章、10章の受け入れ基準）。
 
-Python の playwright と Chromium 系のブラウザ（Chrome、Edge、playwright のもの）がある環境でだけ動く。無ければ、
-確かめなかったことをスキップの理由として結果に残す。ブラウザは CIRCUIT_SIM_CHROME で指定できる。
+Python の playwright と Chromium 系のブラウザ（Chrome、Edge、playwright のもの）がある環境でだけ動く。
+無ければ、確かめなかったことをスキップの理由として結果に残す。ブラウザは CIRCUIT_SIM_CHROME で指定できる。
 CIRCUIT_SIM_SHOTS にフォルダを指定すると、確かめた画面の画像をそこに残す（作業ツリーの外に置く）。
 アプリ本体は別のプロセス（python -m circuit_sim.app）で起動し、止めたり起動し直したりする。
 """
@@ -104,9 +104,8 @@ def browser():
 class Page:
     """1つの画面。外部への通信を記録し、終わりに1件も無いことを確かめる（AC-1-7）。"""
 
-    def __init__(self, browser, app: App, width=1280, height=720, lang="ja", theme="light", scale=1, reset=True):
-        if reset:
-            app.reset()
+    def __init__(self, browser, app: App, width=1280, height=720, lang="ja", theme="light", scale=1):
+        app.reset()
         self.app = app
         self.context = browser.new_context(
             viewport={"width": width, "height": height}, device_scale_factor=scale,
@@ -144,49 +143,8 @@ class Page:
         assert self.errors == [], f"画面のエラー: {self.errors}"
 
 
-# ページの中で、見えている文字の欠け・はみ出しと、文字のコントラストを測る（AC-1-1、AC-10-2、AC-10-4）
-MEASURE = r"""
-() => {
-  const parse = (c) => { const m = c.match(/rgba?\(([^)]+)\)/); if (!m) return null;
-    const v = m[1].split(/[ ,\/]+/).filter(Boolean).map(Number); return {r:v[0], g:v[1], b:v[2], a: v.length > 3 ? v[3] : 1}; };
-  const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
-  const lum = (c) => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-  const bgOf = (el) => {
-    const layers = [];
-    for (let e = el; e; e = e.parentElement) {
-      const c = parse(getComputedStyle(e).backgroundColor);
-      if (c && c.a > 0) { layers.push(c); if (c.a >= 1) break; }
-    }
-    let out = {r: 255, g: 255, b: 255};
-    for (const c of layers.reverse()) out = {r: c.r * c.a + out.r * (1 - c.a), g: c.g * c.a + out.g * (1 - c.a), b: c.b * c.a + out.b * (1 - c.a)};
-    return out;
-  };
-  const low = [], cut = [];
-  for (const el of document.querySelectorAll("body *")) {
-    const own = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
-    if (!own) continue;
-    const style = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    if (style.visibility === "hidden" || rect.width === 0 || rect.height === 0 || el.closest("[hidden]")) continue;
-    if (el.closest(".visually-hidden")) continue;
-    if (el.closest('[aria-disabled="true"]')) continue;   // 使えない操作の文字は基準の外（design-system 2.3）
-    const fg = parse(style.color), bg = bgOf(el);
-    const [a, b] = [lum(fg), lum(bg)].sort((x, y) => y - x);
-    const ratio = (a + 0.05) / (b + 0.05);
-    if (ratio < 4.5) low.push(`${el.className || el.tagName}: ${el.textContent.trim().slice(0, 30)} ${ratio.toFixed(2)}`);
-    if (el.scrollWidth > el.clientWidth + 1 && style.overflow !== "visible")
-      cut.push(`${el.className || el.tagName}: ${el.textContent.trim().slice(0, 30)}`);
-    if (rect.right > innerWidth + 0.5 || rect.left < -0.5) cut.push(`画面の外: ${el.textContent.trim().slice(0, 30)}`);
-  }
-  const header = document.querySelector("[data-testid=header]").getBoundingClientRect();
-  const parts = [...document.querySelectorAll("[data-testid=header] > *")].filter((e) => e.getBoundingClientRect().width > 0)
-    .map((e) => { const r = e.getBoundingClientRect(); return {name: e.dataset.testid || e.className, l: r.left, r: r.right, t: r.top, b: r.bottom}; });
-  const overlaps = [];
-  for (let i = 1; i < parts.length; i++) if (parts[i].l < parts[i - 1].r - 0.5) overlaps.push(`${parts[i - 1].name} / ${parts[i].name}`);
-  const outside = parts.filter((p) => p.t < header.top - 0.5 || p.b > header.bottom + 0.5 || p.r > header.right + 0.5).map((p) => p.name);
-  return {low, cut, overlaps, outside, headerHeight: header.height};
-}
-"""
+# ページの中で、文字の欠け・はみ出し、コントラスト、ヘッダーの重なりを測る（AC-1-1、AC-10-2、AC-10-4）
+MEASURE = (ROOT / "tests" / "data" / "measure_layout.js").read_text(encoding="utf-8")
 
 
 def check_layout(page, where: str) -> None:
@@ -201,7 +159,7 @@ def check_layout(page, where: str) -> None:
 
 @pytest.mark.parametrize(("width", "height", "lang", "theme"), COMBOS, ids=lambda v: str(v))
 def test_eight_combinations_start_and_frame(browser, app, width, height, lang, theme):
-    """AC-1-1、AC-10-2（A0 の領域）、AC-10-4: 8通りで、起動直後と、仕様を開いた枠の文字が欠けず重ならず、読める。"""
+    """AC-1-1、AC-10-2（A0 の領域）、AC-10-4: 8通りで、起動直後と仕様を開いた枠の文字が読める。"""
     p = Page(browser, app, width, height, lang, theme)
     page = p.open()
     assert page.evaluate("document.documentElement.lang") == lang
@@ -240,7 +198,10 @@ def test_start_screen_appears_within_one_second(browser, app):
 
 
 def test_tab_order_in_header_and_visible_focus(browser, app):
-    """AC-1-5（A0 の範囲）: Tab でヘッダーの順（開く → サンプル → 保存 → 実行 → 言語 → テーマ）に回り、輪が見える。"""
+    """AC-1-5（A0 の範囲）: Tab がヘッダーの順（開く → サンプル → 保存 → 実行 → 言語 → テーマ）に回る。
+
+    フォーカスの輪が見える。
+    """
     p = Page(browser, app)
     page = p.open()
     page.click("[data-testid=header-app]")  # 順番を数え始める位置を、ページの先頭（アプリ名）に置く
@@ -262,7 +223,10 @@ def test_tab_order_in_header_and_visible_focus(browser, app):
 
 
 def test_samples_loading_and_error_states(browser, app):
-    """3.3 と AC-3-5: 一覧が遅いと「読み込んでいます」、取れないと「読み込めませんでした」と「もう一度」。開く操作は使える。"""
+    """3.3 と AC-3-5: 一覧が遅いと「読み込んでいます」、取れないと「読み込めませんでした」と「もう一度」。
+
+    一覧が取れなくても、ファイルを開く操作は使える。
+    """
     p = Page(browser, app)
     page = p.page
     page.route("**/api/samples", lambda route: route.abort())
@@ -272,7 +236,8 @@ def test_samples_loading_and_error_states(browser, app):
     p.shot("start-samples-error-ja-light")
     page.unroute("**/api/samples")
     held = []
-    page.route("**/api/samples", lambda route: held.append(route))  # 応答を止めておき、読み込み中を確かめてから流す
+    # 応答を止めておき、読み込み中の表示を確かめてから流す
+    page.route("**/api/samples", lambda route: held.append(route))
     page.click("text=もう一度")
     page.wait_for_selector("[data-testid=samples-loading]")
     assert page.inner_text("[data-testid=samples-loading]") == "サンプルを読み込んでいます…"
@@ -329,13 +294,17 @@ def test_open_errors_on_start_screen_and_in_notices(browser, app, tmp_path):
     page.set_input_files("[data-testid=file-input]", str(bad))
     row = page.wait_for_selector("[data-testid=notice-row][data-code=N-OPEN-SYNTAX]")
     assert "broken.json" in row.inner_text()
-    assert "bom.json" in page.inner_text("[data-testid=header-file]"), "開けなかったのに、開いていた仕様が変わった"
+    header = page.inner_text("[data-testid=header-file]")
+    assert "bom.json" in header, "開けなかったのに、開いていた仕様が変わった"
     p.shot("frame-notice-error-ja-light")
     p.close()
 
 
 def test_notices_keyboard_and_language_switch(browser, app, tmp_path):
-    """AC-9-7、AC-10-1、AC-10-5、AC-10-8: キーボードで帯を操作し、言語の切り替えで出ている文も変わる。再読み込みしない。"""
+    """AC-9-7、AC-10-1、AC-10-5、AC-10-8: キーボードで帯を操作できる。
+
+    言語の切り替えで、出ているお知らせの文も変わり、再読み込みは起きない。
+    """
     bad = tmp_path / "broken.json"
     bad.write_text("{", encoding="utf-8")
     p = Page(browser, app, theme="dark")
@@ -383,11 +352,13 @@ def test_notices_keyboard_and_language_switch(browser, app, tmp_path):
 
 
 def test_no_light_flash_when_dark_is_chosen(browser, app):
-    """AC-10-7: 暗いテーマを選んだ状態で再読み込みしても、明るいテーマが一瞬も出ない（本文より先にテーマが当たる）。"""
+    """AC-10-7: 暗いテーマで再読み込みしても、明るいテーマが一瞬も出ない（本文より先にテーマが当たる）。"""
     p = Page(browser, app, theme="dark")
     p.context.add_init_script(
         """new MutationObserver((list, obs) => {
-             if (document.body) { window.__themeAtBody = document.documentElement.dataset.theme; obs.disconnect(); }
+             if (!document.body) return;
+             window.__themeAtBody = document.documentElement.dataset.theme;
+             obs.disconnect();
            }).observe(document, {childList: true, subtree: true});"""
     )
     page = p.open()
@@ -404,7 +375,8 @@ def test_layout_is_remembered_after_reload(browser, app):
     page = p.open()
     page.click("[data-testid=sample-rlc_series]")
     page.wait_for_selector("[data-testid=frame]")
-    width = lambda: page.evaluate("document.querySelector('[data-testid=spec-panel]').getBoundingClientRect().width")  # noqa: E731
+    panel = "document.querySelector('[data-testid=spec-panel]')"
+    width = lambda: page.evaluate(f"{panel}.getBoundingClientRect().width")  # noqa: E731
     assert width() == 360
     page.focus("[data-testid=splitter-spec]")
     page.keyboard.press("ArrowRight")
@@ -422,7 +394,10 @@ def test_layout_is_remembered_after_reload(browser, app):
 
 
 def test_disconnect_banner_and_restart(browser, app):
-    """AC-1-3、D8: アプリ本体を止めると 5秒以内に帯が出る。起動し直すと 5秒以内に消え、開いていた仕様が残る。"""
+    """AC-1-3、D8: アプリ本体を止めると 5秒以内に帯が出る。
+
+    起動し直すと 5秒以内に帯が消え、開いていた仕様が残る。
+    """
     p = Page(browser, app)
     page = p.open()
     page.click("[data-testid=sample-rlc_series]")

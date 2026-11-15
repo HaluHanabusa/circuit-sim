@@ -1,7 +1,7 @@
 """画面仕様（docs/design/screens-v0.1.md）の文言の表から、日英の辞書を作る・照らし合わせる。
 
 画面の文言の出どころは画面仕様の表だけにする（表に無い文字列を画面に出さない。0.2）。
-  python frontend/tools/strings_from_spec.py --write   表から辞書（frontend/src/i18n/ja.json、en.json）を書き直す
+  python frontend/tools/strings_from_spec.py --write   表から辞書（src/i18n/ の ja.json、en.json）を作る
   python frontend/tools/strings_from_spec.py           表と辞書が食い違っていないかを確かめる（0 = 一致）
 
 読む表は2種類。
@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 

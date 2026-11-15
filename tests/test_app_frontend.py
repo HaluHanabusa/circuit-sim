@@ -27,7 +27,7 @@ TEXT_SUFFIXES = {".html", ".js", ".css", ".json", ".svg"}
 def node() -> str:
     found = shutil.which("node")
     if not found:
-        pytest.skip("Node.js が無いので、画面のビルド結果とソースの食い違い・部品の試験を確かめなかった（D-041）")
+        pytest.skip("Node.js が無いので、画面のビルド結果とソースの食い違いと、部品の試験を確かめなかった")
     if not (FRONTEND / "node_modules" / "vite").is_dir():
         pytest.skip("frontend/node_modules が無いので、画面のビルドと部品の試験を確かめなかった"
                     "（cd frontend && npm ci で入れると確かめる）")
@@ -58,12 +58,15 @@ def files(base: Path) -> dict[str, bytes]:
 def test_bundled_build_matches_the_source(tmp_path):
     run_node("node_modules/typescript/bin/tsc", "--noEmit", "-p", ".")
     out = tmp_path / "static"
-    run_node("node_modules/vite/bin/vite.js", "build", "--outDir", str(out), "--emptyOutDir", "--logLevel", "warn")
+    vite = "node_modules/vite/bin/vite.js"
+    run_node(vite, "build", "--outDir", str(out), "--emptyOutDir", "--logLevel=warn")
     built, bundled = files(out), files(STATIC)
-    assert sorted(built) == sorted(bundled), "ビルド結果のファイルが違う。cd frontend && npm run build で作り直す"
+    rebuild = "cd frontend && npm run build で作り直す"
+    assert sorted(built) == sorted(bundled), f"ビルド結果のファイルの組が違う。{rebuild}"
     for name, data in built.items():
-        assert bundled[name] == data, f"{name} がソースと違う。cd frontend && npm run build で作り直す"
+        assert bundled[name] == data, f"{name} がソースと違う。{rebuild}"
 
 
 def test_component_tests_pass():
-    run_node("node_modules/vitest/vitest.mjs", "run", "--reporter=dot")  # 失敗が1件でもあれば終了コードが 0 でない
+    # 失敗が1件でもあれば、終了コードが 0 でない
+    run_node("node_modules/vitest/vitest.mjs", "run", "--reporter=dot")

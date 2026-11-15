@@ -21,8 +21,8 @@ EN = json.loads((I18N / "en.json").read_text(encoding="utf-8"))
 JAPANESE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
 # 日英で同じ文言でよいもの（記号、名前、差し込むだけのもの。10.4 の「変わらない」もの）
 SAME_IN_BOTH = {
-    "app.name", "lang.ja", "lang.en", "notice.count", "num.interp", "schem.source.step", "schem.source.step.t",
-    "scope.compare.diff.item", "scope.csv", "scope.table.delta",
+    "app.name", "lang.ja", "lang.en", "notice.count", "num.interp", "schem.source.step",
+    "schem.source.step.t", "scope.compare.diff.item", "scope.csv", "scope.table.delta",
 }
 
 
@@ -80,7 +80,7 @@ def test_every_notice_has_what_and_fix():
 
 @pytest.mark.parametrize("path", sources(".ts", ".tsx"), ids=lambda p: p.relative_to(SRC).as_posix())
 def test_no_hard_coded_screen_text(path: Path):
-    """design-system 10章の5: 画面の文字列は辞書から引く（コードに日本語の文字列も、画面に出す英語の文も無い）。"""
+    """design-system 10章の5: 画面の文字列は辞書から引く（コードに日本語の文字列も、英語の文も無い）。"""
     code = without_comments(path.read_text(encoding="utf-8"))
     assert not JAPANESE.search(code), JAPANESE.search(code)
     if path.suffix == ".tsx":
@@ -106,7 +106,8 @@ COLOR = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklc
 
 @pytest.mark.parametrize(
     "path",
-    [p for p in sources(".ts", ".tsx", ".css") if p.name != "tokens.css"] + [ROOT / "frontend" / "index.html"],
+    [p for p in sources(".ts", ".tsx", ".css") if p.name != "tokens.css"]
+    + [ROOT / "frontend" / "index.html"],
     ids=lambda p: p.name,
 )
 def test_no_hard_coded_colors(path: Path):
