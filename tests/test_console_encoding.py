@@ -95,3 +95,16 @@ def test_spec_saved_with_a_byte_order_mark_is_read(tmp_path, capsys):
     spec.write_bytes(b"\xef\xbb\xbf" + (ROOT / EXAMPLE).read_bytes())
     assert cli_main([str(spec)]) == 0
     assert "テンプレート: rlc_series" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("encoding", ["cp932", "ascii"])
+def test_benchmark_does_not_crash_on_a_terminal_that_cannot_show_the_text(encoding):
+    """速さの測定（benchmarks/bench_switching.py）も、UTF-8 でない端末で落ちない（µ が cp932 で落ちた）"""
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, str(root / "benchmarks" / "bench_switching.py"), "20"],
+        capture_output=True, cwd=root,
+        env={**os.environ, "PYTHONIOENCODING": encoding, "PYTHONPATH": str(root)}, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr.decode(encoding, errors="replace")
+    assert "ステップ数 20".encode(encoding, errors="replace") in proc.stdout

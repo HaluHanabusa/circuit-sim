@@ -67,6 +67,11 @@ def best_of(fn, repeat: int = 3) -> float:
 
 
 def main() -> None:
+    # 画面に出せない文字（UTF-8 でない端末）は置き換えて出す（cp932 の端末で落ちないように）
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
     n_steps = int(sys.argv[1]) if len(sys.argv) > 1 else 200_000
     h = 1.0 / (FSW * DIVISIONS)
     t_end = n_steps * h
@@ -82,7 +87,7 @@ def main() -> None:
     print(f"ステップ数 {n_steps}（3回のうち最も速い値）")
     for name, fn in cases:
         seconds = best_of(fn)
-        print(f"  {name}: {seconds:.3f} s（1ステップあたり {seconds / n_steps * 1e6:.2f} µs）")
+        print(f"  {name}: {seconds:.3f} s（1ステップあたり {seconds / n_steps * 1e6:.2f} マイクロ秒）")
 
 
 if __name__ == "__main__":

@@ -47,7 +47,6 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -56,13 +55,19 @@ LIST_FILE = "scripts/mutants.toml"
 TARGETS = ("scripts/cycle.py", "scripts/doctor.py", "scripts/local_ci.py")
 # 道具の試験。壊し方ごとに、ここから選んで流す
 TOOL_TESTS = (
-    "tests/test_harness.py", "tests/test_dev_tools.py", "tests/test_local_ci.py", "tests/test_claude_guard.py",
+    "tests/test_harness.py", "tests/test_dev_tools.py", "tests/test_local_ci.py",
+    "tests/test_claude_guard.py",
     "tests/test_stop_posix.py", "tests/test_console_encoding.py", "tests/test_error_dialogs.py",
     "tests/acceptance/test_w1_recheck.py", "tests/acceptance/test_w1_windows.py",
     "tests/acceptance/test_w2_local_ci_gate.py",
 )
 STATE_DIR = ".cycle/mutants"
 MARK_VAR = "CIRCUIT_SIM_MUTANT_RUN"     # この回が起動したプロセスの印（後始末で探す）
+# 試験の入れ子を止める印（tests/conftest.py）。この道具は試験の外から写しを流すので、引き継がない
+NESTED_VAR = "CIRCUIT_SIM_PYTEST_RUNNING"
+# pytest の終了コード: 1 = 失敗した試験がある、2 = 集める途中で止まった（壊した道具を読み込めない、など）、
+# 71 = 見張り役の claude が起動された（tests/conftest.py）。どれも、壊れたことに試験が気づいた
+KILLED_CODES = {1: "failed", 2: "collection", 71: "sentinel"}
 COVER_VAR = "CIRCUIT_SIM_MUTANT_COVER"  # 通った行を書く場所（壊す前の試験のときだけ）
 SELECT_VAR = "CIRCUIT_SIM_MUTANT_SELECT"  # 流す試験の一覧のファイル
 RUN_TIMEOUT = 900                        # 1回の試験の上限（秒）。超えたら「止まった」として落ちた扱い
@@ -251,9 +256,10 @@ class Generator(ast.NodeVisitor):
         value = node.value
         if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Set | ast.Tuple):
             value = value.args[0]                               # frozenset({...})
-        if not self.scope and names and names[0].isupper() and isinstance(value, ast.Tuple | ast.List | ast.Set):
+        listing = isinstance(value, ast.Tuple | ast.List | ast.Set)
+        if not self.scope and names and names[0].isupper() and listing:
             items = value.elts
-            strings = [item for item in items if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+            strings = [item for item in items if isinstance(item, ast.Constant) and type(item.value) is str]
             if len(items) >= 2 and len(strings) == len(items):
                 for index, item in enumerate(items):
                     start, _ = self.span(item)
@@ -314,12 +320,12 @@ def mutated_text(root: Path, mutant: Mutant) -> str:
 # ------------------------------------------------------------------ 通った行の記録
 
 # 試験が起動する Python の子プロセスでも、通った行を記録する（PYTHONPATH に置く）
-SITECUSTOMIZE = '''\
+SITECUSTOMIZE = f'''\
 import atexit, json, os, sys, time
-_out = os.environ.get("{cover}")
+_out = os.environ.get("{COVER_VAR}")
 LINES = set()
 if _out and hasattr(sys, "monitoring"):
-    _targets = set(json.loads(os.environ["{cover}_TARGETS"]))
+    _targets = set(json.loads(os.environ["{COVER_VAR}_TARGETS"]))
     _tool = 4
     _start = time.time()
 
@@ -342,16 +348,16 @@ if _out and hasattr(sys, "monitoring"):
             json.dump({{"start": _start, "lines": sorted(LINES)}}, handle)
 
     atexit.register(_save)
-'''.format(cover=COVER_VAR)
+'''
 
 # pytest に読ませる差し込み。壊す前の試験では、試験ごとに通った行と時間を書く。
 # 壊した後の試験では、流す試験を選び、並べ替える。
-PLUGIN = '''\
+PLUGIN = f'''\
 import json, os, time
 import pytest
 
-SELECT = os.environ.get("{select}")
-COVER = os.environ.get("{cover}")
+SELECT = os.environ.get("{SELECT_VAR}")
+COVER = os.environ.get("{COVER_VAR}")
 RECORD = []
 
 
@@ -384,7 +390,7 @@ def pytest_sessionfinish(session, exitstatus):
     if COVER:
         with open(os.path.join(COVER, "main.json"), "w", encoding="utf-8") as handle:
             json.dump(RECORD, handle)
-'''.format(select=SELECT_VAR, cover=COVER_VAR)
+'''
 
 
 def helper_dir(base: Path) -> Path:
@@ -458,7 +464,7 @@ def run_tests(
     token = uuid.uuid4().hex
     env = {
         key: value for key, value in os.environ.items()
-        if not key.startswith(("PYTEST_", COVER_VAR, SELECT_VAR))
+        if not key.startswith(("PYTEST_", COVER_VAR, SELECT_VAR, NESTED_VAR))
     }
     env.update({
         MARK_VAR: token, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
@@ -485,7 +491,8 @@ def run_tests(
             output.close()
     try:
         code = proc.wait(timeout=timeout)
-        outcome = "passed" if code == 0 else "failed"
+        # 0 = 通った。KILLED_CODES = 落ちた。それ以外（試験が無い、入れ子など）は、結果を得られなかった
+        outcome = "passed" if code == 0 else KILLED_CODES.get(code, f"error-{code}")
     except subprocess.TimeoutExpired:
         outcome = "timeout"
         if os.name == "nt":
@@ -526,7 +533,7 @@ def baseline(root: Path, work: Path, helpers: Path, tests: list[str]) -> dict:
     if outcome != "passed":
         tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
         print("\n".join(tail))
-        raise SystemExit(f"壊す前の試験が通らない（{outcome}。出力は {STATE_DIR}/baseline.log）。先に試験を通す")
+        raise SystemExit(f"壊す前の試験が通らない（{outcome}。出力は {STATE_DIR}/baseline.log）")
     records = json.loads((cover / "main.json").read_text(encoding="utf-8"))
     children = [json.loads(path.read_text(encoding="utf-8")) for path in cover.glob("*-*.json")]
     prefix = str(copy.resolve()) + os.sep
@@ -585,7 +592,7 @@ def run_one(
             total, leftovers = total + seconds, leftovers + left
     finally:
         target.write_bytes(original)
-    status = {"passed": "survived", "failed": "killed", "timeout": "killed"}[outcome]
+    status = "survived" if outcome == "passed" else "error" if outcome.startswith("error") else "killed"
     return {
         "id": mutant.id, "status": status, "how": outcome, "stage": stage, "seconds": round(total, 1),
         "leftovers": leftovers,
@@ -626,7 +633,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         mutants = mutants[::step][:args.sample]
     tests = list(args.tests or [t for t in TOOL_TESTS if (root / t).is_file()])
     if not can_find_leftovers():
-        print("注意: このOSでは、試験が残したプロセスを探せない（Linux の /proc が要る）。残っていたら手で止める")
+        print("注意: このOSでは、試験が残したプロセスを探せない（/proc が要る）。残っていたら手で止める")
     with tempfile.TemporaryDirectory(prefix="circuit-sim-mutants-") as tmp:
         work = Path(tmp)
         helpers = helper_dir(work)
@@ -656,6 +663,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 elif done % 25 == 0:
                     print(f"[{done}/{len(mutants)}] …", flush=True)
     survived = [r for r in results if r["status"] == "survived"]
+    errors = [r["id"] for r in results if r["status"] == "error"]
     unexpected = [r for r in survived if r["id"] not in equivalent]
     killed_listed = [r["id"] for r in results if r["status"] == "killed" and r["id"] in equivalent]
     summary = {
@@ -663,7 +671,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "count": len(results), "killed": sum(r["status"] == "killed" for r in results),
         "survived": [r["id"] for r in survived], "unexpected": [r["id"] for r in unexpected],
         "invalid": [r["id"] for r in results if r["status"] == "invalid"],
-        "equivalent_but_killed": killed_listed, "leftovers_stopped": sum(r["leftovers"] for r in results),
+        "equivalent_but_killed": killed_listed, "errors": errors,
+        "leftovers_stopped": sum(r["leftovers"] for r in results),
         "seconds": round(time.monotonic() - started, 1), "stale_equivalent": stale, "results": results,
     }
     out = root / STATE_DIR / f"result-{time.strftime('%Y%m%dT%H%M%S')}.json"
@@ -671,15 +680,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
     print(
         f"{summary['count']} 通り: 落ちた {summary['killed']}、生き残り {len(survived)}"
-        f"（一覧に無いもの {len(unexpected)}）、作れなかった {len(summary['invalid'])}、"
+        f"（一覧に無いもの {len(unexpected)}）、結果を得られなかった {len(errors)}、"
+        f"作れなかった {len(summary['invalid'])}、"
         f"後で止めた残りのプロセス {summary['leftovers_stopped']}、{summary['seconds']} 秒"
     )
     if killed_listed:
         print(f"同値として一覧にあるが、落ちたもの（一覧から外す）: {', '.join(killed_listed)}")
     if stale:
         print(f"一覧の同値のうち、もう無い番号（一覧から外す）: {', '.join(stale)}")
+    if errors:
+        print(f"結果を得られなかったもの（生き残りと同じに扱う）: {', '.join(errors)}")
     print(f"記録: {out.relative_to(root).as_posix()}")
-    return 1 if unexpected else 0
+    return 1 if unexpected or errors else 0
 
 
 def main(argv: list[str] | None = None) -> int:

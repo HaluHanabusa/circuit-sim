@@ -690,7 +690,9 @@ def test_exception_paths_take_only_test_files_and_records(repo):
         "tests/acceptance/conftest.py", "tests/acceptance/data.json", "tests/acceptance/pytest.ini",
         "tests/acceptance/sub/conftest.py", "tests/acceptance/test_x.py.bak",
     ]
-    allowed = ["docs/verification/sub/U1-2.md", "tests/acceptance/sub/test_more.py", "tests/acceptance/test_u1.py"]
+    allowed = [
+        "docs/verification/sub/U1-2.md", "tests/acceptance/sub/test_more.py", "tests/acceptance/test_u1.py",
+    ]
     for path in [*refused, *allowed]:
         (wt / path).parent.mkdir(parents=True, exist_ok=True)
         (wt / path).write_text("\n", encoding="utf-8")
@@ -1367,7 +1369,7 @@ def test_claude_inside_the_worktree_or_the_main_checkout_is_not_used(repo, tmp_p
 
 
 def test_link_on_path_that_leads_inside_the_worktree_is_not_used(repo, tmp_path):
-    """PATH の場所が使ってよい所でも、そこにあるリンクの先が作業ツリーの中なら、使わない（ファイルの実体を見る）。"""
+    """PATH の場所が使ってよい所でも、そこにあるリンクの先が作業ツリーの中なら使わない。"""
     wt = implement(repo)
     planted = wt / "node_modules" / ".bin"
     install_claude(planted, headless(session="planted"))
@@ -1386,7 +1388,8 @@ def test_git_inside_the_main_checkout_is_not_started(repo, tmp_path):
     planted = repo / "tools" / "bin"
     planted.mkdir(parents=True)
     marker = tmp_path / "planted-git-ran"
-    install_command(planted, "git", f"import pathlib\npathlib.Path({str(marker)!r}).touch()\nraise SystemExit(1)\n")
+    source = f"import pathlib\npathlib.Path({str(marker)!r}).touch()\nraise SystemExit(1)\n"
+    install_command(planted, "git", source)
     env = {"PATH": f"{planted}{os.pathsep}{os.environ[SAFE_PATH_VAR]}"}       # 見張り役を含まない PATH
     assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == expected
     assert not marker.exists()
@@ -1396,7 +1399,8 @@ def test_git_inside_the_main_checkout_is_not_started(repo, tmp_path):
 
 
 def test_commands_started_by_the_harness_are_told_not_to_search_the_place_of_execution(repo, tmp_path):
-    """Windows の cmd.exe は、名前だけのコマンド（claude.cmd の中の node）を、PATH より先に実行した場所で探す。
+    """Windows の cmd.exe は、名前だけのコマンド（claude.cmd の中の node）を、PATH より先に、実行した場所で
+    探す。
 
     NoDefaultCurrentDirectoryInExePath があると探さない。起動する claude（と、その先）に引き継ぐ。
     """
@@ -1406,7 +1410,8 @@ def test_commands_started_by_the_harness_are_told_not_to_search_the_place_of_exe
         "import os\n"
         f"pathlib.Path({str(seen)!r}).write_text(os.environ.get('NoDefaultCurrentDirectoryInExePath', '-'))"
     )
-    assert cycle(repo, "run", "U1", "review", env=fake_claude(tmp_path, headless(), script=script)).returncode == 0
+    env = fake_claude(tmp_path, headless(), script=script)
+    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
     assert seen.read_text() == "1"
 
 
@@ -2209,7 +2214,8 @@ def test_recovery_leaves_main_alone_when_it_changed_after_the_kill(repo, tmp_pat
     assert result.returncode == 1
     assert "前回の U1 の統合が途中で終わっているが" in result.stdout
     pending = json.loads((repo / ".cycle" / "merge-pending.json").read_text(encoding="utf-8"))
-    assert f"取り込み前のコミット {pending['before']}、取り込もうとしたコミット {pending['head']}" in result.stdout
+    expected = f"取り込み前のコミット {pending['before']}、取り込もうとしたコミット {pending['head']}"
+    assert expected in result.stdout
     assert sh(repo, "git", "for-each-ref") == refs                 # 人が確かめるまで、何も動かさない
     assert sh(repo, "git", "status", "--porcelain") == files
     assert (repo / ".cycle" / "merge-pending.json").exists()
@@ -2462,7 +2468,7 @@ def record_ci(root: Path, result: object) -> subprocess.CompletedProcess:
     書き方は、scripts/local_ci.py と同じ（字下げつき、最後に改行）。
     """
     path = root.parent / "result.json"
-    if isinstance(result, dict) and result.get("commit") == "c" * 40:   # 確かめたコミットは、作業ツリーの HEAD
+    if isinstance(result, dict) and result.get("commit") == "c" * 40:   # 確かめたコミットは、HEAD
         result = {**result, "commit": sh(root.parent / "wt" / "U1", "git", "rev-parse", "HEAD")}
     if not isinstance(result, str | bytes):
         result = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
@@ -2770,7 +2776,10 @@ def test_needs_windows_cannot_be_dropped_once_records_exist(repo):
 
 @pytest.mark.parametrize("extra, added", [("needs_windows: true\n", "windows"), ("needs_ux: true\n", "ux")])
 def test_header_that_only_adds_gates_keeps_the_records(repo, extra, added):
-    """必要なゲートが増えるだけの見出しの変更は、記録を残したまま start で取り込める。統合は増えたゲートを待つ。"""
+    """必要なゲートが増えるだけの見出しの変更は、記録を残したまま start で取り込める。
+
+    統合は増えたゲートを待つ。
+    """
     wt = implement(repo)
     pass_all(repo)
     commit(wt)

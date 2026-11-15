@@ -15,9 +15,11 @@
    - 見張り役: 取り除いた後の PATH の末尾に、見張り役の claude を置く。起動されたら記録を残して 0 でない
      終了コードで終わる。試験のセッションの終わりに、一度でも起動されていたら、全体を失敗にする
      （終了コード SENTINEL_EXIT_CODE。どの試験の間に起動されたかを表示する）。
-   - 取り除いた場所にしか git が無い場合（Homebrew の bin など）は、git へのリンクを別の場所に置いて残す。
-     リンクを作れない Windows では、試験を始めずに止める。
+   - claude があるので取り除いた場所（Linux の /usr/bin、Homebrew の bin など）は、claude 以外の中身への
+     リンクを並べた場所に置き換える（同じ場所にある git、bash などが消えないように）。
+     リンクを作れない Windows では、取り除くだけにし、そこにしか git が無ければ、試験を始めずに止める。
    - セッションの始めに、取り除いた場所（理由つき）と、リンクで残した道具を表示する（原因を追えるように）。
+   - 見張り役を起動できない（一時フォルダが実行不可）なら、理由を表示して、試験を始めずに止める。
 
 3. Windows で、OSのエラー画面（「サポートされていない 16 ビット アプリケーション」など。人が OK を押すまで
    止まる）を出させない。試験のプロセスに設定し、起動する子プロセスに引き継がれる。scripts/cycle.py の
@@ -28,6 +30,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -44,6 +47,8 @@ SAFE_PATH_VAR = "CIRCUIT_SIM_SAFE_PATH"
 SENTINEL_EXIT_CODE = 71         # 見張り役が起動された試験のセッションの終了コード
 SENTINEL_RETURNCODE = 97        # 見張り役そのものの終了コード
 SENTINEL_LOG = "started.log"
+# 見張り役を、記録を残さずに起動できるかだけを確かめるときの印（セッションの始めに1回）
+SENTINEL_PROBE_VAR = "CIRCUIT_SIM_SENTINEL_PROBE"
 # claude として起動されうる拡張子（PATHEXT に無くても数える。npm は claude、claude.cmd、claude.ps1 を置く）
 CLAUDE_SUFFIXES = ("", ".exe", ".cmd", ".bat", ".com", ".ps1")
 # 取り除いた場所にしか無ければ、リンクで残す道具（試験が名前で起動するもの。Python は sys.executable）
@@ -113,40 +118,46 @@ def guard_report(path: str, pathext: str | None, tools: Path) -> list[str]:
     names = claude_names(pathext)
     removed = [(entry, removal_reason(entry, names)) for entry in path.split(os.pathsep)]
     lines = [f"  PATH から外した場所: {shown_place(entry)}（{why}）" for entry, why in removed if why]
-    links = sorted(tools.iterdir()) if tools.is_dir() else []
-    lines += [f"  リンクで残した道具: {link.name} → {shown_place(os.readlink(link))}" for link in links]
+    for shadow in sorted(tools.iterdir()) if tools.is_dir() else []:
+        links = sorted(link.name for link in shadow.iterdir())
+        origin = shown_place(str(Path(os.readlink(shadow / links[0])).parent)) if links else "?"
+        more = f" ほか {len(links) - 8} 個" if len(links) > 8 else ""
+        lines.append(f"  リンクで残した道具（{origin} の claude 以外）: {'、'.join(links[:8])}{more}")
     return [
         "試験の遮断（本物の claude を起動しないため。tests/conftest.py）:",
         *(lines or ["  PATH から外した場所: なし"]),
     ]
 
 
-def keep_lost_tools(before: list[str], kept: list[str], place: Path) -> list[str]:
-    """取り除いた場所にしか無い道具（KEPT_TOOLS）を、place に置いたリンクで残す。足す PATH の項目を返す。"""
+def link_all_but_claude(entry: str, names: frozenset[str], shadow: Path) -> None:
+    """entry の中身のうち、claude として起動されうるもの以外へのリンクを、shadow に並べる。"""
+    shadow.mkdir(parents=True, exist_ok=True)
+    for name in sorted(os.listdir(entry)):
+        if name.lower() not in names:
+            os.symlink(os.path.join(entry, name), shadow / name)
+
+
+def check_lost_tools(before: list[str], kept: list[str]) -> None:
+    """取り除いた場所にしか無い道具（KEPT_TOOLS）があれば、遮断を組まずに止める。Windows 用"""
     lost = {}
     for tool in KEPT_TOOLS:
         found = shutil.which(tool, path=os.pathsep.join(before))
         if found and not shutil.which(tool, path=os.pathsep.join(kept)):
             lost[tool] = found
-    if not lost:
-        return []
-    if WINDOWS:
+    if lost:
         places = "、".join(str(Path(found).parent) for found in lost.values())
         raise GuardError(
             f"{'、'.join(lost)} が、claude と同じ場所（{places}）にしか無い。"
             "その場所を PATH から外すと見つからなくなるので、試験を始めない。"
             "別の場所に入れてから実行する"
         )
-    place.mkdir(parents=True, exist_ok=True)
-    for tool, found in lost.items():
-        os.symlink(found, place / tool)
-    return [str(place)]
 
 
 # 見張り役。起動されたら、記録の1行（試験の名前が分かれば、その名前と、実行した場所）を足して、失敗で終わる
 SENTINEL_SH = """\
 #!/bin/sh
 # 試験の見張り役（tests/conftest.py）。本物の claude の代わりに、PATH の末尾に置いてある
+[ -n "${{{probe}-}}" ] && exit 0
 printf '%s\\t%s\\n' "${{PYTEST_CURRENT_TEST-}}" "$(pwd)" >> {log}
 exit {code}
 """
@@ -154,6 +165,7 @@ exit {code}
 SENTINEL_CMD = """\
 @echo off
 rem 試験の見張り役（tests/conftest.py）。本物の claude の代わりに、PATH の末尾に置いてある
+if defined {probe} exit /b 0
 >>"%~dp0{log}" echo claude-sentinel
 exit /b {code}
 """
@@ -168,25 +180,62 @@ def install_sentinel(directory: Path, windows: bool = WINDOWS) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     log = directory / SENTINEL_LOG
     if windows:
-        body = SENTINEL_CMD.format(log=SENTINEL_LOG, code=SENTINEL_RETURNCODE).replace("\n", "\r\n")
+        body = SENTINEL_CMD.format(log=SENTINEL_LOG, code=SENTINEL_RETURNCODE, probe=SENTINEL_PROBE_VAR)
+        body = body.replace("\n", "\r\n")
         for name in ("claude.cmd", "claude.bat"):
             (directory / name).write_bytes(body.encode("ascii", errors="replace"))
     else:
         command = directory / "claude"
-        body = SENTINEL_SH.format(log=shlex.quote(str(log)), code=SENTINEL_RETURNCODE)
+        quoted = shlex.quote(str(log))
+        body = SENTINEL_SH.format(log=quoted, code=SENTINEL_RETURNCODE, probe=SENTINEL_PROBE_VAR)
         command.write_text(body, encoding="utf-8")
         command.chmod(0o755)
     return log
 
 
 def guard_path(path: str, pathext: str | None, place: Path, windows: bool = WINDOWS) -> tuple[str, str]:
-    """（claude の無い PATH、その末尾に見張り役を置いた PATH）を組む。見張り役と道具のリンクは place の中。"""
-    before = [entry for entry in path.split(os.pathsep) if os.path.isabs(entry)]
-    kept = without_claude(path, pathext)
-    safe = os.pathsep.join([*kept, *keep_lost_tools(before, kept, place / "tools")])
+    """（claude の無い PATH、その末尾に見張り役を置いた PATH）を組む。見張り役と道具のリンクは place の中。
+
+    claude があるので取り除いた場所は、リンクを作れるOSでは、claude 以外の中身へのリンクを並べた場所
+    （place/tools/<番号>）に、同じ順番のまま置き換える。
+    """
+    names = claude_names(pathext)
+    entries = path.split(os.pathsep)
+    kept = []
+    for index, entry in enumerate(entries):
+        if removal_reason(entry, names) is None:
+            kept.append(entry)
+        elif not windows and os.path.isabs(entry) and claude_files(entry, names):
+            shadow = place / "tools" / str(index)
+            link_all_but_claude(entry, names, shadow)
+            kept.append(str(shadow))
+    if windows:
+        check_lost_tools([entry for entry in entries if os.path.isabs(entry)], kept)
+    safe = os.pathsep.join(kept)
     sentinel = place / "sentinel"
     install_sentinel(sentinel, windows)
     return safe, os.pathsep.join(filter(None, [safe, str(sentinel)]))
+
+
+def sentinel_starts(directory: Path) -> bool:
+    """見張り役を起動できるか（記録は残さない）。一時フォルダが実行不可だと、起動できない。"""
+    command = directory / ("claude.cmd" if WINDOWS else "claude")
+    try:
+        proc = subprocess.run(
+            [str(command)], env={**os.environ, SENTINEL_PROBE_VAR: "1"}, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def called_tests(recorded: list[str], calls: list[str]) -> list[str]:
+    """見張り役を起動した試験の名前。並列実行（pytest-xdist）の子で起動されると、このセッションは控えられないので、
+    見張り役の記録（PYTEST_CURRENT_TEST）から取る。"""
+    if recorded:
+        return recorded
+    named = sorted({line.split("\t")[0].rsplit(" (", 1)[0] for line in calls if line.split("\t")[0]})
+    return [f"{name}（見張り役の記録から）" for name in named] or ["（試験の外。どの試験か分からない）"]
 
 
 def sentinel_calls(log: Path) -> list[str]:
@@ -221,6 +270,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     except GuardError as exc:
         shutil.rmtree(place, ignore_errors=True)
         pytest.exit(str(exc), returncode=SENTINEL_EXIT_CODE)
+    if not sentinel_starts(place / "sentinel"):
+        shutil.rmtree(place, ignore_errors=True)
+        pytest.exit(
+            f"見張り役の claude を、一時フォルダ（{shown_place(str(place))}）で起動できない"
+            "（実行できない場所の可能性）。見張り役が動かないと、本物の claude に届く試験を"
+            "見つけられないので、"
+            "試験を始めない。"
+            "環境変数 TMPDIR（Windows では TEMP）を、実行できる場所に変えて流す",
+            returncode=SENTINEL_EXIT_CODE,
+        )
     # 標準エラーは、出せない文字を置き換えて書くので、UTF-8 でない端末でも落ちない（Python の決まり）
     print("\n".join(guard_report(path, pathext, place / "tools")), file=sys.stderr, flush=True)
     GUARD.update(place=place, log=place / "sentinel" / SENTINEL_LOG, tests=[])
@@ -245,7 +304,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     calls = sentinel_calls(GUARD["log"])
     if calls:
         session.exitstatus = SENTINEL_EXIT_CODE
-        tests = GUARD["tests"] or ["（試験の外。どの試験か分からない）"]
+        tests = called_tests(GUARD["tests"], calls)
         # 標準エラーは、出せない文字を置き換えて書くので、UTF-8 でない端末でも落ちない（Python の決まり）
         print(
             f"\n失敗: 見張り役の claude が {len(calls)} 回起動された（本物の claude なら、起動されていた）。"

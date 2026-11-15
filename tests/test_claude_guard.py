@@ -80,15 +80,30 @@ def test_places_that_hold_anything_launched_as_claude_are_taken_off(tmp_path):
 
 
 @only_posix
-def test_a_tool_found_only_next_to_claude_stays_reachable_through_a_link(tmp_path):
-    """claude と同じ場所にしか無い git（Homebrew の bin など）は、リンクで残す。claude は残さない。"""
+def test_tools_next_to_claude_stay_reachable_through_links_in_the_same_order(tmp_path):
+    """claude と同じ場所にある道具（Linux の /usr/bin の git、bash など）は、claude 以外の中身への
+    リンクを並べた場所で残す。置き換えた場所は、PATH の同じ順番に入る（先に見つかる道具が変わらない）。
+    claude は残さない。"""
     both = tmp_path / "both"
     stand_in(both)
     os.symlink(shutil.which("git"), both / "git")
-    safe, path = guard.guard_path(str(both), None, tmp_path / "guard")
+    tool = both / "mytool"
+    tool.write_text("#!/bin/sh\necho both\n", encoding="utf-8")
+    tool.chmod(0o755)
+    (both / "CLAUDE.PS1").write_text("", encoding="utf-8")
+    later = tmp_path / "later"
+    later.mkdir()
+    (later / "mytool").write_text("#!/bin/sh\necho later\n", encoding="utf-8")
+    (later / "mytool").chmod(0o755)
+    safe, path = guard.guard_path(os.pathsep.join([str(both), str(later)]), None, tmp_path / "guard")
+    assert safe.split(os.pathsep) == [str(tmp_path / "guard" / "tools" / "0"), str(later)]
     git = shutil.which("git", path=safe)
-    assert git is not None and Path(git).parent == tmp_path / "guard" / "tools"
+    assert git is not None and Path(git).parent == tmp_path / "guard" / "tools" / "0"
     assert subprocess.run([git, "--version"], capture_output=True).returncode == 0
+    mine = subprocess.run([shutil.which("mytool", path=safe)], capture_output=True, text=True)
+    assert mine.stdout == "both\n"
+    linked = {name.lower() for name in os.listdir(tmp_path / "guard" / "tools" / "0")}
+    assert "mytool" in linked and not linked & guard.claude_names(None)
     assert shutil.which("claude", path=safe) is None
     assert Path(shutil.which("claude", path=path)).parent == tmp_path / "guard" / "sentinel"
 
@@ -115,8 +130,10 @@ def test_session_start_report_names_the_places_taken_off_and_the_tools_kept(tmp_
     tools.mkdir(parents=True)
     kept = []
     if not WINDOWS:                         # リンクを作れるOSでだけ、道具を残す（Windows では試験を始めない）
-        os.symlink(shutil.which("git"), tools / "git")
-        kept = [f"  リンクで残した道具: git → {shutil.which('git')}"]
+        (tools / "0").mkdir()
+        os.symlink(str(has / "git"), tools / "0" / "git")
+        os.symlink(str(has / "bash"), tools / "0" / "bash")
+        kept = [f"  リンクで残した道具（{has} の claude 以外）: bash、git"]
     path = os.pathsep.join([str(has), "", "rel", str(tmp_path / "missing"), str(plain)])
     with mock.patch.object(Path, "home", return_value=tmp_path / "elsewhere"):
         lines = guard.guard_report(path, None, tools)
@@ -315,3 +332,38 @@ def test_windows_extension_list_without_cmd_does_not_reach_the_real_exe(tmp_path
             found_with_guard = CYCLE_MODULE.find_command("claude")
     assert found_without_guard == str(real / "claude.exe")                             # 穴の再現
     assert found_with_guard == str(tmp_path / "guard" / "sentinel" / "claude.bat")     # 見張り役（.bat）
+
+
+@only_posix
+def test_session_does_not_start_when_the_sentinel_cannot_be_started(tmp_path):
+    """一時フォルダが実行不可（noexec）だと、見張り役も起動できない。理由を表示して、試験を始めない。"""
+    log = guard.install_sentinel(tmp_path / "sentinel")
+    assert guard.sentinel_starts(tmp_path / "sentinel") and guard.sentinel_calls(log) == []
+    (tmp_path / "sentinel" / "claude").chmod(0o644)                    # 実行不可の場所を模擬する
+    assert not guard.sentinel_starts(tmp_path / "sentinel")
+    # セッションの始めに、見張り役を起動できなければ、理由を表示して試験を始めない（遮断した PATH も組まない）
+    session = mock.Mock(spec=["config"])
+    session.config = mock.Mock(spec=["option"])
+    session.config.option.collectonly = False
+    before = dict(os.environ)
+    with (
+        mock.patch.dict(os.environ, {guard.RUNNING: ""}),
+        mock.patch.object(guard, "sentinel_starts", return_value=False),
+        mock.patch.object(guard.tempfile, "mkdtemp", return_value=str(tmp_path / "place")),
+        pytest.raises(pytest.exit.Exception) as stopped,
+    ):
+        (tmp_path / "place").mkdir()
+        guard.pytest_sessionstart(session)
+    assert stopped.value.returncode == guard.SENTINEL_EXIT_CODE
+    assert "見張り役の claude を、一時フォルダ" in str(stopped.value.msg)
+    assert dict(os.environ) == before and not (tmp_path / "place").exists()
+
+
+def test_sentinel_started_in_a_parallel_worker_names_the_test_from_its_record():
+    """並列実行（pytest-xdist）の子で起動されると、このセッションは控えられない。見張り役の記録から出す。"""
+    calls = [
+        "tests/test_a.py::test_one (call)\t/tmp/x", "tests/test_a.py::test_one (call)\t/tmp/y", "\t/tmp/z",
+    ]
+    assert guard.called_tests([], calls) == ["tests/test_a.py::test_one（見張り役の記録から）"]
+    assert guard.called_tests(["tests/test_b.py::test_two"], calls) == ["tests/test_b.py::test_two"]
+    assert guard.called_tests([], ["\t/tmp/z"]) == ["（試験の外。どの試験か分からない）"]

@@ -202,7 +202,11 @@ def doctor(root: Path, *args: str, env: dict[str, str]) -> tuple[int, dict, str]
 
     起動するのは、このリポジトリでない空の場所から（doctor.py が確認を起動する場所を間違えても、
     このリポジトリの本物の scripts/check.py を実行しない）。
+    --headless で役割を指定しなければ、code-reviewer だけを確かめる（役割ごとの確認は
+    test_headless_probe_runs_for_every_role_the_gates_use が確かめる）。
     """
+    if "--headless" in args and "--role" not in args:
+        args = (*args, "--role", "code-reviewer")
     proc = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "doctor.py"), *args], capture_output=True,
         text=True, encoding="utf-8", env={**TEST_ENV, "CYCLE_ROOT": str(root), **env},
@@ -211,6 +215,11 @@ def doctor(root: Path, *args: str, env: dict[str, str]) -> tuple[int, dict, str]
     path = root / ".cycle" / "doctor-result.json"
     assert path.is_file(), proc.stdout + proc.stderr
     return proc.returncode, json.loads(path.read_text(encoding="utf-8")), proc.stdout + proc.stderr
+
+
+def probe(result: dict, index: int = 0) -> dict:
+    """ヘッドレスの確認のうち、1つの役割の結果。"""
+    return result["headless"]["roles"][index]
 
 
 def good_output(**top: object) -> dict:
@@ -417,16 +426,18 @@ def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp
     assert code == 0, screen
     cycle = DOCTOR.cycle
     argv = claude_argv(tmp_path)
-    assert argv == cycle.claude_command(DOCTOR.PROBE_PROMPT, "code-reviewer", 0.5, "Read")[1:]
+    assert argv == cycle.claude_command(DOCTOR.PROBE_PROMPT, "code-reviewer", 0.5, "review")[1:]
     # ハーネスの run と、オプションの並びも、結果の形の指定も同じ
     harness = cycle.agent_command({"owner": "x", "spec": "docs/plan/U1-demo.md"}, "review", 0.5)[1:]
     assert argv[0::2] == harness[0::2]
     same = dict(zip(harness[0::2], harness[1::2], strict=True))
     used = dict(zip(argv[0::2], argv[1::2], strict=True))
-    for option in ("--agent", "--output-format", "--json-schema", "--permission-mode", "--max-budget-usd"):
-        assert used[option] == same[option]
-    head = result["headless"]
+    # 指示のほかは、道具の一覧、許可の扱い、禁じる道具まで、ハーネスの review と同じ
+    assert {**used, "-p": ""} == {**same, "-p": ""}
+    head = probe(result)
+    assert (head["role"], head["gate"], head["restricts_tools"]) == ("code-reviewer", "review", False)
     assert head["ran"] is True and head["timed_out"] is False and head["unexpected"] == []
+    assert head["failure"] is None
     assert head["options"] == argv[0::2]
     assert head["launcher"].lower() == ("claude.cmd" if os.name == "nt" else "claude")
     assert head["returncode"] == 0 and head["harness_verdict"] == "pass"
@@ -439,12 +450,12 @@ def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp
     assert head["fields"]["total_cost_usd"] == {"present": True, "kind": "number", "value": 0.0125}
     assert head["fields"]["structured_output"] == {
         "present": True, "kind": "object", "keys": ["criteria", "issues", "summary", "verdict"],
-        "other_keys": 0, "problem": "", "verdict": "pass", "criteria": 0, "issues": 0,
+        "other_keys": 0, "problem": "", "verdict": "pass", "criteria": 1, "issues": 0,
     }
     assert head["keys"] == sorted(good_output()) and head["other_keys"] == 0
     assert head["result_as_json"] is None           # structured_output があるので、result の中身は調べない
     # 実行の前に、何をするかを表示する
-    assert "claude -p を1回だけ実行します" in screen and "利用枠を少し使います" in screen
+    assert "claude -p を、役割ごとに1回ずつ、1 回実行します" in screen and "利用枠を少し使います" in screen
     assert "ハーネスの前提どおりの形で返ってきた" in screen
 
 
@@ -453,7 +464,7 @@ def test_probe_prompt_and_gate_prompts_can_pass_through_a_batch_launcher():
     cycle = DOCTOR.cycle
     state = {"owner": "solver-engineer", "spec": "docs/plan/U1-demo.md"}
     commands = [cycle.agent_command(state, gate, 5.0) for gate in cycle.AGENT_GATES]
-    commands.append(cycle.claude_command(DOCTOR.PROBE_PROMPT, DOCTOR.PROBE_ROLE, 1.0, DOCTOR.PROBE_TOOLS))
+    commands += [cycle.claude_command(DOCTOR.PROBE_PROMPT, "x", 1.0, gate) for gate in cycle.AGENT_GATES]
     with mock.patch.object(cycle, "find_command", return_value="C:/npm/claude.cmd"):
         for cmd in commands:
             assert cycle.launchable(cmd)[1:] == cmd[1:]
@@ -507,7 +518,7 @@ def test_headless_output_that_differs_from_what_the_harness_expects_is_a_problem
     code, result, screen = doctor(root, "--no-check", "--headless", env=env)
     assert code == 1
     assert result["problems"] == ["headless"]
-    assert result["headless"]["unexpected"] == unexpected
+    assert probe(result)["unexpected"] == unexpected
     assert f"ハーネスの前提と違う点がある: {'、'.join(unexpected)}" in screen
 
 
@@ -516,7 +527,7 @@ def test_headless_shape_details_are_recorded(root, tmp_path):
     failed = good_output(subtype="error_max_turns")
     output = [{"type": "system", "session_id": "x"}, failed, {"type": "other"}]
     code, result, screen = doctor(root, "--no-check", "--headless", env=fake_claude(tmp_path, output))
-    head = result["headless"]
+    head = probe(result)
     assert head["stdout"]["form"] == "json_array" and head["harness_verdict"] == "error"
     assert head["fields"]["subtype"]["value"] == "error_max_turns"
     assert head["fields"]["num_turns"] == {"present": True, "kind": "number", "value": 1}
@@ -527,7 +538,7 @@ def test_headless_shape_details_are_recorded(root, tmp_path):
     stderr = "error: unknown option '--json-schema'\n(Did you mean --json?)\n"
     env = fake_claude(tmp_path, "", exit_code=1, stderr=stderr)
     code, result, screen = doctor(root, "--no-check", "--headless", env=env)
-    head = result["headless"]
+    head = probe(result)
     assert head["stdout"] == {"form": "empty", "characters": 0}
     assert head["messages"] == {
         "characters": len(stderr), "lines": 2, "rejected_options": ["--json-schema"], "mentions_login": False,
@@ -538,7 +549,7 @@ def test_headless_shape_details_are_recorded(root, tmp_path):
     # サインインを求める文面（出力の側に出た場合も）
     env = fake_claude(tmp_path, "Invalid API key · Please run /login", exit_code=1)
     code, result, screen = doctor(root, "--no-check", "--headless", env=env)
-    head = result["headless"]
+    head = probe(result)
     assert head["stdout"]["form"] == "not_json"
     assert head["messages"]["mentions_login"] is True and head["messages"]["rejected_options"] == []
     assert "サインインや認証に触れている" in screen
@@ -548,7 +559,7 @@ def test_headless_probe_that_does_not_finish_is_a_problem(root, tmp_path):
     env = fake_claude(tmp_path, good_output(), script="time.sleep(20)")
     code, result, screen = doctor(root, "--no-check", "--headless", "--timeout", "1", env=env)
     assert code == 1
-    head = result["headless"]
+    head = probe(result)
     assert head["ran"] is True and head["timed_out"] is True and head["unexpected"] == ["timed_out"]
     assert "時間内に終わらなかった" in screen
 
@@ -594,15 +605,15 @@ def test_response_text_and_credentials_are_not_written_anywhere(root, tmp_path):
     assert SECRET not in written and SECRET not in screen
     assert SECRET.lower() not in written.lower() and SECRET.lower() not in screen.lower()
     # 形は記録されている
-    fields = result["headless"]["fields"]
+    fields = probe(result)["fields"]
     assert fields["subtype"] == {"present": True, "kind": "string"}
     assert fields["is_error"] == {"present": True, "kind": "string"}
     assert fields["total_cost_usd"] == {"present": True, "kind": "string"}
     assert fields["structured_output"]["keys"] == ["criteria", "issues", "summary", "verdict"]
     assert fields["structured_output"]["other_keys"] == 1
     # 項目の名前は、決めてある一覧のものだけ。api_key と、目印の入った2つは、個数だけ
-    assert result["headless"]["keys"] == sorted(key for key in output if key in (*DOCTOR.FIELDS, "usage"))
-    assert result["headless"]["other_keys"] == 3
+    assert probe(result)["keys"] == sorted(key for key in output if key in (*DOCTOR.FIELDS, "usage"))
+    assert probe(result)["other_keys"] == 3
     # 結果のファイルのほかに、何も書き出していない
     assert [path.name for path in (root / ".cycle").iterdir()] == ["doctor-result.json"]
 
@@ -620,7 +631,7 @@ def test_item_names_outside_the_known_list_are_only_counted(root, tmp_path):
     written = (root / ".cycle" / "doctor-result.json").read_text(encoding="utf-8")
     for name in SECRET_NAMES:
         assert name.lower() not in written.lower() and name.lower() not in screen.lower()
-    head = result["headless"]
+    head = probe(result)
     assert head["keys"] == sorted([*good_output(), "usage"]) and head["other_keys"] == 3
     structured = head["fields"]["structured_output"]
     assert structured["keys"] == ["criteria", "issues", "summary", "verdict"]
@@ -632,7 +643,7 @@ def test_names_that_may_be_recorded_are_a_fixed_list():
     assert DOCTOR.KNOWN_KEYS == {
         "type", "subtype", "is_error", "session_id", "result", "structured_output", "total_cost_usd",
         "num_turns", "duration_ms", "duration_api_ms", "usage", "modelUsage", "permission_denials", "uuid",
-        "errors", "stop_reason",
+        "errors", "stop_reason", "terminal_reason",
     }
     assert DOCTOR.KNOWN_RESULT_KEYS == {"verdict", "summary", "criteria", "issues"}
 
@@ -677,8 +688,8 @@ def test_result_text_is_checked_for_json_when_structured_output_is_missing(root,
     top, expected, shown = RESULT_TEXTS[case]
     output = {k: v for k, v in good_output().items() if k not in ("structured_output", "result")} | top
     code, result, screen = doctor(root, "--no-check", "--headless", env=fake_claude(tmp_path, output))
-    assert code == 1 and "structured_output" in result["headless"]["unexpected"]
-    assert result["headless"]["result_as_json"] == expected
+    assert code == 1 and "structured_output" in probe(result)["unexpected"]
+    assert probe(result)["result_as_json"] == expected
     if shown is None:
         assert "result の文字列は" not in screen
     else:
@@ -717,3 +728,104 @@ def test_doctor_does_not_crash_on_a_terminal_that_cannot_show_the_text(root, tmp
     assert b"Traceback" not in proc.stderr
     result = json.loads((root / ".cycle" / "doctor-result.json").read_text(encoding="utf-8"))
     assert result["encoding"]["stdout"] == encoding and result["ok"] is True
+
+
+# ------------------------------------------------------------ 役割ごとの確認、失敗の種類（H2）
+
+def define_roles(root: Path, *names: str, restricted: str = "") -> None:
+    agents = root / ".claude" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        tools = "tools: Read, Grep\n" if name == restricted else "disallowedTools: Edit\n"
+        (agents / f"{name}.md").write_text(f"---\nname: {name}\n{tools}---\n本文\n", encoding="utf-8")
+
+
+def test_headless_probe_runs_for_every_role_the_gates_use(root, tmp_path):
+    """ゲートで使う役割（確認系の担当と、役割の定義にある実装の担当）ごとに、そのゲートの組み立てで1回ずつ。"""
+    define_roles(root, "code-reviewer", "verifier", "ux-designer", "solver-engineer", "tooling-engineer",
+                 restricted="ux-designer")
+    script = "(here / 'calls.txt').open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')"
+    env = fake_claude(tmp_path, good_output(), script=script)
+    code, result, screen = doctor(root, "--no-check", "--headless", "--role", "verifier", env=env)
+    assert code == 0 and [item["role"] for item in result["headless"]["roles"]] == ["verifier"]
+    (tmp_path / "bin" / "calls.txt").unlink()
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "doctor.py"), "--no-check", "--headless"],
+        capture_output=True,
+        text=True, encoding="utf-8", env={**TEST_ENV, "CYCLE_ROOT": str(root), **env}, cwd=started_here(root),
+    )
+    result = json.loads((root / ".cycle" / "doctor-result.json").read_text(encoding="utf-8"))
+    roles = [(item["role"], item["gate"]) for item in result["headless"]["roles"]]
+    assert roles == [
+        ("code-reviewer", "review"), ("verifier", "verify"), ("ux-designer", "ux"),
+        ("solver-engineer", "implement"), ("tooling-engineer", "implement"),
+    ]
+    lines = (tmp_path / "bin" / "calls.txt").read_text(encoding="utf-8").splitlines()
+    calls = [json.loads(line) for line in lines]
+    cycle = DOCTOR.cycle
+    assert calls == [cycle.claude_command(DOCTOR.PROBE_PROMPT, role, 1.0, gate)[1:] for role, gate in roles]
+    # 道具の一覧（tools:）のある役割は、実行の前に知らせ、記録する
+    restricted = [item["restricts_tools"] for item in result["headless"]["roles"]]
+    assert restricted == [False, False, True, False, False]
+    assert "役割 ux-designer の定義に、使える道具の一覧（tools:）がある" in proc.stdout
+    assert proc.returncode == 0 and result["headless"]["unexpected"] == []
+
+
+def test_each_role_is_judged_by_the_gate_it_is_used_for(root, tmp_path):
+    """独立検証の担当だけは、基準ゼロ件の合格を、ハーネスと同じく合格にしない。"""
+    output = good_output(structured_output={**PASS, "criteria": []})
+    env = fake_claude(tmp_path, output)
+    roles = ("--role", "verifier", "--role", "code-reviewer")
+    code, result, screen = doctor(root, "--no-check", "--headless", *roles, env=env)
+    assert code == 1
+    assert result["headless"]["unexpected"] == ["verifier: harness_verdict"]
+    assert [item["harness_verdict"] for item in result["headless"]["roles"]] == ["pass", "fail"]
+
+
+def test_unknown_role_is_not_run(root, tmp_path):
+    env = fake_claude(tmp_path, good_output())
+    code, result, screen = doctor(root, "--no-check", "--headless", "--role", "no-such-role", env=env)
+    assert code == 1 and result["headless"] == {"ran": False, "reason": "unknown_role"}
+    assert claude_argv(tmp_path) == ["--version"]           # 版を聞いただけで、-p では起動していない
+
+
+FAILURES = {
+    "サインインしていない": ("Not logged in · Please run /login", "not_logged_in"),
+    "利用枠の上限": ("Claude AI usage limit reached|1763200000", "usage_limit"),
+    "モデルを使えない": (
+        "There's an issue with the selected model (x). It may not exist or you may not have access to it.",
+        "model_unavailable",
+    ),
+    "上限額": ("Reached maximum budget ($1)", "budget_exceeded"),
+    "分類できない": ("something odd happened", "other"),
+}
+
+
+@pytest.mark.parametrize("case", FAILURES)
+def test_kind_of_failure_is_recorded_without_the_text(root, tmp_path, case):
+    """失敗したとき、原因の種類を、文面を記録せずに分類して出す（利用者にもう一度打ってもらわずに済むように）。"""
+    text, expected = FAILURES[case]
+    output = good_output(is_error=True, subtype="success", result=f"{text} {SECRET}", stop_reason="end_turn")
+    del output["structured_output"]
+    code, result, screen = doctor(root, "--no-check", "--headless", env=fake_claude(tmp_path, output))
+    assert code == 1
+    head = probe(result)
+    assert head["failure"] == expected
+    assert head["fields"]["stop_reason"] == {"present": True, "kind": "string", "value": "end_turn"}
+    assert DOCTOR.FAILURE_TEXT[expected] in screen
+    assert SECRET not in json.dumps(result) and SECRET not in screen
+
+
+def test_failure_on_the_error_output_is_classified_too(root, tmp_path):
+    env = fake_claude(tmp_path, "", exit_code=1, stderr=f"Error: Invalid API key {SECRET}\n")
+    code, result, screen = doctor(root, "--no-check", "--headless", env=env)
+    assert code == 1 and probe(result)["failure"] == "not_logged_in"
+    assert SECRET not in json.dumps(result) and SECRET not in screen
+
+
+@pytest.mark.parametrize("args, ran", [((), False), (("--check",), True), (("--no-check", "--check"), False)])
+def test_headless_leaves_the_check_out_unless_asked(root, tmp_path, args, ran):
+    """--headless のときは、確認（数分かかる）を省くのが既定。--check で流す。"""
+    code, result, screen = doctor(root, "--headless", *args, env=fake_claude(tmp_path, good_output()))
+    assert result["check"]["ran"] is ran
+    assert code == 0

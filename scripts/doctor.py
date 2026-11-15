@@ -6,7 +6,8 @@
   python scripts/doctor.py --no-check    scripts/check.py（数分かかる）を省く
   python scripts/doctor.py --headless    加えて、本物の claude -p を最小の指示で、ゲートで使う役割ごとに
                                          1回ずつ実行し、ハーネス（scripts/cycle.py run）が前提にしている
-                                         出力の形かを確かめる（--role で役割を絞れる。確認は省く。--check で流す）
+                                         出力の形かを確かめる（--role で役割を絞れる。確認は省く。
+                                         --check で流す）
 
 --headless はClaudeの利用枠を少し使うので、付けたときだけ実行する。実行の前に、何をするかを表示する。
 失敗したときは、原因の種類（サインインしていない、利用枠の上限、モデルを使えない、など）を、文面を記録せずに
@@ -47,7 +48,7 @@ PROBE_PROMPT = (
     "verdict を pass、summary を ok、criteria を name が probe、measured が ok、pass が true の項目1つだけの"
     "一覧、issues を空の一覧にした結果だけを返してください。"
 )
-# ゲートで使う役割（確認系のゲートの担当）。ほかの役割の定義（.claude/agents/ の中）は、実装の担当として確かめる
+# 役割の定義の場所。確認系のゲートの担当（cycle.GATE_AGENT）のほかの役割は、実装の担当として確かめる
 AGENTS_DIR = ".claude/agents"
 
 # 設定されていると、ヘッドレス実行が利用枠ではなくAPIの料金になる環境変数（中身は見ない。有無だけ）
@@ -69,9 +70,11 @@ WORD_FIELDS = ("type", "subtype", "stop_reason", "terminal_reason")
 # 失敗の原因の種類。応答（result）とエラーの文面を、この順に照らして、最初に当たったものにする。
 # 文面そのものは記録しない（種類の名前だけ）。
 FAILURE_KINDS = (
-    ("usage_limit", r"usage limit|rate limit|limit reached|quota|too many requests|credit balance|out of credits"),
+    ("usage_limit", (
+        r"usage limit|rate limit|limit reached|quota|too many requests|credit balance|out of credits"
+    )),
     ("model_unavailable", (
-        r"model[^\n]{0,80}(not found|not available|unavailable|does not exist|not supported|no access|"
+        r"model[^\n]{0,120}(not found|not available|unavailable|not exist|not supported|access|"
         r"not allowed|invalid)|(invalid|unknown) model"
     )),
     ("not_logged_in", r"not logged in|log ?in|sign ?in|authenticat|unauthori[sz]ed|api key|credential|oauth"),
@@ -322,7 +325,7 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
 
 
 def gate_roles(root: Path) -> list[tuple[str, str]]:
-    """ゲートで使う役割と、そのゲート: 確認系のゲートの担当と、.claude/agents/ にあるほかの役割（実装の担当）。"""
+    """ゲートで使う役割と、そのゲート: 確認系のゲートの担当と、.claude/agents/ のほかの役割（実装の担当）。"""
     checkers = [(role, gate) for gate, role in cycle.GATE_AGENT.items()]
     agents = root / AGENTS_DIR
     others = sorted(path.stem for path in agents.glob("*.md")) if agents.is_dir() else []
@@ -349,7 +352,7 @@ def restricts_tools(root: Path, role: str) -> bool:
 def headless_info(
     root: Path, budget: float, timeout: int, allow_api_billing: bool, only: list[str] | None = None,
 ) -> dict:
-    """本物の claude -p を、ハーネスと同じ組み立てで、ゲートで使う役割ごとに1回ずつ実行して、出力の形を調べる。"""
+    """本物の claude -p を、ハーネスと同じ組み立てで、ゲートで使う役割ごとに1回ずつ実行し、形を調べる"""
     roles = [(role, gate) for role, gate in gate_roles(root) if not only or role in only]
     unknown = sorted(set(only or ()) - {role for role, _ in roles})
     if unknown:
@@ -381,7 +384,8 @@ def headless_info(
         cmd = cycle.claude_command(PROBE_PROMPT, role, budget, gate)
         restricted = restricts_tools(root, role)
         if restricted:
-            print(f"  - 注意: 役割 {role} の定義に、使える道具の一覧（tools:）がある。構造化された結果が返らない"
+            print(f"  - 注意: 役割 {role} の定義に、使える道具の一覧（tools:）がある。"
+                  "構造化された結果が返らない"
                   "ことがある（D-030）。使えない道具（disallowedTools:）で絞る")
         print(f"  - 実行するコマンド（{role}）: {cycle.shell_line(root, cmd)}", flush=True)
         probes.append({
@@ -407,7 +411,10 @@ def probe(root: Path, cmd: list[str], timeout: int, gate: str) -> dict:
     except subprocess.TimeoutExpired:
         return {**info, "timed_out": True, "unexpected": ["timed_out"]}
     except OSError:
-        return {"ran": False, "reason": "cannot_start", "launcher": info["launcher"], "unexpected": ["cannot_start"]}
+        return {
+            "ran": False, "reason": "cannot_start", "launcher": info["launcher"],
+            "unexpected": ["cannot_start"],
+        }
     info["timed_out"] = False
     info["seconds"] = round(time.monotonic() - started, 1)
     return {**info, **describe_output(proc.returncode, proc.stdout, proc.stderr, options, gate)}
@@ -460,7 +467,7 @@ def check_line(check: dict) -> str:
 
 
 NOT_RUN = {
-    "not_requested": "実行していない（--headless で、役割ごとに claude -p を1回ずつ実行して出力の形を確かめる）",
+    "not_requested": "実行していない（--headless で、役割ごとに claude -p を1回ずつ実行して、形を確かめる）",
     "api_key_set": "実行していない（APIキーの環境変数が設定されている）",
     "unknown_role": "実行していない（--role に、知らない役割がある）",
     "claude_not_found": "実行できない（claude コマンドが見つからない）",
@@ -481,7 +488,8 @@ def headless_lines(headless: dict) -> list[str]:
 
 def probe_lines(headless: dict) -> list[str]:
     """1つの役割の確認の結果の表示。"""
-    notes = ["役割の定義に tools: がある（D-030。disallowedTools: で絞る）"] if headless["restricts_tools"] else []
+    restricted = headless["restricts_tools"]
+    notes = ["役割の定義に tools: がある（D-030。disallowedTools: で絞る）"] if restricted else []
     if not headless["ran"]:
         return [NOT_RUN[headless["reason"]], *notes]
     if headless["timed_out"]:
@@ -547,14 +555,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="doctor.py", description="開発環境の確認")
     parser.add_argument("--no-check", action="store_true", help="scripts/check.py を実行しない")
     parser.add_argument(
-        "--check", action="store_true", help="--headless のときも scripts/check.py を実行する（既定では省く）",
+        "--check", action="store_true", help="--headless のときも scripts/check.py を実行する（既定は省く）",
     )
     parser.add_argument(
         "--headless", action="store_true",
         help="本物の claude -p を、ゲートで使う役割ごとに1回ずつ実行して、出力の形を確かめる"
         "（Claudeの利用枠を少し使う）",
     )
-    parser.add_argument("--role", action="append", help="ヘッドレスの確認をする役割（くり返せる。既定はすべて）")
+    parser.add_argument("--role", action="append", help="ヘッドレスの確認をする役割（くり返せる）")
     parser.add_argument("--budget", type=float, default=1.0, help="ヘッドレスの確認の上限額（米ドル）")
     parser.add_argument("--timeout", type=int, default=300, help="ヘッドレスの確認を打ち切るまでの秒数")
     parser.add_argument(
@@ -578,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         # 確かめた内容（確認を始める前の時点）。ツリーIDは、ハーネス（cycle.py）と同じ求め方
         "content": cycle.content_info(root),
-        # --headless のときは、確認（数分かかる）を省くのが既定（ヘッドレスの失敗を、すぐに切り分けられるように）
+        # --headless のときは、確認（数分かかる）を省くのが既定（ヘッドレスの失敗をすぐ切り分けるため）
         "check": check_info(root, args.no_check or (args.headless and not args.check)),
         "headless": {"ran": False, "reason": "not_requested"},
     }

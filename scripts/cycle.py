@@ -347,19 +347,20 @@ def launchable(cmd: list[str], avoid: Iterable[Path] = ()) -> list[str]:
     return [found, *cmd[1:]]
 
 
-# Windows の cmd.exe と CreateProcess は、名前だけで書かれたコマンドを、PATH より先に実行した場所（カレント）で
-# 探す（npm 版の claude.cmd が中で呼ぶ node、名前で起動する git など）。この環境変数があると、探さない。
+# Windows の cmd.exe と CreateProcess は、名前だけで書かれたコマンドを、PATH より先に、実行した場所
+# （カレント）で探す（npm 版の claude.cmd が中で呼ぶ node、名前で起動する git など）。
+# この環境変数があると、探さない。
 # 起動する子プロセスにも引き継ぐ。ほかのOSでは、読む仕組みが無いので何も変わらない。
 NO_CURRENT_DIRECTORY_SEARCH = "NoDefaultCurrentDirectoryInExePath"
 
 
 def no_current_directory_search() -> None:
-    """名前だけのコマンドを、実行した場所で探させない（このプロセスと、起動する子プロセス）。main が最初に呼ぶ。"""
+    """名前だけのコマンドを、実行した場所で探させない（このプロセスと、起動する子プロセス）。main が呼ぶ。"""
     os.environ[NO_CURRENT_DIRECTORY_SEARCH] = "1"
 
 
 def system_command(name: str) -> str:
-    """Windows に付いてくるコマンド（taskkill）の場所。名前だけで起動しない（実行した場所のものを使わない）。"""
+    """Windows に付いてくるコマンド（taskkill）の場所。名前だけで起動しない"""
     return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", f"{name}.exe")
 
 
@@ -486,7 +487,9 @@ def git_program() -> str:
     """起動する git の場所。claude と同じ探し方（find_command）で、実行した場所と本体の中のものは使わない。"""
     found = find_command("git", (repo_root(),))
     if found is None:
-        raise CycleError("git が見つからない（実行した場所と本体の中にあるものは使わない）。git を入れて PATH を通す")
+        raise CycleError(
+            "git が見つからない（実行した場所と本体の中にあるものは使わない）。git を入れて PATH を通す"
+        )
     return found
 
 
@@ -910,12 +913,14 @@ def run_check(cwd: Path) -> tuple[str, str, str, str]:
     except OSError as exc:
         return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}", ""
     output = proc.stdout + proc.stderr
-    # 1行の表示には、標準出力の最後の行（pytest の件数）を使う。標準エラーの最後は、試験の遮断の表示のことがある
+    # 1行の表示には、標準出力の最後の行（pytest の件数）を使う。
+    # 標準エラーの最後は、試験の遮断の表示のことがある
     last = (proc.stdout.strip().splitlines() or [""])[-1]
     if proc.returncode != 0:
         return "fail", before, output, last
     if tree_id(cwd) != before:
-        return "error", before, output + "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない", last
+        changed = "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない"
+        return "error", before, output + changed, last
     return "pass", before, output, last
 
 
@@ -975,7 +980,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def claude_command(prompt: str, role: str, budget: float, gate: str) -> list[str]:
-    """ヘッドレス実行のコマンド。道具と許可の扱いは、ゲート（gate）で決まる。結果は VERDICT_SCHEMA の形で受け取る。"""
+    """ヘッドレス実行のコマンド。道具と許可の扱いは、ゲート（gate）で決まる。結果は VERDICT_SCHEMA の形。"""
     cmd = [
         "claude", "-p", prompt,
         "--agent", role,
@@ -1068,8 +1073,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     owner = state["owner"]
     if args.gate == "implement" and not (worktree / AGENTS_DIR / f"{owner}.md").is_file():
         raise CycleError(
-            f"担当 {owner} の役割の定義（{AGENTS_DIR}/{owner}.md）が作業ツリーに無いので、ヘッドレスで起動できない。"
-            "仕様の見出しの owner には、定義のある役割の名前を書く（セッション内で動かした結果は record で記録できる）"
+            f"担当 {owner} の役割の定義（{AGENTS_DIR}/{owner}.md）が作業ツリーに無いので、"
+            "ヘッドレスで起動できない。仕様の見出しの owner には、定義のある役割の名前を書く"
+            "（セッション内で動かした結果は record で記録できる）"
         )
     cmd = launchable(cmd, (root, worktree))
 
@@ -1121,7 +1127,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         )
     else:
         tree = tree_id(worktree)
-    add_record(root, args.id, args.gate, args.verdict, tree, main_base(worktree), by, "session", args.report or "")
+    base = main_base(worktree)
+    add_record(root, args.id, args.gate, args.verdict, tree, base, by, "session", args.report or "")
     print(f"{args.id} {args.gate}: {args.verdict} を記録（対象 {tree[:10]}、担当 {by}）")
     return 0
 
@@ -1227,7 +1234,9 @@ def changed_after_gate(worktree: Path, gate_tree: str, current: str) -> list[str
 def may_add_after_gate(path: str) -> bool:
     """ゲートの後で足してよいファイルか（AFTER_GATE_FILES）。名前は、場所の中のどの階層でも同じ決まり。"""
     name = path.rpartition("/")[2]
-    return any(path.startswith(place) and fnmatch.fnmatchcase(name, pattern) for place, pattern in AFTER_GATE_FILES)
+    return any(
+        path.startswith(place) and fnmatch.fnmatchcase(name, pattern) for place, pattern in AFTER_GATE_FILES
+    )
 
 
 def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list[str]:
@@ -1255,7 +1264,8 @@ def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list
             continue
         if entry.get("base") is None or entry["base"] != base:
             problems.append(
-                f"{gate}: 確認の後で、main との分かれ目（土台）が変わっている。土台を付け替えた内容を取り込むと、"
+                f"{gate}: 確認の後で、main との分かれ目（土台）が変わっている。"
+                "土台を付け替えた内容を取り込むと、"
                 "main に入った他の成果が消える。main を取り込み直して（git merge main）からやり直す"
             )
             continue
