@@ -82,6 +82,22 @@ GIT_LOCATION_VARS = (
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
 )
 
+# 内容（ツリーID、確認のための取り出し）を扱う git では、利用者とシステムの設定のうち、内容の読み方を
+# 変えるものを、ここで決めた値にする。同じ内容なら、誰が、どの環境（設定）で求めても、同じツリーIDになる
+# （決まり9）。
+# 読むのは、リポジトリ自身の設定（.git/config。実行できる印やリンクを表せるか、など）と、
+# リポジトリの中の .gitattributes、.gitignore、.git/info/ の指定だけ。
+#   core.autocrlf: 改行の変換（Git for Windows は、システムの設定で true にする）
+#   core.safecrlf: 改行の変換の警告で、内容を読むのを止める
+#   ほかに、リポジトリの外の属性（core.attributesFile、システムの属性 GIT_ATTR_NOSYSTEM、GIT_ATTR_SOURCE）、
+#   利用者の無視の指定（core.excludesFile）、フック（core.hooksPath）は、pinned_git_options が空に向ける。
+# 署名、認証、safe.directory、長いパスの扱いなど、内容の読み方を変えない設定は、利用者のものを使う。
+PINNED_GIT_SETTINGS = (("core.autocrlf", "false"), ("core.safecrlf", "false"))
+PINNED_GIT_DROP = ("GIT_ATTR_SOURCE",)
+
+# 確認（pytest）の、試験の選び方を変えうる環境変数の名前の始まり（check_env）
+PYTEST_VARS_PREFIX = "PYTEST_"
+
 GATE_TOOLS = {
     "implement": "Read,Edit,Write,Bash,Grep,Glob",
     "review": "Read,Bash,Grep,Glob",
@@ -292,10 +308,26 @@ def shell_line(cwd: Path, cmd: list[str]) -> str:
     return f"cd {shlex.quote(str(cwd))} && {shlex.join(cmd)}"
 
 
+def group_options() -> dict:
+    """起動するプロセスを、その先のプロセスごと止められるようにする Popen の指定（kill_tree と組で使う）。
+
+    Linux / macOS では、新しいセッション（プロセスのまとまり）で起動する。端末の Ctrl-C はこのスクリプトだけに
+    届き、こちらがまとまりごと止める。Windows では指定しない（taskkill /T が、その先のプロセスをたどる）。
+    """
+    return {} if WINDOWS else {"start_new_session": True}
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
-    """起動したプロセスを止める。Windows では、起動用のファイル（claude.cmd）の先のプロセスも一緒に止める。"""
+    """起動したプロセスを、その先のプロセスごと止める（group_options で起動したもの）。
+
+    Windows では、起動用のファイル（claude.cmd）の先の本体や、確認の先の pytest まで、taskkill /T でたどる。
+    Linux / macOS では、プロセスのまとまりごと止める（起動したプロセスが先に終わっていても、残りを止める）。
+    """
     if WINDOWS:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        with contextlib.suppress(ProcessLookupError):       # まとまりが、もう無い（どれも終わっている）
+            os.killpg(proc.pid, signal.SIGKILL)
     proc.kill()
 
 
@@ -305,7 +337,7 @@ def run_captured(
     """コマンドを実行して、出力を UTF-8 の文字列で受け取る。
 
     呼び出し元の標準入力は渡さない（人が見ていない実行で、入力を待って止まり続けないように）。
-    時間切れなら、起動したプロセスを止めてから subprocess.TimeoutExpired を送出する。
+    時間切れなら、起動したプロセスを、その先のプロセスごと止めてから subprocess.TimeoutExpired を送出する。
 
     止めた後は、出力の終わりを待たない。起動したプロセスが残した子プロセスが出力の口を持ったままだと、
     その子が終わるまで戻れなくなる（打ち切りは、人が見ていない実行の最後の歯止め）。
@@ -313,7 +345,7 @@ def run_captured(
     """
     with subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", env=env,
+        text=True, encoding="utf-8", errors="replace", env=env, **group_options(),
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -326,6 +358,16 @@ def run_captured(
 def python_env() -> dict[str, str]:
     """Python のスクリプトを起動するときの環境変数。出力を UTF-8 で受け取れるようにする。"""
     return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def check_env(base: dict[str, str]) -> dict[str, str]:
+    """確認（scripts/check.py → pytest）を起動するときの環境変数。base から、pytest の環境変数を除いたもの。
+
+    PYTEST_ で始まる変数（PYTEST_ADDOPTS の -k、-m、--deselect、--ignore、--lf、PYTEST_PLUGINS の差し込み、
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD など）は、実行する試験を選び直せる。呼び出し元から引き継ぐと、
+    一部の試験だけを実行した結果が、合格として記録される（Windows の os.environ の名前は、もとから大文字）。
+    """
+    return {key: value for key, value in base.items() if not key.startswith(PYTEST_VARS_PREFIX)}
 
 
 def retry_while_busy(action: Callable[[], T]) -> T:
@@ -360,28 +402,51 @@ def git_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key not in GIT_LOCATION_VARS}
 
 
+def pinned_git_options(folder: Path) -> list[str]:
+    """内容を扱う git に渡す設定（-c の並び。PINNED_GIT_SETTINGS の説明）。
+
+    リポジトリの外の属性、利用者の無視の指定、フックは、folder の中の、作らない名前に向ける（git は、無い
+    ファイルを空のファイルとして、無いフォルダをフックの無いフォルダとして扱う）。folder は、確かめる内容の
+    外の一時フォルダ（ツリーIDを求める間、取り出す間だけある。ほかの誰も書かない）。
+    """
+    nothing = (folder / "pinned-nothing").as_posix()
+    settings = (
+        *PINNED_GIT_SETTINGS, ("core.attributesFile", nothing), ("core.excludesFile", nothing),
+        ("core.hooksPath", nothing),
+    )
+    return [option for key, value in settings for option in ("-c", f"{key}={value}")]
+
+
 def run_git(
-    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None,
+    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None, pinned: Path | None = None,
 ) -> subprocess.CompletedProcess:
+    """git を実行する。pinned を渡すと、内容の読み方を変える設定を決めた値にする（pinned_git_options）。"""
     env = git_env()
+    options = []
+    if pinned is not None:
+        options = pinned_git_options(pinned)
+        env = {key: value for key, value in env.items() if key not in PINNED_GIT_DROP}
+        env["GIT_ATTR_NOSYSTEM"] = "1"
     if index is not None:
         env["GIT_INDEX_FILE"] = str(index)
     return subprocess.run(
-        ["git", "-C", str(cwd), *args],
+        ["git", *options, "-C", str(cwd), *args],
         input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
     )
 
 
-def git(cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None) -> str:
-    proc = run_git(cwd, *args, index=index, stdin=stdin)
+def git(
+    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None, pinned: Path | None = None,
+) -> str:
+    proc = run_git(cwd, *args, index=index, stdin=stdin, pinned=pinned)
     if proc.returncode != 0:
         raise CycleError(f"git {' '.join(args)} が失敗: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout.strip()
 
 
-def git_paths(cwd: Path, *args: str, index: Path | None = None) -> list[str]:
+def git_paths(cwd: Path, *args: str, index: Path | None = None, pinned: Path | None = None) -> list[str]:
     """-z を付けた git の出力（NUL 区切りのファイル名）を一覧にする。"""
-    proc = run_git(cwd, *args, index=index)
+    proc = run_git(cwd, *args, index=index, pinned=pinned)
     if proc.returncode != 0:
         raise CycleError(f"git {' '.join(args)} が失敗: {proc.stderr.strip()}")
     return [path for path in proc.stdout.split("\0") if path]
@@ -465,7 +530,11 @@ def read_header(spec: Path) -> dict:
 
 
 def required_gates(source: dict) -> list[str]:
-    """必要なゲート。source は見出し（read_header の結果）か、状態（start が保存したもの）。"""
+    """必要なゲート。source は見出し（read_header の結果）か、状態（start が保存したもの）。
+
+    needs_windows: true なら、見出しに gates: があっても windows を必ず加える（gates: には windows を
+    書けないので、食い違いにはならない。gates: で必要なゲートを絞っても、Windows での確認は外れない）。
+    """
     wanted = list(source.get("gates_required") or DEFAULT_GATES)
     if source.get("needs_ux"):
         wanted.append("ux")
@@ -563,22 +632,25 @@ def tree_id(worktree: Path) -> str:
     実行できる印とリンクを表せないファイルシステム（Windows の既定）では、git は、索引に無いファイルを
     「実行できない普通のファイル」として足す。空の索引から始めると、実行できる印の付いたファイルを含む内容で、
     コミットのツリーとも、Linux で求めたIDとも食い違う。索引にあるファイルは、その印を引き継ぐ。
+
+    利用者とシステムの git の設定のうち、内容の読み方を変えるもの（改行の変換、リポジトリの外の属性と
+    無視の指定、フック）は、決めた値にする（PINNED_GIT_SETTINGS）。同じ内容なら、どの環境で求めても同じIDになる。
     """
     with tempfile.TemporaryDirectory(prefix="cycle-index-") as tmp:
-        index = Path(tmp) / "index"
+        index, pinned = Path(tmp) / "index", Path(tmp)
         # コミットがまだ無いリポジトリでは失敗する。その場合は、空の索引から始める
-        run_git(worktree, "read-tree", "HEAD", index=index)
-        git(worktree, "add", "-A", index=index)
+        run_git(worktree, "read-tree", "HEAD", index=index, pinned=pinned)
+        git(worktree, "add", "-A", index=index, pinned=pinned)
         # 無視の対象でも、追跡しているファイル（git add -f で足したもの）は内容に含める
-        taken = set(git_paths(worktree, "ls-files", "-z", index=index))
+        taken = set(git_paths(worktree, "ls-files", "-z", index=index, pinned=pinned))
         forced = [
-            path for path in git_paths(worktree, "ls-files", "-z")
+            path for path in git_paths(worktree, "ls-files", "-z", pinned=pinned)
             if path not in taken and ((worktree / path).is_file() or (worktree / path).is_symlink())
         ]
         if forced:
             names = "\0".join(forced) + "\0"
-            git(worktree, "update-index", "--add", "-z", "--stdin", index=index, stdin=names)
-        return git(worktree, "write-tree", index=index)
+            git(worktree, "update-index", "--add", "-z", "--stdin", index=index, stdin=names, pinned=pinned)
+        return git(worktree, "write-tree", index=index, pinned=pinned)
 
 
 def is_tree_id(value: object) -> bool:
@@ -707,6 +779,7 @@ def run_check(cwd: Path) -> tuple[str, str, str]:
     返すのは（判定、確認した内容のツリーID、出力）。
 
     合格にするのは、終了コードが 0 で、実行の前後で内容が変わっていないときだけ。
+    呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（check_env。試験を選び直させない）。
     """
     before = tree_id(cwd)
     if not (cwd / CHECK_SCRIPT).is_file():
@@ -714,7 +787,7 @@ def run_check(cwd: Path) -> tuple[str, str, str]:
     try:
         proc = subprocess.run(
             [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", env=python_env(),
+            text=True, encoding="utf-8", errors="replace", env=check_env(python_env()),
         )
     except OSError as exc:
         return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
@@ -935,7 +1008,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_record_ci(args: argparse.Namespace) -> int:
     """Windows での手元の確認（scripts/local_ci.py）の結果を、ゲート windows の記録として取り込む。
 
-    取り込むのは、形が正しく、Windows で実行され、作業ツリーのいまの内容に対する結果だけ。
+    取り込むのは、形が正しく、Windows で、コミットを取り出して（mode: checkout、未コミットの変更なし、
+    内容の食い違いなし）実行された、作業ツリーのいまの内容に対する結果だけ。
     それ以外は、記録を変えずにエラーで終わる。結果が不合格なら、不合格として記録する。
     内容の突き合わせは、ほかの確認系のゲートと同じ決まり（結果の後で増えてよいのは、例外の場所への
     新しいファイルだけ）。
@@ -956,6 +1030,18 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
     system = result["os"]["system"]
     if system != WINDOWS_SYSTEM:
         raise CycleError(refused + f"Windows での結果ではない（{system[:40]}）")
+    # 取り込むのは、コミットを取り出して、その内容のまま確かめた結果だけ。作業フォルダで確かめた結果
+    # （--current）は、無視の対象のファイル（コミットに無い）に助けられた合格でも、ツリーが同じになるので
+    # 取り込まない
+    if result.get("mode") != "checkout":
+        raise CycleError(
+            refused + "コミットを取り出して確かめた結果ではない（--current の結果は取り込まない）。"
+            "Windows のPCで python scripts\\local_ci.py --ref origin/<ブランチ> を実行した結果を渡す"
+        )
+    if result.get("dirty") is not False:
+        raise CycleError(refused + "未コミットの変更を含む内容に対する結果（dirty）")
+    if result.get("changed") != []:
+        raise CycleError(refused + "確かめた内容が、対象のコミットと食い違っていた結果（changed）")
     tree = result["tree"]
     current = tree_id(worktree)
     try:

@@ -322,11 +322,6 @@ def test_c1_nothing_is_left_after_an_interruption(repo, tmp, tmp_path, stop):
 
 
 @pytest.mark.skipif(WINDOWS, reason="Windows では taskkill /T で、確認の先のプロセスまで止める")
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(軽微): Linux / macOS では、時間切れで止めるのは scripts/check.py だけで、"
-    "その先の pytest は "
-    "動き続ける（取り出した場所を消した後も、試験を最後まで実行する）。docs/verification/W2-verifier.md"
-))
 def test_c1_the_tests_do_not_keep_running_after_a_timeout(repo, tmp, tmp_path):
     wait = tmp_path / "wait"
     proc = local_ci(
@@ -485,11 +480,6 @@ def test_c3_a_result_of_the_folder_and_of_a_checkout_are_not_reused_for_each_oth
     assert run_count(runs) == 2                             # それぞれ、同じやり方の結果は使い回す
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(重大): 呼び出し元の PYTEST_ADDOPTS（-k、--deselect など）を引き継ぐので、一部の試験だけを"
-    "実行した結果が合格として記録され、record-ci が取り込み、後の素の実行でも使い回される。"
-    "docs/verification/W2-verifier.md"
-))
 def test_c3_a_run_with_only_some_tests_selected_does_not_make_a_pass(repo, tmp):
     assert cycle(repo, tmp, "start", "U1").returncode == 0
     wt = repo.parent / "wt" / "U1"

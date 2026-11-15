@@ -118,10 +118,14 @@ def ci_dir(root: Path) -> Path:
 
 
 def identity(result: dict) -> tuple:
-    """同じ確認かどうかを決めるもの: 取り出したか、どのコミットとツリーか、どのOSと Python か。"""
+    """同じ確認かどうかを決めるもの: 取り出したか、どのコミットとツリーか、どのOSと Python か、文字コード。
+
+    文字コードの設定（既定の文字コード、画面、ファイル名、UTF-8 モード。PYTHONUTF8 などで変わる）が違えば、
+    同じ内容でも別の確認として扱う（UTF-8 にした端末の合格を、素の端末の実行で示さない）。
+    """
     return (
         result.get("mode"), result["commit"], result["tree"],
-        result["os"]["system"], result["python"]["version"],
+        result["os"]["system"], result["python"]["version"], result.get("encoding"),
     )
 
 
@@ -206,9 +210,9 @@ def run_streaming(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float
     """コマンドを実行して、終了コードを返す。出力は受け取らず、そのまま画面に流す（どこにも記録しない）。
 
     呼び出し元の標準入力は渡さない（人が見ていない実行で、入力を待って止まり続けないように）。
-    時間切れと中断では、起動したプロセス（Windows では、その先のプロセスも）を止めてから、例外を送出する。
+    時間切れと中断では、起動したプロセスを、その先のプロセス（pytest）ごと止めてから、例外を送出する。
     """
-    with subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL) as proc:
+    with subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, **cycle.group_options()) as proc:
         try:
             return proc.wait(timeout=timeout)
         except BaseException:               # 時間切れ、中断（Ctrl-C、終了の合図）
@@ -219,6 +223,22 @@ def run_streaming(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float
 def changed_paths(place: Path, before: str, after: str) -> list[str]:
     """2つのツリーの間で違うファイルの名前（結果に残すのは、先頭の20個まで）。"""
     return cycle.git_paths(place, "diff", "--no-renames", "--name-only", "-z", before, after)[:20]
+
+
+def check_env(place: Path, junit: Path) -> dict[str, str]:
+    """確認を実行するときの環境変数。
+
+    - 呼び出し元の pytest の環境変数（PYTEST_ADDOPTS、PYTEST_PLUGINS など）は引き継がない（cycle.check_env）。
+      -k や --deselect で一部の試験だけを実行した結果を、合格として記録しないため。渡すオプションは、
+      試験ごとの結果を書かせるもの（junit_options）だけ。
+    - 確かめる場所を、Python が読み込む場所（PYTHONPATH）の先頭に置く。試験が別の場所から起動した Python も、
+      pip install -e . で入れた作業フォルダの版ではなく、確かめる場所の版を読む。呼び出し元の値は、その後に
+      続ける。
+    """
+    env = cycle.check_env(dict(os.environ))
+    env["PYTEST_ADDOPTS"] = junit_options(junit)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(place), os.environ.get("PYTHONPATH")]))
+    return env
 
 
 def run_check(place: Path, tree: str, junit: Path, timeout: float) -> dict:
@@ -232,13 +252,10 @@ def run_check(place: Path, tree: str, junit: Path, timeout: float) -> dict:
     if before != tree:
         changed = changed_paths(place, tree, before)
         return {**outcome, "changed": changed, "verdict": "error", "reason": "content_mismatch"}
-    addopts = " ".join(filter(None, [os.environ.get("PYTEST_ADDOPTS"), junit_options(junit)]))
     print(f"{cycle.CHECK_SCRIPT} を実行します（ruff と pytest。数分かかることがあります）", flush=True)
     started = time.monotonic()
     try:
-        code = run_streaming(
-            [sys.executable, cycle.CHECK_SCRIPT], place, {**os.environ, "PYTEST_ADDOPTS": addopts}, timeout,
-        )
+        code = run_streaming([sys.executable, cycle.CHECK_SCRIPT], place, check_env(place, junit), timeout)
     except subprocess.TimeoutExpired:
         code = None
     check = {**check, "returncode": code, "seconds": round(time.monotonic() - started, 1)}
@@ -274,12 +291,15 @@ def check_target(root: Path, target: dict, timeout: float) -> dict:
 
     取り出すのは git の作業ツリー（コミットにある内容だけ）。作業中のフォルダの未コミットの変更、
     無視されているファイル（.venv など）は、取り出した場所には無い。
+    取り出す git は、ツリーIDを求めるのと同じ決めた設定で動かす（改行を変換しない。作業フォルダのフック、
+    post-checkout などは動かさない）。
     """
     base = cycle.real_path(tempfile.mkdtemp(prefix=WORK_PREFIX))
     checkout = base / "checkout" if target["mode"] == "checkout" else None
     try:
         if checkout is not None:
-            cycle.git(root, "worktree", "add", "--detach", str(checkout), target["commit"])
+            add = ("worktree", "add", "--detach", str(checkout), target["commit"])
+            cycle.git(root, *add, pinned=base)
         return run_check(checkout or root, target["tree"], base / "junit.xml", timeout)
     finally:
         if not clean_up(root, base, checkout):

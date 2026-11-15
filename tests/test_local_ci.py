@@ -28,12 +28,14 @@ from test_harness import (
     commit,
     cycle,
     implement,
+    install_hook,
     make_repo,
     only_posix,
     only_windows,
     set_header,
     sh,
     state,
+    users_git_config,
     wait_for,
     write_text_like_windows,
 )
@@ -55,7 +57,9 @@ HARNESS = LOCAL_CI.cycle        # local_ci.py が使っている、ハーネス�
 
 # 試験用の確認スクリプト。リポジトリの plan.json（コミットされた内容）に書かれたとおりに振る舞う:
 #   junit: 試験ごとの結果として書く XML（無ければ書かない）、write: 実行中に書くファイル（名前と中身）、
-#   sleep: 止まる秒数、exit: 終了コード（環境変数 CHECK_EXIT があれば、そちら）
+#   sleep: 止まる秒数、exit: 終了コード（環境変数 CHECK_EXIT があれば、そちら）、
+#   child: 確認の先で動くプロセス（pytest の代わり）を起動し、その秒数の後に NOTES.child の印を置かせる、
+#   import_product: 別の場所から起動した Python が、product をどこから読むかを控える
 # 環境変数 NOTES のファイルに、実行のたびに、実行した場所や受け取ったものを控える。
 # 最後まで進んだら、NOTES に .finished を付けた名前のファイルを置く。
 PLANNED_CHECK = """\
@@ -63,17 +67,28 @@ import json
 import os
 import pathlib
 import shlex
+import subprocess
 import sys
 import time
 
 plan = json.loads(pathlib.Path("plan.json").read_text(encoding="utf-8"))
+if plan.get("child"):
+    later = "import pathlib, sys, time; time.sleep(float(sys.argv[1])); pathlib.Path(sys.argv[2]).touch()"
+    subprocess.Popen([sys.executable, "-c", later, str(plan["child"]), os.environ["NOTES"] + ".child"])
 options = shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))
 junit = [option.split("=", 1)[1] for option in options if option.startswith("--junitxml=")]
 note = {
     "cwd": os.getcwd(), "files": sorted(os.listdir(".")), "options": options, "junit": junit,
     "stdin": sys.stdin.readline() if os.environ.get("READ_STDIN") else None,
     "guard": os.environ.get("CIRCUIT_SIM_PYTEST_RUNNING"),
+    "pytest_settings": sorted(name for name in os.environ if name.startswith("PYTEST_")),
+    "pythonpath": os.environ.get("PYTHONPATH", "").split(os.pathsep),
 }
+if plan.get("import_product"):
+    where = "import product; print(product.__file__)"
+    elsewhere = os.path.dirname(os.environ["NOTES"])
+    found = subprocess.run([sys.executable, "-B", "-c", where], cwd=elsewhere, capture_output=True, text=True)
+    note["product"] = found.stdout.strip()
 notes = pathlib.Path(os.environ["NOTES"])
 runs = json.loads(notes.read_text(encoding="utf-8")) if notes.exists() else []
 notes.write_text(json.dumps(runs + [note]), encoding="utf-8")
@@ -247,19 +262,82 @@ def test_check_gets_the_report_file_outside_the_checked_content_and_no_input(rep
         # 場所は、たどった先で扱う。git に渡す場所と、pytest に渡す場所が、同じ書き方になる
         (repo.parent / "実際の場所").mkdir()
         (repo.parent / "作業 用").symlink_to(repo.parent / "実際の場所", target_is_directory=True)
-    env = {"PYTEST_ADDOPTS": "-p no:cacheprovider", "CIRCUIT_SIM_PYTEST_RUNNING": "1", "READ_STDIN": "1"}
+    env = {"CIRCUIT_SIM_PYTEST_RUNNING": "1", "READ_STDIN": "1"}
     proc = start_local_ci(repo, "--no-fetch", "--ref", "main", env=env, stdin=subprocess.PIPE)
     out, err = proc.communicate("input of the caller\n", timeout=120)
     assert proc.returncode == 0, out + err
     [note] = notes(repo)
     place = Path(note["cwd"])
-    assert note["options"][:2] == ["-p", "no:cacheprovider"]            # 利用者が渡していたオプションは残す
     report = (place.parent / "junit.xml").as_posix()                    # 取り出した内容の、外
-    assert note["options"][2:] == [f"--junitxml={report}", "-o", "junit_family=xunit1"]
+    assert note["options"] == [f"--junitxml={report}", "-o", "junit_family=xunit1"]
     assert note["stdin"] == ""
     assert note["guard"] == "1"
     assert "check output" in out                                         # 確認の出力は、そのまま画面に流れる
     assert_cleaned_up(repo)
+
+
+CALLERS_PYTEST_SETTINGS = {
+    "試験を名前で選ぶ（-k）": {"PYTEST_ADDOPTS": "-k test_skipped"},
+    "落ちる試験を外す（--deselect。外さなければ合格になる）": {
+        "PYTEST_ADDOPTS": "--deselect tests/test_sample.py::TestGroup"
+        " --deselect 'tests/test_sample.py::test_param[a b]'"
+        " --deselect tests/test_sample.py::test_with_fixture",
+    },
+    "ファイルを外す（--ignore）、前に失敗した試験だけ（--lf）、印で選ぶ（-m）": {
+        "PYTEST_ADDOPTS": "--ignore=tests/test_sample.py --lf -m slow",
+    },
+    "試験を選び直す差し込み（PYTEST_PLUGINS）": {"PYTEST_PLUGINS": "chooser"},
+}
+
+# PYTEST_PLUGINS で読み込ませる差し込み。スキップの試験だけを残す
+CHOOSER = """\
+def pytest_collection_modifyitems(config, items):
+    items[:] = [item for item in items if item.name == "test_skipped"]
+"""
+
+
+@pytest.mark.parametrize("case", CALLERS_PYTEST_SETTINGS)
+def test_callers_pytest_settings_do_not_choose_the_tests(tmp_path, case):
+    """呼び出し元の pytest の環境変数（PYTEST_ADDOPTS、PYTEST_PLUGINS など）は、確認に渡さない。
+
+    渡すと、全体では落ちるコミットで、一部の試験だけを実行した結果が合格になり、取り込まれ、使い回される。
+    本物の pytest で確かめる。渡すオプションは、試験ごとの結果を書かせるものだけ。
+    """
+    root = make_repo(tmp_path)
+    shutil.copy(ROOT / "scripts" / "check.py", root / "scripts" / "check.py")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_sample.py").write_text(SAMPLE_TESTS, encoding="utf-8")
+    ignored = ".cycle/\n__pycache__/\n.pytest_cache/\n.ruff_cache/\n"
+    (root / ".gitignore").write_text(ignored, encoding="utf-8")
+    commit(root, "tests")
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "chooser.py").write_text(CHOOSER, encoding="utf-8")
+    env = {"BREAK": "1", "PYTHONPATH": str(plugins), **CALLERS_PYTEST_SETTINGS[case]}
+    failed = run_local_ci(root, "--no-fetch", "--ref", "main", env=env)
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    [written] = results(root)
+    assert (written["verdict"], written["reason"]) == ("fail", "tests_failed")
+    assert written["tests"] == {"total": 5, "passed": 1, "failed": 2, "errors": 1, "skipped": 1}
+    # 同じ設定のままでも、素の実行でも、使い回すのは、この不合格
+    assert run_local_ci(root, "--no-fetch", "--ref", "main", env={"BREAK": "1"}).returncode == 1
+    assert len(results(root)) == 1
+
+
+def test_python_started_elsewhere_reads_the_checked_content_first(repo):
+    """pip install -e . の環境では、作業フォルダが、どこから起動した Python にも読み込まれる。
+
+    試験が別の場所から起動した Python も、確かめる場所の版を先に読む（Python が読み込む場所の先頭に置く）。
+    ここでは、作業フォルダを PYTHONPATH に入れて、入れた状態の代わりにする。
+    """
+    set_plan(repo, junit=PASSING, import_product=True)
+    (repo / "product.py").write_text("x = 99\n", encoding="utf-8")       # 作業フォルダの、未コミットの変更
+    result = local_ci(repo, "--no-fetch", "--ref", "main", env={"PYTHONPATH": str(repo)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    [note] = notes(repo)
+    place = Path(note["cwd"])
+    assert Path(note["product"]).resolve() == (place / "product.py").resolve()
+    assert [Path(entry) for entry in note["pythonpath"]] == [place, repo]   # 呼び出し元の値は、後に続く
 
 
 def test_report_file_option_survives_the_way_pytest_splits_it_on_windows():
@@ -596,10 +674,13 @@ def test_test_name_is_built_from_the_report_items(case):
 
 
 def test_check_that_does_not_finish_is_stopped_and_is_not_a_pass(repo):
-    set_plan(repo, junit=PASSING, sleep=30)
+    """時間切れでは、確認スクリプトと、その先のプロセス（pytest の代わり）を止める。"""
+    set_plan(repo, junit=PASSING, sleep=30, child=2)
     started = time.monotonic()
     result = local_ci(repo, "--no-fetch", "--ref", "main", "--timeout", "1")
     assert time.monotonic() - started < 20
+    time.sleep(3)
+    assert not (repo.parent / "notes.json.child").exists(), "時間切れの後も、確認の先のプロセスが動いていた"
     assert result.returncode == 1
     [written] = results(repo)
     assert (written["verdict"], written["reason"]) == ("error", "timeout")
@@ -685,10 +766,10 @@ def test_result_of_a_run_without_a_result_is_not_reused(repo):
 
 
 def altered(**changes: object):
-    """結果の項目を差し替える書き換え。os と python は、中の項目だけを差し替える。"""
+    """結果の項目を差し替える書き換え。os、python、encoding は、中の項目だけを差し替える。"""
     def change(written: dict) -> str:
         for key, value in changes.items():
-            written[key] = {**written[key], **value} if key in ("os", "python") else value
+            written[key] = {**written[key], **value} if key in ("os", "python", "encoding") else value
         return json.dumps(written)
     return change
 
@@ -699,6 +780,13 @@ NOT_THE_SAME_CHECK = {
     "別のツリーの結果": altered(tree="1" * 40),
     "別のコミットの結果": altered(commit="1" * 40),
     "取り出さずに実行した結果": altered(mode="current"),
+    "既定の文字コードが違う結果": altered(encoding={"locale": "cp932"}),
+    "UTF-8 モード（PYTHONUTF8）が違う結果": altered(encoding={"utf8_mode": not sys.flags.utf8_mode}),
+    "画面の文字コードが違う結果": altered(encoding={"stdout": "cp932"}),
+    "文字コードの記録が空の結果": lambda written: json.dumps({**written, "encoding": None}),
+    "文字コードの項目が無い結果": lambda written: json.dumps(
+        {key: value for key, value in written.items() if key != "encoding"},
+    ),
     "合格と書かれているが、中身が合格と矛盾する": altered(tests=None),
     "JSON でない": lambda written: "{",
     "UTF-8 でない": lambda written: b"\x80\x81",
@@ -741,6 +829,74 @@ def test_current_checks_the_working_folder_as_it_is(repo):
     assert written["tree"] == HARNESS.tree_id(repo) != tree
     assert "未コミットの変更あり" in result.stdout
     assert len(worktrees(repo)) == 1 and list(work_dir(repo).iterdir()) == []
+
+
+def test_current_records_the_tree_the_harness_finds_whatever_git_settings_it_reads(repo, tmp_path):
+    """Windows の実機で落ちた形を、どのOSでも再現する（W2 の確認。原因は docs/design/harness.md の5章）。
+
+    試験の中の local_ci.py は、利用者とシステムの git の設定から切り離して動く（TEST_ENV）。試験のプロセス
+    自身の呼び出しは、利用者の端末の設定（Git for Windows のシステムの設定 core.autocrlf=true）を読む。
+    新しいファイルを CRLF で書いた（Windows の write_text）とき、その設定を読む側だけが LF に直していた。
+    """
+    with write_text_like_windows():
+        (repo / "plan.json").write_text(json.dumps({"exit": 1}), encoding="utf-8")
+        (repo / "new.txt").write_text("n\n", encoding="utf-8")
+    result = local_ci(repo, "--current")
+    assert result.returncode == 1, result.stdout + result.stderr
+    written = results(repo)[-1]
+    users = users_git_config(tmp_path, "[core]\n\tautocrlf = true\n\tfileMode = false\n")
+    with mock.patch.dict(os.environ, {**TEST_ENV, **users}, clear=True):
+        assert written["tree"] == HARNESS.tree_id(repo)
+    assert sh(repo, "git", "rev-parse", f"{written['tree']}:new.txt") == sh(
+        repo, "git", "hash-object", "--no-filters", "new.txt",
+    )
+
+
+def test_checkout_is_the_commit_whatever_git_settings_and_hooks_the_working_folder_has(repo, tmp_path):
+    """取り出す git も、ツリーIDと同じ決めた設定で動く。改行を変換せず、作業フォルダのフックを動かさない。
+
+    利用者の core.autocrlf=true（Git for Windows の既定）で取り出すと、属性の無いファイルの改行が CRLF に
+    なり、確かめる内容がコミットと食い違う。post-checkout などのフックは、取り出した場所で動き、内容を
+    変えうる。
+    """
+    marker = tmp_path / "hook-ran"
+    for hook in ("post-checkout", "reference-transaction"):
+        install_hook(repo, hook, marker)
+    commit_id, tree = head(repo)
+    users = users_git_config(tmp_path, "[core]\n\tautocrlf = true\n")
+    result = local_ci(repo, "--no-fetch", "--ref", "main", env=users)
+    assert result.returncode == 0, result.stdout + result.stderr
+    [written] = results(repo)
+    assert (written["commit"], written["tree"], written["verdict"]) == (commit_id, tree, "pass")
+    assert not marker.exists()
+    assert_cleaned_up(repo)
+
+
+def test_current_result_is_not_taken_as_the_windows_gate(tmp_path):
+    """作業フォルダで確かめた結果（--current）は、ツリーが同じでも取り込まない。
+
+    コミットに無い、無視の対象のファイル（*.csv など）に助けられた合格でも、ツリーは同じで、
+    未コミットの変更なしになる。
+    """
+    root = make_repo(tmp_path)
+    (root / "scripts" / "check.py").write_text(PLANNED_CHECK, encoding="utf-8")
+    (root / "plan.json").write_text(json.dumps({"junit": PASSING}), encoding="utf-8")
+    (root / ".gitignore").write_text(".cycle/\n*.csv\n", encoding="utf-8")
+    commit(root, "plan")
+    set_header(root, "needs_windows: true\n")
+    wt = implement(root)
+    commit(wt)
+    (wt / "data.csv").write_text("1\n", encoding="utf-8")         # 無視の対象。コミットには無い
+    with as_windows():
+        assert local_ci(wt, "--current").returncode == 0
+    [written] = results(wt)
+    unit_tree = cycle(root, "snapshot", "U1").stdout.strip()
+    assert (written["mode"], written["dirty"], written["tree"]) == ("current", False, unit_tree)
+    path = result_files(wt)[0]
+    refused = cycle(root, "record-ci", "U1", "--result", str(path))
+    assert refused.returncode == 2
+    assert "コミットを取り出して確かめた結果ではない（--current の結果は取り込まない）" in refused.stderr
+    assert "windows" not in state(root)["gates"]
 
 
 def test_current_on_a_detached_head_has_no_branch(repo):
@@ -799,7 +955,7 @@ def test_checkout_is_removed_when_it_cannot_be_made(repo):
     pytest.param("CTRL_BREAK_EVENT", marks=only_windows("Ctrl-Break の合図は Windows にだけある")),
 ])
 def test_checkout_is_removed_and_the_check_is_stopped_when_the_run_is_told_to_end(repo, stop):
-    set_plan(repo, junit=PASSING, sleep=3)
+    set_plan(repo, junit=PASSING, sleep=3, child=2)
     proc = start_local_ci(repo, "--no-fetch", "--ref", "main")
     wait_for(repo.parent / "notes.json")                    # 確認が走っている
     proc.send_signal(getattr(signal, stop))
@@ -809,6 +965,7 @@ def test_checkout_is_removed_and_the_check_is_stopped_when_the_run_is_told_to_en
     assert_cleaned_up(repo)
     time.sleep(4)
     assert not (repo.parent / "notes.json.finished").exists()       # 確認スクリプトは、止められている
+    assert not (repo.parent / "notes.json.child").exists()          # その先のプロセスも
 
 
 def test_registration_is_removed_even_when_git_first_refuses_to_remove_the_checkout(repo):
