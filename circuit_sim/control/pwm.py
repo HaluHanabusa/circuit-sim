@@ -26,6 +26,10 @@ class Pwm(BaseModel):
                 "triangle" = 三角波（オンの区間が周期の中央に来る）。
     carry_remainder : 格子点に丸めた余りを次の周期に持ち越す（既定 True）。False にすると、
                 毎周期 round(duty * N) ステップになる。
+    complement : 相補のゲート信号の名前（省略できる）。指定すると、name がオフの区間だけオンになる
+                ゲート信号をこの名前で出す。ブリッジのレグの上下のスイッチを動かすのに使う
+                （上のスイッチが name、下のスイッチが complement）。
+    dead_time : 上下のスイッチを両方オフにする時間 [s]。いまは 0 だけ（0 以外はエラー）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -35,11 +39,19 @@ class Pwm(BaseModel):
     duty: float | str
     carrier: Literal["sawtooth", "triangle"] = "sawtooth"
     carry_remainder: bool = True
+    complement: str | None = None
+    dead_time: float = 0.0
 
     @model_validator(mode="after")
     def _check(self) -> Pwm:
         if not math.isfinite(self.frequency):
             raise ValueError(f"{self.name}: frequency は有限値が必要")
+        if self.complement is not None and (not self.complement or self.complement == self.name):
+            raise ValueError(f"{self.name}: complement には、name と違う空でない名前を付ける")
+        if self.dead_time != 0.0:
+            raise ValueError(
+                f"{self.name}: デッドタイム（dead_time={self.dead_time}）はまだ扱えない。0 にする"
+            )
         if isinstance(self.duty, str):
             if not self.duty:
                 raise ValueError(f"{self.name}: duty に指令の名前を使うなら空にしない")
@@ -63,6 +75,11 @@ class Pwm(BaseModel):
         counts = np.clip(counts, 0, steps_per_period).astype(np.int64)
         left = carry + n_periods * exact - float(counts.sum())
         return counts, min(max(left, -0.5), 0.5)
+
+    @property
+    def outputs(self) -> list[str]:
+        """このPWMが出すゲート信号の名前（相補のゲートがあれば2つ）。"""
+        return [self.name] if self.complement is None else [self.name, self.complement]
 
     def pattern(self, k: np.ndarray, steps_per_period: int, n_on: np.ndarray | int) -> np.ndarray:
         """ステップ番号 k（配列）の区間 [t[k], t[k+1]) でオンかどうか。

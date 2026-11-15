@@ -7,6 +7,9 @@ SI単位の値だけを受け取り、単位を知らない。
   接頭語  : f p n u(µ, μ) m k M G
   単位記号: V（電圧）、A（電流）、ohm / Ohm / Ω（抵抗）、H（インダクタンス）、F（キャパシタンス）、
             Hz（周波数）、s（時間）、W（電力）
+  接頭語を付けない単位（制御の値）: 1/V（比例ゲイン）、1/(V·s)（積分ゲイン）、s/V（微分ゲイン）、
+            1（無次元。デューティなど）、%（無次元の 1/100）。
+            空の文字列は読まない（単位の書き忘れと区別できない）
 """
 from __future__ import annotations
 
@@ -27,6 +30,17 @@ UNIT_DIMENSION = {
     "W": "power",
 }
 
+# 接頭語を付けない単位（完全に一致したときだけ読む）→（次元、10 の指数）。
+# 制御のゲインは、デューティ（無次元）を電圧の偏差で割った量。· は U+00B7、* と空白も受け付ける
+EXACT_UNITS = {
+    "1/V": ("per_voltage", 0),
+    "1/(V·s)": ("per_voltage_time", 0),
+    "1/(V*s)": ("per_voltage_time", 0),
+    "1/(V s)": ("per_voltage_time", 0),
+    "s/V": ("time_per_voltage", 0),
+    "1": ("ratio", 0), "%": ("ratio", -2),
+}
+
 # 次元 → （日本語の呼び名、SI単位の記号）
 DIMENSION_LABEL = {
     "voltage": ("電圧", "V"),
@@ -37,6 +51,10 @@ DIMENSION_LABEL = {
     "frequency": ("周波数", "Hz"),
     "time": ("時間", "s"),
     "power": ("電力", "W"),
+    "per_voltage": ("比例ゲイン（1/電圧）", "1/V"),
+    "per_voltage_time": ("積分ゲイン（1/(電圧·時間)）", "1/(V·s)"),
+    "time_per_voltage": ("微分ゲイン（時間/電圧）", "s/V"),
+    "ratio": ("無次元の量", "1"),
 }
 
 
@@ -50,6 +68,8 @@ def parse_unit(text: str) -> tuple[str, int]:
     例: "mH" → ("inductance", -3)、"kΩ" → ("resistance", 3)、"V" → ("voltage", 0)
     """
     unit = text.strip()
+    if unit in EXACT_UNITS:
+        return EXACT_UNITS[unit]
     if unit in UNIT_DIMENSION:
         return UNIT_DIMENSION[unit], 0
     for symbol, dimension in UNIT_DIMENSION.items():

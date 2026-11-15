@@ -11,7 +11,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "0.1"
+SCHEMA_VERSION = "0.2"
+SUPPORTED_SCHEMA_VERSIONS = ("0.1", "0.2")
+LEGACY_SOURCE = "記載なし"     # 版 0.1 の control の数値を Quantity にしたときの出どころ
 
 
 # ---------------------------------------------------------------- 層A: 仕様
@@ -31,28 +33,72 @@ class Quantity(BaseModel):
 
 
 class SimulationSettings(BaseModel):
-    """計算時間と刻み。省略するとテンプレートが回路定数から決める。"""
+    """計算時間と刻み、モデルの精度。省略するとテンプレートが決める。
+
+    fidelity: "switching"（スイッチングモデル。スイッチを理想スイッチで計算する）、
+              "average"（平均モデル。ブリッジのレグを「指令 × 直流電圧」の電源に置き換える）。
+              省略するとテンプレートの既定（スイッチを含むテンプレートでは switching）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     t_end: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     h: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    fidelity: Literal["switching", "average"] | None = None
 
 
 class Spec(BaseModel):
+    """仕様（層A）。
+
+    版 0.2: control の値も plant と同じ Quantity（値、単位、出どころ）。
+    版 0.1: control の値は単位の無い数値だった。読むときは、数値（と null）を単位 ""、出どころ
+            「記載なし」の Quantity にする（legacy_control() で分かる。単位はテンプレートが SI とみなす）。
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["0.1"] = SCHEMA_VERSION
+    schema_version: Literal["0.1", "0.2"] = SCHEMA_VERSION
     template: str
     plant: dict[str, Quantity]
-    control: dict[str, Any] | None = None
+    control: dict[str, Quantity] | None = None
     targets: dict[str, float] = Field(default_factory=dict)
     simulation: SimulationSettings = Field(default_factory=SimulationSettings)
     missing: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _read_legacy_control(cls, data: Any) -> Any:
+        """版 0.1 の control の数値を Quantity の形にする。
+
+        数値でも null でも Quantity の形でもなければエラー。
+        """
+        if not isinstance(data, dict) or data.get("schema_version") != "0.1":
+            return data
+        control = data.get("control")
+        if not isinstance(control, dict):
+            return data
+        converted = {}
+        for name, value in control.items():
+            if value is None or (isinstance(value, int | float) and not isinstance(value, bool)):
+                converted[name] = {"value": value, "unit": "", "source": LEGACY_SOURCE}
+            elif isinstance(value, dict):
+                converted[name] = value
+            else:
+                raise ValueError(
+                    f"仕様の版 0.1 の control.{name} は数値でないので読めない（{value!r}）。"
+                    "版 0.2 の形（value、unit、source）で書く"
+                )
+        return {**data, "control": converted}
+
     def null_fields(self) -> list[str]:
         """値が入っていないパラメータ名の一覧。"""
         return [name for name, q in self.plant.items() if q.value is None]
+
+    def legacy_control(self) -> list[str]:
+        """版 0.1 の数値から作った control の項目（単位 ""、出どころ「記載なし」）の名前。"""
+        if self.schema_version != "0.1" or not self.control:
+            return []
+        return [n for n, q in self.control.items() if q.unit == "" and q.source == LEGACY_SOURCE]
 
 
 # ---------------------------------------------------------- 層B: ネットリスト
@@ -84,7 +130,39 @@ class Sine(BaseModel):
     offset: float = Field(default=0.0, allow_inf_nan=False)
 
 
-Waveform = Annotated[DC | Step | Sine, Field(discriminator="kind")]
+class Command(BaseModel):
+    """制御器の指令で値が決まる電源: 値 = gain × 指令（lower〜upper で止める）。
+
+    指令は制御器の出力の名前（command）。制御周期の頭で変わり、次に変わるまで一定（区分一定）。
+    制御器（simulate の controllers）が無いと計算できない。平均モデルでブリッジのレグを置き換えるのに使う
+    （指令 = デューティ、gain = 直流電圧、lower = 0、upper = 1）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["command"] = "command"
+    command: str = Field(min_length=1)
+    gain: float = Field(allow_inf_nan=False)
+    lower: float | None = Field(default=None, allow_inf_nan=False)
+    upper: float | None = Field(default=None, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check(self) -> Command:
+        if self.lower is not None and self.upper is not None and self.lower > self.upper:
+            raise ValueError(
+                f"指令 '{self.command}': lower（{self.lower}）は upper（{self.upper}）以下にする"
+            )
+        return self
+
+    def value(self, command: float) -> float:
+        """指令の値から電源の値を作る。"""
+        if self.lower is not None:
+            command = max(command, self.lower)
+        if self.upper is not None:
+            command = min(command, self.upper)
+        return self.gain * command
+
+
+Waveform = Annotated[DC | Step | Sine | Command, Field(discriminator="kind")]
 
 
 DEFAULT_R_ON = 1e-3    # S と D のオン抵抗の既定値 [ohm]
@@ -94,7 +172,7 @@ DEFAULT_R_OFF = 1e6    # S と D のオフ抵抗の既定値 [ohm]
 class Component(BaseModel):
     """2端子素子。
 
-    type  : R [ohm], L [H], C [F], V = 電圧源 [V], I = 電流源 [A],
+    type  : R [ohm], L [H], C [F], V = 電圧源 [V], I = 電流源 [A]（波形は DC / Step / Sine / Command）,
             S = 制御スイッチ, D = ダイオード（順方向電圧は 0）
     nodes : (n+, n-)。電流の正方向は素子の中を n+ から n- へ（SPICEと同じ）。
             D はアノードが n+、カソードが n-。

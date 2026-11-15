@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..control import Controller, Pwm
 from ..ir import Component, Netlist, Spec, Step
+from ..simulate import Result, simulate
 from ..units import DIMENSION_LABEL, UnitError, parse_unit, to_si
+from .items import MissingValueError, SignalInfo
 
 DEFAULT_MAX_STEPS = 20_000    # 既定の刻みと計算時間で出すステップ数の上限（画面の横1列あたり約10点）
 PHASE_NOTE = 0.008            # 振動の位相のずれの見積もりが入力のこの比を超えたら知らせる。
@@ -25,21 +28,32 @@ def _readable(unit: str) -> bool:
     return True
 
 
-class MissingValueError(ValueError):
-    """仕様に値が入っていないパラメータがある。"""
-
-    def __init__(self, names: list[str]):
-        self.names = names
-        super().__init__(f"値が入っていないパラメータ: {names}")
-
-
 @dataclass
 class Expanded:
+    """テンプレートを展開した結果（層Bと、計算に渡すもの）。
+
+    probes      : 要約に出す信号の名前
+    notes       : 単位の換算、既定の刻みの調整など、利用者に伝えること
+    gates, controllers : simulate() に渡すゲート信号と制御器（スイッチや制御の無い回路では空）
+    signals     : 表示する信号の定義（名前、単位、既定で表示するか、電流の正の向き）。空なら probes
+    fidelity    : モデルの精度（"switching" / "average"。精度を選べないテンプレートでは None）
+    """
+
     netlist: Netlist
     t_end: float
     h: float
     probes: list[str]
-    notes: list[str] = field(default_factory=list)    # 単位の換算、既定の刻みの調整など、利用者に伝えること
+    notes: list[str] = field(default_factory=list)
+    gates: list[Pwm] = field(default_factory=list)
+    controllers: list[Controller] = field(default_factory=list)
+    signals: list[SignalInfo] = field(default_factory=list)
+    fidelity: str | None = None
+
+    def run(self, **kwargs) -> Result:
+        """展開した回路を計算する（simulate() に、刻み・ゲート信号・制御器を渡す）。"""
+        return simulate(
+            self.netlist, self.t_end, self.h, gates=self.gates, controllers=self.controllers, **kwargs
+        )
 
 
 def _values(spec: Spec, names: list[str], notes: list[str]) -> dict[str, float]:

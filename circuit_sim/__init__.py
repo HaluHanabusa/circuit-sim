@@ -1,13 +1,26 @@
 """回路シミュレータ（仕様JSONのスキーマと、R / L / C / 電源 / スイッチ / ダイオードのソルバ核）。"""
 from .control import Controller, Pwm
-from .ir import DC, SCHEMA_VERSION, Component, Netlist, Quantity, Sine, Spec, Step
+from .ir import (
+    DC,
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    Command,
+    Component,
+    Netlist,
+    Quantity,
+    Sine,
+    Spec,
+    Step,
+)
 from .mna import CircuitError, build_system
 from .simulate import Result, simulate
 from .templates import MissingValueError, expand
 
 __all__ = [
     "SCHEMA_VERSION",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "CircuitError",
+    "Command",
     "Component",
     "Controller",
     "DC",
