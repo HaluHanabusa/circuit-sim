@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,9 +48,14 @@ EMPTY_GIT_CONFIG = Path(tempfile.gettempdir()) / "circuit-sim-test-empty.gitconf
 EMPTY_GIT_CONFIG.write_text("", encoding="utf-8")
 
 # 試験の中の git は、利用者の設定（署名、フック、改行の変換など）や、呼び出し元の GIT_DIR などに
-# 左右されないようにする。起動した Python の出力は、端末の文字コードに依らず UTF-8 で受け取る
+# 左右されないようにする。起動した Python の出力は、端末の文字コードに依らず UTF-8 で受け取る。
+# 実行した場所でコマンドを探させない印（NoDefaultCurrentDirectoryInExePath）は、呼び出し元から引き継がない
+# （スクリプトが自分で置くことを確かめる試験が、呼び出し元の印で通ってしまわないように）
 TEST_ENV = {
-    **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+    **{
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key.lower() != "nodefaultcurrentdirectoryinexepath"
+    },
     "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     "GIT_CONFIG_GLOBAL": str(EMPTY_GIT_CONFIG), "GIT_CONFIG_NOSYSTEM": "1",
@@ -399,6 +405,8 @@ def test_merge_succeeds_when_all_gates_pass(repo):
     }
     assert not (repo / ".cycle" / "merge-pending.json").exists()
     assert "U1（docs/plan/U1-demo.md、担当 solver-engineer）  統合済み" in cycle(repo, "status", "U1").stdout
+    # 取り込んだ後の確認の出力も、記録に残る
+    assert len(list((repo / ".cycle" / "runs").glob("U1-merge-check-*.log"))) == 1
 
 
 def test_merge_refused_when_a_gate_is_missing(repo):
@@ -511,6 +519,16 @@ def test_spec_without_a_complete_header_is_rejected(repo, text, message):
     assert result.returncode == 2
     assert message in result.stderr
     assert not (repo / ".cycle" / "state" / "U1.json").exists()
+
+
+def test_blank_lines_in_the_header_are_allowed(repo):
+    """見出しの中の空行は、読み飛ばす（読めない行として拒まない）。"""
+    text = "---\nid: U1\n\nowner: solver-engineer\n   \nneeds_ux: true\n---\n# U1\n"
+    (repo / "docs" / "plan" / "U1-demo.md").write_text(text, encoding="utf-8")
+    commit(repo, "見出しに空行")
+    result = cycle(repo, "start", "U1")
+    assert result.returncode == 0, result.stderr
+    assert state(repo)["owner"] == "solver-engineer" and "ux" in CYCLE_MODULE.required_gates(state(repo))
 
 
 @pytest.mark.parametrize("count", [0, 2])
@@ -795,10 +813,12 @@ def test_record_rejects_a_tree_that_cannot_be_resolved(repo, value):
 
 @pytest.mark.parametrize("tree, message", [
     ("HEAD", "review: 記録の対象がツリーIDでない（HEAD）"),     # 名前のままの記録は、決して古くならない
+    ("main", "review: 記録の対象がツリーIDでない（main）"),
+    (None, "review: 記録の対象がツリーIDでない（None）"),
     ("1" * 40, "review: 記録の対象（1111111111）を読めない"),   # 無くなったツリーとは比べられない
 ])
 def test_gate_whose_recorded_tree_cannot_be_compared_is_not_valid(repo, tree, message):
-    """以前の版が残した記録や、手で直した記録を、合格として扱わない。"""
+    """以前の版が残した記録や、手で直した記録を、合格として扱わない。理由は、その1つだけを挙げる。"""
     wt = implement(repo)
     pass_all(repo)
     commit(wt)
@@ -807,7 +827,9 @@ def test_gate_whose_recorded_tree_cannot_be_compared_is_not_valid(repo, tree, me
     (repo / ".cycle" / "state" / "U1.json").write_text(json.dumps(data), encoding="utf-8")
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1
-    assert message in result.stdout
+    assert [line for line in result.stdout.splitlines() if line.startswith("  - review:")] == [
+        f"  - {message}。やり直す",
+    ]
     assert main_log(repo) == ["init"]
 
 
@@ -822,6 +844,13 @@ def test_merge_refused_when_check_is_stale_or_failed(repo):
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1
     assert "check: 確認した後で内容が変わっている" in result.stdout
+    # 製品のコードが変わっても、check の理由は1つだけ（ほかの確認系のゲートの比べ方を重ねない）
+    (wt / "product.py").write_text("x = 3\n", encoding="utf-8")
+    commit(wt)
+    lines = cycle(repo, "merge", "U1").stdout.splitlines()
+    assert [line for line in lines if line.startswith("  - check:")] == [
+        "  - check: 確認した後で内容が変わっている。check をやり直す",
+    ]
 
     (wt / "FAIL").write_text("", encoding="utf-8")
     assert cycle(repo, "check", "U1").returncode == 1
@@ -979,11 +1008,39 @@ def test_headless_runs_without_session_id_count_as_the_same_person(repo, tmp_pat
     assert "実装した本人が検証している" in result.stdout
 
 
+def test_record_keeps_the_report_it_names(repo):
+    """セッション内の記録は、渡された報告のファイルの名前を残す（渡さなければ空）。"""
+    implement(repo)
+    tree = snap(repo)
+    args = ["record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", tree]
+    assert cycle(repo, *args, "--report", "docs/verification/U1-review.md").returncode == 0
+    assert state(repo)["gates"]["review"]["report"] == "docs/verification/U1-review.md"
+    assert cycle(repo, *args).returncode == 0
+    assert state(repo)["gates"]["review"]["report"] == ""
+
+
 def test_record_requires_a_name(repo):
     implement(repo)
     result = cycle(repo, "record", "U1", "implement", "--verdict", "pass", "--by", " ")
     assert result.returncode == 2
     assert "--by が空" in result.stderr
+
+
+@pytest.mark.parametrize("args, missing", [
+    ([], "command"),
+    (["record", "U1", "implement", "--by", "impl-2"], "--verdict"),
+    (["record", "U1", "implement", "--verdict", "pass"], "--by"),
+    (["record-ci", "U1"], "--result"),
+])
+def test_missing_required_arguments_are_refused_without_changing_records(repo, args, missing):
+    """コマンドと、記録に要る引数（判定、担当、結果のファイル）が無ければ、使い方の誤りとして終わる
+    （判定や担当の無い記録を作らない）。"""
+    implement(repo)
+    before = state(repo)
+    result = cycle(repo, *args)
+    assert result.returncode == 2
+    assert "required" in result.stderr and missing in result.stderr
+    assert state(repo) == before
 
 
 # ------------------------------------------------------------ 決まり6: ヘッドレスの結果
@@ -1151,7 +1208,9 @@ def test_headless_run_that_times_out_is_not_a_pass(repo, tmp_path):
     result = cycle(repo, "run", "U1", "review", "--timeout", "1", env=env)
     assert result.returncode == 1
     assert "review: error（1 秒で終わらなかったので打ち切った）" in result.stdout
-    assert state(repo)["gates"]["review"]["verdict"] == "error"
+    entry = state(repo)["gates"]["review"]
+    assert entry["verdict"] == "error"
+    assert (repo / entry["report"]).read_text(encoding="utf-8") == "timeout"      # 記録が指す生の出力
     # 打ち切ったら、起動した先（Windows では claude.cmd が呼んだプロセス）も止めて、すぐに戻る
     assert time.monotonic() - started < 15
 
@@ -1731,6 +1790,26 @@ def test_record_is_written_while_another_program_has_the_state_file_open(repo):
     assert state(repo)["gates"]["implement"]["by"] == "impl-2"
 
 
+def test_busy_state_file_is_retried_after_a_short_pause(repo):
+    """拒まれた置き換えは、POLL_SECONDS ずつ休んでからやり直す（回り続けない）。"""
+    implement(repo)
+    replace, refused, sleeps = os.replace, [], []
+
+    def busy_three_times(source, target):
+        if len(refused) < 3:
+            refused.append(target)
+            raise PermissionError(13, "他のプロセスが使っている")
+        replace(source, target)
+
+    with (
+        busy_wait(5.0), mock.patch.object(os, "replace", busy_three_times),
+        mock.patch.object(CYCLE_MODULE.time, "sleep", sleeps.append),
+    ):
+        result = cycle(repo, "record", "U1", "implement", "--verdict", "pass", "--by", "impl-2")
+    assert result.returncode == 0, result.stderr
+    assert sleeps == [CYCLE_MODULE.POLL_SECONDS] * 3 and state(repo)["gates"]["implement"]["by"] == "impl-2"
+
+
 def test_state_that_cannot_be_written_is_an_error(repo):
     implement(repo)
 
@@ -1758,6 +1837,27 @@ def write_text_like_windows() -> contextlib.AbstractContextManager:
         return write_text(self, data, encoding=encoding, errors=errors, newline=newline)
 
     return mock.patch.object(Path, "write_text", like_windows)
+
+
+def test_state_file_keeps_the_text_as_utf8(repo):
+    """状態ファイルは、UTF-8 のまま書く（日本語の担当の名前を \\u の形にしない。人が開いて読める）。"""
+    implement(repo)
+    record(repo, "review", "レビュー担当", tree=snap(repo))
+    assert "レビュー担当".encode() in (repo / ".cycle" / "state" / "U1.json").read_bytes()
+
+
+def test_state_write_whose_partial_file_vanished_is_an_error_not_a_crash(repo):
+    """書きかけのファイルが、置き換えの前に消えても（ほかのプログラムが片付けた）、記録を変えずにエラーで終わる。"""
+    implement(repo)
+
+    def vanished(source, target):
+        Path(source).unlink()
+        raise FileNotFoundError(2, "書きかけのファイルが無い")
+
+    with mock.patch.object(os, "replace", vanished):
+        result = cycle(repo, "record", "U1", "implement", "--verdict", "pass", "--by", "impl-2")
+    assert result.returncode == 2 and "U1.json を書けない" in result.stderr
+    assert state(repo)["gates"]["implement"]["by"] == "impl-1"
 
 
 def test_state_file_ends_lines_with_lf_where_text_files_get_crlf(repo):
@@ -1908,6 +2008,16 @@ def test_snapshot_during_conflict_does_not_mark_it_resolved(repo):
 
 # ------------------------------------------------------------ merge の前提と、取り込む対象
 
+def test_missing_worktree_is_named(repo):
+    """作業ツリーが無くなっていたら、その場所を示して、統合できないと言う。"""
+    wt = implement(repo)
+    shutil.rmtree(wt)
+    for command in ("status", "merge"):
+        result = cycle(repo, command, "U1")
+        assert f"作業ツリー {wt} が無い" in result.stdout
+    assert main_log(repo) == ["init"]
+
+
 def test_merge_requires_committed_worktree(repo):
     implement(repo)
     pass_all(repo)
@@ -1928,6 +2038,16 @@ def test_status_gives_the_same_reason_as_merge_for_uncommitted_changes(repo):
     assert refused.returncode == 1 and reason in refused.stdout
     commit(wt)
     assert "統合: できる" in cycle(repo, "status", "U1").stdout
+
+
+def test_uncommitted_files_beyond_the_first_five_are_counted(repo):
+    """未コミットの変更のファイルは、先頭の5つの名前と、残りの数を示す。"""
+    wt = implement(repo)                                        # product.py が未コミット
+    for index in range(5):
+        (wt / f"new{index}.py").write_text("", encoding="utf-8")
+    status = cycle(repo, "status", "U1").stdout
+    listed = "new0.py, new1.py, new2.py, new3.py, new4.py ほか 1 件"
+    assert f"作業ツリーに未コミットの変更がある（{listed}）" in status
 
 
 def test_files_only_the_users_git_settings_ignore_are_named_with_the_way_out(repo, tmp_path):
@@ -2166,6 +2286,12 @@ def test_gate_recorded_without_the_base_is_stale(repo):
     assert result.returncode == 1
     assert "verify: 確認の後で、main との分かれ目（土台）が変わっている" in result.stdout
     assert "review: 確認の後で、main との分かれ目" not in result.stdout
+    # 内容も変わっていても、分かれ目の古いゲートは、その理由だけを挙げる
+    (wt / "product.py").write_text("x = 3\n", encoding="utf-8")
+    commit(wt)
+    refused = cycle(repo, "merge", "U1").stdout
+    lines = [line for line in refused.splitlines() if line.startswith("  - verify:")]
+    assert len(lines) == 1 and "分かれ目（土台）が変わっている" in lines[0]
 
 
 def test_base_of_each_gate_is_the_one_seen_when_it_was_recorded(repo, tmp_path):
@@ -2411,6 +2537,23 @@ def test_recovery_leaves_main_alone_when_it_changed_after_the_kill(repo, tmp_pat
     assert sh(repo, "git", "for-each-ref") == refs                 # 人が確かめるまで、何も動かさない
     assert sh(repo, "git", "status", "--porcelain") == files
     assert (repo / ".cycle" / "merge-pending.json").exists()
+
+
+def test_recovery_leaves_main_alone_when_the_merge_had_not_started(repo):
+    """控えを置いた直後（取り込みを始める前）に止まっていたら、本体に触らずに控えを片付ける（その後で本体に
+    入った手の変更を、取り込み前に戻す処理で消さない）。"""
+    wt = implement(repo)
+    pass_all(repo)
+    commit(wt)
+    before, head = sh(repo, "git", "rev-parse", "HEAD"), sh(wt, "git", "rev-parse", "HEAD")
+    pending = {"id": "U1", "before": before, "head": head}
+    (repo / ".cycle" / "merge-pending.json").write_text(json.dumps(pending), encoding="utf-8")
+    (repo / "product.py").write_text("x = 5\n", encoding="utf-8")       # その後で、本体に手が入った
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1 and "本体（main）に未コミットの変更がある" in result.stdout
+    assert (repo / "product.py").read_text(encoding="utf-8") == "x = 5\n"
+    assert sh(repo, "git", "rev-parse", "HEAD") == before
+    assert not (repo / ".cycle" / "merge-pending.json").exists()
 
 
 def test_recovery_cleans_up_a_merge_left_half_done(repo):
@@ -2842,6 +2985,15 @@ def test_result_whose_commit_does_not_hold_the_checked_tree_is_not_recorded(wait
         assert f"結果のコミット（{commit_id[:10]}）が、このリポジトリに無いか、そのツリーが" in result.stderr
     assert "windows" not in state(root)["gates"]
     assert not list((root / ".cycle" / "runs").glob("U1-windows-*"))
+
+
+def test_windows_pass_with_a_single_passing_test_is_recorded(repo):
+    """通過が1件でも（失敗とエラーが 0 なら）、合格として取り込む。"""
+    _, tree = windows_unit(repo)
+    result = ci_result(tree, tests={"total": 1, "passed": 1, "failed": 0, "errors": 0, "skipped": 0})
+    recorded = record_ci(repo, result)
+    assert recorded.returncode == 0, recorded.stderr
+    assert state(repo)["gates"]["windows"]["verdict"] == "pass"
 
 
 @pytest.mark.parametrize("verdict", ["fail", "error"])

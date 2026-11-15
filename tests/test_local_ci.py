@@ -84,6 +84,7 @@ note = {
     "guard": os.environ.get("CIRCUIT_SIM_PYTEST_RUNNING"),
     "pytest_settings": sorted(name for name in os.environ if name.startswith("PYTEST_")),
     "pythonpath": os.environ.get("PYTHONPATH", "").split(os.pathsep),
+    "no_current_directory_search": os.environ.get("NoDefaultCurrentDirectoryInExePath"),
 }
 if plan.get("import_product"):
     # 場所は JSON の ASCII で受け渡す。起動した Python の出力の文字コード（PYTHONIOENCODING）と、ここで読む
@@ -277,6 +278,8 @@ def test_check_gets_the_report_file_outside_the_checked_content_and_no_input(rep
     assert note["options"] == [f"--junitxml={report}", "-o", "junit_family=xunit1"]
     assert note["stdin"] == ""
     assert note["guard"] == "1"
+    # 確認（Windows では、その先の cmd.exe が呼ぶコマンド）に、実行した場所でコマンドを探させない印を渡す
+    assert note["no_current_directory_search"] == "1"
     assert "check output" in out                                         # 確認の出力は、そのまま画面に流れる
     assert_cleaned_up(repo)
 
@@ -638,6 +641,14 @@ NOT_A_PASS = {
 }
 
 
+def test_run_with_a_single_passing_test_is_a_pass():
+    """通過が1件でも、失敗とエラーが 0 なら合格（通過が 0 だけを、結果と合わないとする）。"""
+    one = {"total": 1, "passed": 1, "failed": 0, "errors": 0, "skipped": 0}
+    assert LOCAL_CI.judge(0, one, [], True) == ("pass", "ok")
+    none = {**one, "passed": 0, "skipped": 1}
+    assert LOCAL_CI.judge(0, none, [], True) == ("error", "test_results_disagree")
+
+
 @pytest.mark.parametrize("case", NOT_A_PASS)
 def test_run_with_a_failure_a_gap_or_a_contradiction_is_not_a_pass(repo, case):
     plan, verdict, reason = NOT_A_PASS[case]
@@ -732,6 +743,14 @@ def test_result_that_cannot_be_written_is_not_a_pass(repo):
     assert "結果を" in result.stderr and "に書けない" in result.stderr
     assert result_files(repo) == []
     assert_cleaned_up(repo)
+
+
+def test_result_file_keeps_the_text_as_utf8(repo):
+    """結果のファイルは、UTF-8 のまま書く（日本語のブランチ名を \\u の形にしない。人が開いて読める）。"""
+    sh(repo, "git", "branch", "作業-ブランチ")
+    assert local_ci(repo, "--no-fetch", "--ref", "作業-ブランチ").returncode == 0
+    [path] = result_files(repo)
+    assert results(repo)[0]["ref"] == "作業-ブランチ" and "作業-ブランチ".encode() in path.read_bytes()
 
 
 def test_git_that_cannot_be_started_is_an_error_not_a_crash(repo):

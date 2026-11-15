@@ -249,6 +249,15 @@ def test_check_script_does_not_pass_a_session_that_ended_early_with_zero(tmp_pat
     assert "試験のセッションが終わりまで届かなかった" in output
 
 
+def test_check_script_does_not_pass_when_the_last_test_ends_the_session_with_zero(tmp_path):
+    """最後の試験の中から pytest.exit(returncode=0) で終えると、セッションの結果は書かれるが、その試験は
+    後始末（teardown）まで届かない。終わりまで流れた試験として数えないので、合格にしない。"""
+    stop = "import pytest\n\n\ndef test_quit():\n    pytest.exit('止める', returncode=0)\n"
+    code, output = run_copy_of_check(tmp_path, {"test_sample.py": PASSING_TEST, "test_zz_quit.py": stop})
+    assert code == 1, output
+    assert "集めた試験 2 件のうち、終わりまで流れたのは 1 件" in output
+
+
 def test_check_script_does_not_pass_when_tests_are_left_out(tmp_path):
     """一部の試験だけを選んだ実行（-k など）は、通っても合格にしない。"""
     files = {"test_sample.py": PASSING_TEST + "\n\ndef test_other():\n    assert True\n"}
@@ -610,6 +619,21 @@ def test_version_text_that_does_not_look_like_a_version_is_not_recorded(root):
 
 
 # ------------------------------------------------------------ doctor.py --headless
+
+def test_doctor_tells_the_commands_it_starts_not_to_search_the_place_of_execution(root, tmp_path):
+    """doctor.py も、起動する claude（Windows では claude.cmd の先の node など）に、実行した場所でコマンドを
+    探させない印を渡す（cycle.py と同じ）。"""
+    seen = tmp_path / "seen.txt"
+    script = (
+        "import os\n"
+        f"pathlib.Path({str(seen)!r}).write_text(os.environ.get('NoDefaultCurrentDirectoryInExePath', '-'))"
+    )
+    assert "NoDefaultCurrentDirectoryInExePath" not in TEST_ENV
+    env = fake_claude(tmp_path, good_output(), script)
+    code, _, screen = doctor(root, "--no-check", "--headless", env=env)
+    assert code == 0, screen
+    assert seen.read_text(encoding="utf-8") == "1"
+
 
 def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp_path):
     env = fake_claude(tmp_path, good_output())
@@ -1001,6 +1025,31 @@ def test_only_the_heading_of_a_role_definition_is_read_for_the_tool_list(root):
     assert DOCTOR.restricts_tools(root, "no-such-role") is False
     (root / ".claude" / "agents" / "plain.md").write_text("tools: Read\n本文だけ\n", encoding="utf-8")
     assert DOCTOR.restricts_tools(root, "plain") is False               # 見出し（---）の無い定義
+    (root / ".claude" / "agents" / "body.md").write_text("本文\ntools: Read\n", encoding="utf-8")
+    assert DOCTOR.restricts_tools(root, "body") is False                # 見出しが無く、2行目からの本文
+    (root / ".claude" / "agents" / "empty.md").write_text("", encoding="utf-8")
+    assert DOCTOR.restricts_tools(root, "empty") is False               # 空の定義（落ちない）
+
+
+@pytest.mark.parametrize("step, error, reason", [
+    ("launchable", DOCTOR.cycle.CycleError("渡せない"), "cannot_pass_arguments"),
+    ("run_captured", OSError(8, "起動できない"), "cannot_start"),
+])
+def test_role_whose_probe_could_not_run_is_not_counted_as_run(root, step, error, reason):
+    """役割ごとの確認で、指示を渡せない、claude を起動できない場合は、実行しなかった（ran: false）と
+    記録する。"""
+    launch = mock.patch.object(DOCTOR.cycle, "launchable", side_effect=lambda cmd, avoid: cmd)
+    with launch, mock.patch.object(DOCTOR.cycle, step, side_effect=error):
+        result = DOCTOR.probe(root, ["/x/claude", "-p", "指示"], 10, "review")
+    assert result["ran"] is False and result["reason"] == reason and result["unexpected"] == [reason]
+
+
+@pytest.mark.parametrize("restricted", [True, False])
+def test_result_lines_point_out_a_tool_list_in_the_role_definition_only_when_there_is_one(restricted):
+    """役割ごとの結果の表示に、定義に tools: がある（D-030）ことを、あるときだけ添える。"""
+    lines = DOCTOR.probe_lines({"restricts_tools": restricted, "ran": False, "reason": "cannot_start"})
+    note = "役割の定義に tools: がある（D-030。disallowedTools: で絞る）"
+    assert lines == [DOCTOR.NOT_RUN["cannot_start"], *([note] if restricted else [])]
 
 
 def test_probe_is_not_run_when_the_instruction_cannot_pass_through_the_launcher(root, tmp_path):
@@ -1038,14 +1087,20 @@ FAILURES = {
 def test_kind_of_failure_is_recorded_without_the_text(root, tmp_path, case):
     """失敗したとき、原因の種類を、文面を記録せずに分類して出す（利用者にもう一度打ってもらわずに済むように）。"""
     text, expected = FAILURES[case]
-    output = good_output(is_error=True, subtype="success", result=f"{text} {SECRET}", stop_reason="end_turn")
+    output = good_output(
+        is_error=True, subtype="success", result=f"{text} {SECRET}", stop_reason="end_turn",
+        terminal_reason="completed",
+    )
     del output["structured_output"]
     code, result, screen = doctor(root, "--no-check", "--headless", env=fake_claude(tmp_path, output))
     assert code == 1
     head = probe(result)
     assert head["failure"] == expected
     assert head["fields"]["stop_reason"] == {"present": True, "kind": "string", "value": "end_turn"}
+    assert head["fields"]["terminal_reason"] == {"present": True, "kind": "string", "value": "completed"}
     assert DOCTOR.FAILURE_TEXT[expected] in screen
+    # くわしい原因を調べる手順（記録されない形で、自分の端末で）を示す
+    assert "くわしい原因は、上の「実行するコマンド」を端末" in screen
     assert SECRET not in json.dumps(result) and SECRET not in screen
 
 

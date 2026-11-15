@@ -615,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
     result["ok"] = not result["problems"]
 
     path = root / RESULT_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(exist_ok=True)       # .cycle/ の上は、リポジトリの最上位（もうある）
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     print("\n".join(report(result)))
     print(f"記録: {RESULT_FILE}（形、真偽、git のIDだけ。認証情報と応答の本文は入っていない）")

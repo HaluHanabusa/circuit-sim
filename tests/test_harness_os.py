@@ -6,7 +6,9 @@ Windows の分岐のうち、OSの仕組みを模擬できるもの（msvcrt.loc
 模擬して流す（Linux で1か所ずつ壊す確認をしても、その分岐の壊し方が落ちるように）。
 """
 import os
+import signal
 import subprocess
+import time
 from unittest import mock
 
 import pytest
@@ -107,6 +109,36 @@ def test_windows_stop_goes_through_taskkill_for_the_whole_tree():
         taskkill = os.path.join(r"C:\Windows", "System32", "taskkill.exe")
     assert calls == [([taskkill, "/F", "/T", "/PID", "4321"], {"capture_output": True})]
     proc.kill.assert_called_once_with()
+
+
+def test_ctrl_break_counts_as_a_stop_signal_where_the_os_has_it():
+    """Windows の Ctrl-Break（signal.SIGBREAK）も終了の合図に数える（統合を取り消してから終わる）。
+    ほかのOSには SIGBREAK が無いので、その名前の合図があるものとして模擬する。"""
+    if hasattr(signal, "SIGBREAK"):
+        assert signal.SIGBREAK in CYCLE_MODULE.stop_signals()
+        return
+    with mock.patch.object(signal, "SIGBREAK", signal.SIGUSR1, create=True):
+        assert signal.SIGUSR1 in CYCLE_MODULE.stop_signals()
+    assert CYCLE_MODULE.stop_signals() == [signal.SIGTERM, signal.SIGHUP]
+
+
+def test_files_in_use_are_waited_for_only_on_windows(repo):
+    """状態ファイルの置き換えが拒まれたとき、待ってやり直すのは Windows だけ（他のプロセスが開いている間に
+    拒むのは Windows）。ほかのOSでは、待たずに1回でエラーにする（待つ秒数の既定）。"""
+    implement(repo)
+    attempts = []
+
+    def refused(source, target):
+        attempts.append(time.monotonic())
+        raise PermissionError(13, "書けない")
+
+    with mock.patch.object(os, "replace", refused):
+        result = cycle(repo, "record", "U1", "implement", "--verdict", "pass", "--by", "impl-2")
+    assert result.returncode == 2 and "U1.json を書けない" in result.stderr
+    if WINDOWS:
+        assert attempts[-1] - attempts[0] >= CYCLE_MODULE.BUSY_WAIT_SECONDS - 1 > 0
+    else:
+        assert len(attempts) == 1
 
 
 @only_windows("cmd.exe が、名前だけのコマンドを実行した場所で探すのは Windows だけ")

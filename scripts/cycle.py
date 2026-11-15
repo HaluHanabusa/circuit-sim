@@ -86,9 +86,12 @@ CI_KIND = "local-ci"
 CI_VERDICTS = ("pass", "fail", "error")
 CI_COUNTS = ("total", "passed", "failed", "errors", "skipped")
 
-# git の置き場所を外から差し替える環境変数。持ち込むと、対象でないリポジトリや索引を見てしまう。
+# git の置き場所を外から差し替える環境変数。持ち込むと、対象でないリポジトリや索引、参照を見てしまう。
+# GIT_NAMESPACE は、手元のリモートからの取得を、名前の範囲の外の参照を見ずに、何も取らずに 0 で終わらせる。
+# GIT_PREFIX は入れない（git はシェルの別名を動かすときに置くだけで、読まない。git 2.43 で、ハーネスが使う
+# コマンドの出力が変わらないことを確かめた）。
 GIT_LOCATION_VARS = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX",
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
 )
 
@@ -417,7 +420,7 @@ def run_captured(
     """
     with termination_as_exception(), subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", env=env, **group_options(),
+        encoding="utf-8", errors="replace", env=env, **group_options(),       # encoding で、文字列で受け取る
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -516,7 +519,7 @@ def run_git(
         env["GIT_INDEX_FILE"] = str(index)
     return subprocess.run(
         [git_program(), *options, "-C", str(cwd), *args],
-        input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+        input=stdin, capture_output=True, encoding="utf-8", errors="replace", env=env,     # 文字列で受け取る
     )
 
 
@@ -670,7 +673,7 @@ def save_state(root: Path, state: dict) -> None:
     try:
         retry_while_busy(lambda: os.replace(partial, path))
     except OSError as exc:
-        partial.unlink(missing_ok=True)
+        discard(partial)
         raise CycleError(f"{path} を書けない: {exc}") from exc
 
 
@@ -700,8 +703,9 @@ def pending_file(root: Path) -> Path:
 
 
 def discard(path: Path) -> None:
-    """控えを消す。もう無くても、エラーにしない（取り込んだ内容の確認スクリプトは、本体の中で動くので、
-    .cycle/ の中を消すことがある。消えていても、後始末は済んでいる）。"""
+    """控えや書きかけのファイルを消す。もう無くても、エラーにしない（取り込んだ内容の確認スクリプトは、
+    本体の中で動くので、.cycle/ の中を消すことがある。書きかけのファイルは、ほかのプログラムが片付けることが
+    ある。消えていても、後始末は済んでいる）。"""
     path.unlink(missing_ok=True)
 
 
@@ -910,7 +914,7 @@ def add_record(
 
 def runs_dir(root: Path) -> Path:
     path = root / ".cycle" / "runs"
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(exist_ok=True)       # 上の .cycle/ は、もうある（呼ぶのは、状態ファイルを読んだ後だけ）
     return path
 
 
@@ -929,7 +933,7 @@ def run_check(cwd: Path) -> tuple[str, str, str]:
     try:
         proc = subprocess.run(
             [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", env=check_env(python_env()),
+            encoding="utf-8", errors="replace", env=check_env(python_env()),      # 文字列で受け取る
         )
     except OSError as exc:
         return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
@@ -1008,7 +1012,7 @@ def claude_command(prompt: str, role: str, budget: float, gate: str, tools: str 
         "claude", "-p", prompt,
         "--agent", role,
         "--output-format", "json",
-        "--json-schema", json.dumps(VERDICT_SCHEMA, ensure_ascii=False),
+        "--json-schema", json.dumps(VERDICT_SCHEMA),      # 形の指定は英数字だけ（\u の形にならない）
         "--permission-mode", GATE_PERMISSION.get(gate, DEFAULT_PERMISSION),
         "--max-budget-usd", str(budget),
         "--allowedTools", tools or GATE_TOOLS[gate],
@@ -1308,10 +1312,8 @@ def changed_after_gate(worktree: Path, gate_tree: str, current: str) -> list[str
     # 出力は「種類 NUL ファイル名 NUL」の繰り返し。その形でなければ、変更なしとは見なさない
     if proc.returncode != 0 or fields.pop() != "" or len(fields) % 2:
         raise CycleError(f"git diff の結果を読めない: {proc.stderr.strip()}")
-    return [
-        path for status, path in zip(fields[0::2], fields[1::2], strict=True)
-        if not (status == "A" and may_add_after_gate(path))
-    ]
+    pairs = [(fields[index], fields[index + 1]) for index in range(0, len(fields), 2)]     # 数は偶数（上）
+    return [path for status, path in pairs if not (status == "A" and may_add_after_gate(path))]
 
 
 def may_add_after_gate(path: str) -> bool:

@@ -319,7 +319,7 @@ def write_result(root: Path, result: dict) -> Path:
     try:
         cycle.retry_while_busy(lambda: os.replace(partial, path))
     except OSError as exc:
-        partial.unlink(missing_ok=True)
+        cycle.discard(partial)
         raise cycle.CycleError(f"結果を {path} に書けない: {exc}") from exc
     return path
 

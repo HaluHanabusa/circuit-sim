@@ -17,8 +17,8 @@ replacement = "fcntl.flock(handle, fcntl.LOCK_SH)"
 # ---- 同値（壊しても動作が変わらない）
 
 [[equivalent]]
-id = "cycle:run_captured:const:1"
-reason = "Popen に encoding を渡すと、text の指定によらず文字列で受け取る。Python の subprocess は、text_mode を encoding or errors or text or universal_newlines で決める（3.11〜3.13 の Lib/subprocess.py で確かめた）。text=False にしても、encoding='utf-8' があるので、出力は同じ文字列になる"
+id = "cycle:unlock_handle:del:2"
+reason = "Linux / macOS の分岐の、ロックを外す呼び出し（fcntl.flock の LOCK_UN）。locked の with が、直後にファイルを閉じる。flock のロックは、その記述子がすべて閉じられると外れる（flock の決まり）。Python の open の記述子は、起動する子プロセスに引き継がれない（PEP 446）ので、閉じた時点で外れる。外すのと閉じるのとの間に、ほかの処理は無い。用心として残す（Windows の msvcrt.locking は、閉じたときに外れるまでの時間が決まっていないので、外す呼び出しが要る）"
 
 # ---- 別枠（いまは無い）
 # Windows でだけ通る分岐のうち、OSの仕組みを模擬できるもの（msvcrt.locking、taskkill の呼び出し）は、
