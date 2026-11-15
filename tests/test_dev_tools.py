@@ -218,8 +218,13 @@ def doctor(root: Path, *args: str, env: dict[str, str]) -> tuple[int, dict, str]
 
 
 def probe(result: dict, index: int = 0) -> dict:
-    """ヘッドレスの確認のうち、1つの役割の結果。"""
-    return result["headless"]["roles"][index]
+    """ヘッドレスの確認のうち、1つの役割の結果（先頭の役割は上の段、ほかは others）。"""
+    head = result["headless"]
+    return head if index == 0 else head["others"][index - 1]
+
+
+def probes(result: dict) -> list[dict]:
+    return [result["headless"], *result["headless"]["others"]]
 
 
 def good_output(**top: object) -> dict:
@@ -426,14 +431,15 @@ def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp
     assert code == 0, screen
     cycle = DOCTOR.cycle
     argv = claude_argv(tmp_path)
-    assert argv == cycle.claude_command(DOCTOR.PROBE_PROMPT, "code-reviewer", 0.5, "review")[1:]
+    assert argv == cycle.claude_command(DOCTOR.PROBE_PROMPT, "code-reviewer", 0.5, "review", "Read")[1:]
     # ハーネスの run と、オプションの並びも、結果の形の指定も同じ
     harness = cycle.agent_command({"owner": "x", "spec": "docs/plan/U1-demo.md"}, "review", 0.5)[1:]
     assert argv[0::2] == harness[0::2]
     same = dict(zip(harness[0::2], harness[1::2], strict=True))
     used = dict(zip(argv[0::2], argv[1::2], strict=True))
-    # 指示のほかは、道具の一覧、許可の扱い、禁じる道具まで、ハーネスの review と同じ
-    assert {**used, "-p": ""} == {**same, "-p": ""}
+    # 指示と、許す道具（読む道具だけ）のほかは、許可の扱い、禁じる道具まで、ハーネスの review と同じ
+    assert {**used, "-p": "", "--allowedTools": ""} == {**same, "-p": "", "--allowedTools": ""}
+    assert used["--allowedTools"] == "Read"
     head = probe(result)
     assert (head["role"], head["gate"], head["restricts_tools"]) == ("code-reviewer", "review", False)
     assert head["ran"] is True and head["timed_out"] is False and head["unexpected"] == []
@@ -747,7 +753,7 @@ def test_headless_probe_runs_for_every_role_the_gates_use(root, tmp_path):
     script = "(here / 'calls.txt').open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')"
     env = fake_claude(tmp_path, good_output(), script=script)
     code, result, screen = doctor(root, "--no-check", "--headless", "--role", "verifier", env=env)
-    assert code == 0 and [item["role"] for item in result["headless"]["roles"]] == ["verifier"]
+    assert code == 0 and [item["role"] for item in probes(result)] == ["verifier"]
     (tmp_path / "bin" / "calls.txt").unlink()
     proc = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "doctor.py"), "--no-check", "--headless"],
@@ -755,17 +761,18 @@ def test_headless_probe_runs_for_every_role_the_gates_use(root, tmp_path):
         text=True, encoding="utf-8", env={**TEST_ENV, "CYCLE_ROOT": str(root), **env}, cwd=started_here(root),
     )
     result = json.loads((root / ".cycle" / "doctor-result.json").read_text(encoding="utf-8"))
-    roles = [(item["role"], item["gate"]) for item in result["headless"]["roles"]]
+    roles = [(item["role"], item["gate"]) for item in probes(result)]
     assert roles == [
         ("code-reviewer", "review"), ("verifier", "verify"), ("ux-designer", "ux"),
         ("solver-engineer", "implement"), ("tooling-engineer", "implement"),
     ]
     lines = (tmp_path / "bin" / "calls.txt").read_text(encoding="utf-8").splitlines()
     calls = [json.loads(line) for line in lines]
-    cycle = DOCTOR.cycle
-    assert calls == [cycle.claude_command(DOCTOR.PROBE_PROMPT, role, 1.0, gate)[1:] for role, gate in roles]
+    command = DOCTOR.cycle.claude_command
+    expected = [command(DOCTOR.PROBE_PROMPT, role, 1.0, gate, "Read")[1:] for role, gate in roles]
+    assert calls == expected
     # 道具の一覧（tools:）のある役割は、実行の前に知らせ、記録する
-    restricted = [item["restricts_tools"] for item in result["headless"]["roles"]]
+    restricted = [item["restricts_tools"] for item in probes(result)]
     assert restricted == [False, False, True, False, False]
     assert "役割 ux-designer の定義に、使える道具の一覧（tools:）がある" in proc.stdout
     assert proc.returncode == 0 and result["headless"]["unexpected"] == []
@@ -779,7 +786,19 @@ def test_each_role_is_judged_by_the_gate_it_is_used_for(root, tmp_path):
     code, result, screen = doctor(root, "--no-check", "--headless", *roles, env=env)
     assert code == 1
     assert result["headless"]["unexpected"] == ["verifier: harness_verdict"]
-    assert [item["harness_verdict"] for item in result["headless"]["roles"]] == ["pass", "fail"]
+    assert [item["harness_verdict"] for item in probes(result)] == ["pass", "fail"]
+
+
+def test_repository_without_role_definitions_probes_the_reviewer_only(root, tmp_path):
+    """役割の定義の場所（.claude/agents/）が無いリポジトリでは、code-reviewer の1回だけ（W1 と同じ形）。"""
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "doctor.py"), "--headless"], capture_output=True, text=True,
+        encoding="utf-8", env={**TEST_ENV, "CYCLE_ROOT": str(root), **fake_claude(tmp_path, good_output())},
+        cwd=started_here(root),
+    )
+    result = json.loads((root / ".cycle" / "doctor-result.json").read_text(encoding="utf-8"))
+    assert proc.returncode == 0 and [item["role"] for item in probes(result)] == ["code-reviewer"]
+    assert result["headless"]["others"] == []
 
 
 def test_unknown_role_is_not_run(root, tmp_path):

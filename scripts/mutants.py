@@ -55,7 +55,7 @@ LIST_FILE = "scripts/mutants.toml"
 TARGETS = ("scripts/cycle.py", "scripts/doctor.py", "scripts/local_ci.py")
 # 道具の試験。壊し方ごとに、ここから選んで流す
 TOOL_TESTS = (
-    "tests/test_harness.py", "tests/test_dev_tools.py", "tests/test_local_ci.py",
+    "tests/test_harness.py", "tests/test_harness_os.py", "tests/test_dev_tools.py", "tests/test_local_ci.py",
     "tests/test_claude_guard.py",
     "tests/test_stop_posix.py", "tests/test_console_encoding.py", "tests/test_error_dialogs.py",
     "tests/acceptance/test_w1_recheck.py", "tests/acceptance/test_w1_windows.py",

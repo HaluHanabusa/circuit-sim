@@ -894,34 +894,31 @@ def runs_dir(root: Path) -> Path:
     return path
 
 
-def run_check(cwd: Path) -> tuple[str, str, str, str]:
+def run_check(cwd: Path) -> tuple[str, str, str]:
     """scripts/check.py を、このスクリプトと同じ Python で実行する。
 
-    返すのは（判定、確認した内容のツリーID、出力、標準出力の最後の行）。
+    返すのは（判定、確認した内容のツリーID、出力）。出力は、標準エラー、標準出力の順に並べる（最後の行が、
+    標準出力の最後の行＝ pytest の件数になる。標準エラーの最後は、試験の遮断の表示のことがある）。
 
     合格にするのは、終了コードが 0 で、実行の前後で内容が変わっていないときだけ。
     呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（check_env。試験を選び直させない）。
     """
     before = tree_id(cwd)
     if not (cwd / CHECK_SCRIPT).is_file():
-        return "error", before, f"{CHECK_SCRIPT} が無いので、確認を起動できない", ""
+        return "error", before, f"{CHECK_SCRIPT} が無いので、確認を起動できない"
     try:
         proc = subprocess.run(
             [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
             text=True, encoding="utf-8", errors="replace", env=check_env(python_env()),
         )
     except OSError as exc:
-        return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}", ""
-    output = proc.stdout + proc.stderr
-    # 1行の表示には、標準出力の最後の行（pytest の件数）を使う。
-    # 標準エラーの最後は、試験の遮断の表示のことがある
-    last = (proc.stdout.strip().splitlines() or [""])[-1]
+        return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
+    output = proc.stderr + proc.stdout
     if proc.returncode != 0:
-        return "fail", before, output, last
+        return "fail", before, output
     if tree_id(cwd) != before:
-        changed = "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない"
-        return "error", before, output + changed, last
-    return "pass", before, output, last
+        return "error", before, output + "\ncheck の実行中に内容が変わった。どの内容を確認したか決められない"
+    return "pass", before, output
 
 
 # ---------------------------------------------------------------- コマンド
@@ -979,8 +976,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def claude_command(prompt: str, role: str, budget: float, gate: str) -> list[str]:
-    """ヘッドレス実行のコマンド。道具と許可の扱いは、ゲート（gate）で決まる。結果は VERDICT_SCHEMA の形。"""
+def claude_command(prompt: str, role: str, budget: float, gate: str, tools: str = "") -> list[str]:
+    """ヘッドレス実行のコマンド。道具と許可の扱いは、ゲート（gate）で決まる。結果は VERDICT_SCHEMA の形。
+
+    tools を渡すと、許す道具の一覧（--allowedTools）だけを差し替える（環境の確認は、読む道具だけにする）。
+    """
     cmd = [
         "claude", "-p", prompt,
         "--agent", role,
@@ -988,7 +988,7 @@ def claude_command(prompt: str, role: str, budget: float, gate: str) -> list[str
         "--json-schema", json.dumps(VERDICT_SCHEMA, ensure_ascii=False),
         "--permission-mode", GATE_PERMISSION.get(gate, DEFAULT_PERMISSION),
         "--max-budget-usd", str(budget),
-        "--allowedTools", GATE_TOOLS[gate],
+        "--allowedTools", tools or GATE_TOOLS[gate],
     ]
     if gate in GATE_DISALLOWED:
         cmd += ["--disallowedTools", GATE_DISALLOWED[gate]]
@@ -1139,12 +1139,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     worktree = Path(state["worktree"])
     seen = record_count(state, "check")
     base = main_base(worktree)
-    verdict, tree, output, last = run_check(worktree)
+    verdict, tree, output = run_check(worktree)
     log = runs_dir(root) / f"{args.id}-check-{stamp()}.log"
     log.write_text(output, encoding="utf-8")
     report = log.relative_to(root).as_posix()
     adopted = add_record(root, args.id, "check", verdict, tree, base, CHECK_SCRIPT, "script", report, seen)
-    print(f"{args.id} check: {verdict}（{last or output.strip()[-200:]}）")
+    tail = output.strip().splitlines()[-1:] or [""]         # 標準出力の最後の行（run_check）
+    print(f"{args.id} check: {verdict}（{tail[0]}）")
     if not adopted:
         print(NOT_ADOPTED)
     return 0 if verdict == "pass" and adopted else 1
@@ -1454,7 +1455,7 @@ def merge_unit(root: Path, uid: str) -> int:
     pending.write_text(json.dumps({"id": uid, "before": before, "head": head}), encoding="utf-8")
     try:
         git(root, "merge", "--no-ff", head, "-m", message)
-        verdict, _, output, _ = run_check(root)
+        verdict, _, output = run_check(root)
         (runs_dir(root) / f"{uid}-merge-check-{stamp()}.log").write_text(output, encoding="utf-8")
     except BaseException as exc:
         # 競合、中断（Ctrl-C、終了の合図）、記録を書けないなど。どの場合も本体を元に戻す。

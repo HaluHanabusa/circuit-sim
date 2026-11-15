@@ -1368,19 +1368,6 @@ def test_claude_inside_the_worktree_or_the_main_checkout_is_not_used(repo, tmp_p
     assert not was_run(entry) and "review" not in state(repo)["gates"]
 
 
-def test_link_on_path_that_leads_inside_the_worktree_is_not_used(repo, tmp_path):
-    """PATH の場所が使ってよい所でも、そこにあるリンクの先が作業ツリーの中なら使わない。"""
-    wt = implement(repo)
-    planted = wt / "node_modules" / ".bin"
-    install_claude(planted, headless(session="planted"))
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "claude").symlink_to(planted / "claude")
-    result = cycle(repo, "run", "U1", "review", env={"PATH": str(outside)})
-    assert result.returncode == 2 and "claude コマンドが見つからない" in result.stderr
-    assert not was_run(planted) and "review" not in state(repo)["gates"]
-
-
 def test_git_inside_the_main_checkout_is_not_started(repo, tmp_path):
     """git も claude と同じ探し方で、絶対パスで起動する（本体の中や、実行した場所の git を動かさない）。"""
     implement(repo)
@@ -1627,22 +1614,6 @@ def test_writing_commands_wait_for_the_lock(repo, command, lock):
         assert main_log(repo) == ["init"]
     assert proc.wait(timeout=30) == 0
     assert state(repo) != before
-
-
-@only_posix("Windows の msvcrt.locking には共有のロックが無い（LK_NBRLCK も排他のロックと同じ）")
-@pytest.mark.parametrize("lock", ["state/U1.lock", "merge.lock"])
-def test_lock_is_exclusive_and_waits_even_for_a_shared_holder(repo, lock):
-    """記録と統合のロックは排他。共有のロックで済ませると、2つの実行が同時に状態を読み書きできてしまう。"""
-    wt = implement(repo)
-    pass_all(repo)
-    commit(wt)
-    before = state(repo)
-    with held_lock(repo / ".cycle" / lock, shared=True):
-        proc = start_cycle(repo, "merge", "U1")
-        with pytest.raises(subprocess.TimeoutExpired):
-            proc.wait(timeout=1.0)
-        assert state(repo) == before and main_log(repo) == ["init"]
-    assert proc.wait(timeout=30) == 0
 
 
 def busy_wait(seconds: float) -> contextlib.AbstractContextManager:

@@ -48,6 +48,8 @@ PROBE_PROMPT = (
     "verdict を pass、summary を ok、criteria を name が probe、measured が ok、pass が true の項目1つだけの"
     "一覧、issues を空の一覧にした結果だけを返してください。"
 )
+# 確認の実行に許す道具（読む道具だけ。許可の扱いと禁じる道具は、その役割を使うゲートのとおり）
+PROBE_TOOLS = "Read"
 # 役割の定義の場所。確認系のゲートの担当（cycle.GATE_AGENT）のほかの役割は、実装の担当として確かめる
 AGENTS_DIR = ".claude/agents"
 
@@ -324,12 +326,19 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
     }
 
 
-def gate_roles(root: Path) -> list[tuple[str, str]]:
-    """ゲートで使う役割と、そのゲート: 確認系のゲートの担当と、.claude/agents/ のほかの役割（実装の担当）。"""
+def gate_roles(root: Path, only: list[str] | None = None) -> list[tuple[str, str]]:
+    """確かめる役割と、それを使うゲート: 確認系のゲートの担当と、.claude/agents/ のほかの役割（実装の担当）。
+
+    先頭は code-reviewer（レビュー）。only を渡すと、その名前の役割だけ。渡さず、役割の定義の場所が無い
+    リポジトリでは、code-reviewer だけ。
+    """
     checkers = [(role, gate) for gate, role in cycle.GATE_AGENT.items()]
     agents = root / AGENTS_DIR
     others = sorted(path.stem for path in agents.glob("*.md")) if agents.is_dir() else []
-    return checkers + [(name, "implement") for name in others if name not in cycle.GATE_AGENT.values()]
+    roles = checkers + [(name, "implement") for name in others if name not in cycle.GATE_AGENT.values()]
+    if only:
+        return [(role, gate) for role, gate in roles if role in only]
+    return roles if agents.is_dir() else checkers[:1]
 
 
 def restricts_tools(root: Path, role: str) -> bool:
@@ -353,7 +362,7 @@ def headless_info(
     root: Path, budget: float, timeout: int, allow_api_billing: bool, only: list[str] | None = None,
 ) -> dict:
     """本物の claude -p を、ハーネスと同じ組み立てで、ゲートで使う役割ごとに1回ずつ実行し、形を調べる"""
-    roles = [(role, gate) for role, gate in gate_roles(root) if not only or role in only]
+    roles = gate_roles(root, only)
     unknown = sorted(set(only or ()) - {role for role, _ in roles})
     if unknown:
         print(f"ヘッドレスの確認は実行しませんでした。知らない役割: {'、'.join(unknown)}")
@@ -367,7 +376,8 @@ def headless_info(
         )
         return {"ran": False, "reason": "api_key_set"}
     try:
-        cycle.launchable(cycle.claude_command(PROBE_PROMPT, roles[0][0], budget, roles[0][1]), (root,))
+        first = cycle.claude_command(PROBE_PROMPT, roles[0][0], budget, roles[0][1], PROBE_TOOLS)
+        cycle.launchable(first, (root,))
     except cycle.CommandNotFound:
         return {"ran": False, "reason": "claude_not_found"}
     except cycle.CycleError:
@@ -381,7 +391,7 @@ def headless_info(
     print("  - 記録するのは、出力の形（項目の有無と型）と真偽だけです。応答の本文と認証情報は記録しません")
     probes = []
     for role, gate in roles:
-        cmd = cycle.claude_command(PROBE_PROMPT, role, budget, gate)
+        cmd = cycle.claude_command(PROBE_PROMPT, role, budget, gate, PROBE_TOOLS)
         restricted = restricts_tools(root, role)
         if restricted:
             print(f"  - 注意: 役割 {role} の定義に、使える道具の一覧（tools:）がある。"
@@ -391,9 +401,13 @@ def headless_info(
         probes.append({
             "role": role, "gate": gate, "restricts_tools": restricted, **probe(root, cmd, timeout, gate),
         })
+    # 先頭の役割の結果を、そのまま上の段に置く（1つの役割だけを確かめる場合の形は、H2 より前と同じ）。
+    # ほかの役割の結果は others に並べ、前提と違う点は「役割: 項目」の形で、上の段の unexpected に足す
+    first, *others = probes
     return {
-        "ran": True, "roles": probes,
-        "unexpected": [f"{item['role']}: {name}" for item in probes for name in item["unexpected"]],
+        **first, "others": others,
+        "unexpected": [*first["unexpected"], *(f"{item['role']}: {name}" for item in others
+                                              for name in item["unexpected"])],
     }
 
 
@@ -477,10 +491,11 @@ NOT_RUN = {
 
 
 def headless_lines(headless: dict) -> list[str]:
-    if not headless["ran"]:
+    if "others" not in headless:            # どの役割も実行していない
         return [NOT_RUN[headless["reason"]]]
+    first = {**headless, "unexpected": [name for name in headless["unexpected"] if ": " not in name]}
     lines = []
-    for item in headless["roles"]:
+    for item in [first, *headless["others"]]:
         first, *rest = probe_lines(item)
         lines += [f"{item['role']}: {first}", *(f"  {line}" for line in rest)]
     return lines

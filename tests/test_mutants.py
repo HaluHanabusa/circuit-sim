@@ -192,7 +192,7 @@ def command_lines() -> list[str]:
 
 
 REPRESENTATIVE = {
-    "hand:lock-shared": "tests/test_harness.py::test_lock_is_exclusive_and_waits_even_for_a_shared_holder",
+    "hand:lock-shared": "tests/test_harness_os.py::test_lock_is_exclusive_and_waits_even_for_a_shared_holder",
     "cycle:git_paths:del:1": (
         "tests/test_harness.py::test_failure_of_git_listing_files_is_an_error_not_an_empty_list"
     ),
