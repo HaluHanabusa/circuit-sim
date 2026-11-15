@@ -116,12 +116,6 @@ def test_large_load_matches_its_high_q_limit_and_the_reference(circuit, r_load):
             assert pm >= 55.0 - TARGET_TOL and ref.radius() <= 1.0 - STABILITY_EPS
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微。文言と理由。返すゲインは正しい）: Q = R·√(C/L) が約 1e16 を超えると、植物の極の"
-    " |z|² − 1（本当は −Ts/(RC) < 0）が固有値の丸めで 0 以上になり、_arg_sum が極を単位円の外として偏角を"
-    "数え、共振より上の位相が 360° ずれる。最良の候補を「位相余裕 256.6°（目標の 55° は満たす）」"
-    "（参照 −103.4°、半径 1.46）と書き、理由を crossover_at_search_edge にする。"
-    "Q = 1e10 では成功する設計も断る"))
 @pytest.mark.parametrize("r_load", [1e17, 1e20])
 @pytest.mark.parametrize("circuit", [CIRCUITS[0], CIRCUITS[2]], ids=lambda c: f"L{c[1]:g}-f{c[3]:g}")
 def test_huge_load_matches_its_high_q_limit_and_never_says_meets_falsely(circuit, r_load):
@@ -246,9 +240,6 @@ def test_slow_but_resolvable_integral_is_returned_as_stable():
     assert _min_margin(ref) >= 55.0 - TARGET_TOL
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微。文言）: 最良の候補の半径を小数4桁で書くので、1 − 1e-9 < 半径 ≦ 0.99995 のとき"
-    "「閉ループの極の半径 1.0000（1 未満で安定）」と書く（掃引の 395 通り）"))
 def test_radius_shown_as_below_one_when_it_says_below_one():
     plant, f_ctrl = (24.0, 470e-6, 10e-6, 6.0), 15e3
     best, err = _design(plant, f_ctrl, zero_ratio=1e-4)

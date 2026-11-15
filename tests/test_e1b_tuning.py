@@ -581,3 +581,162 @@ def test_crossing_search_work_stays_small(case, monkeypatch):
     monkeypatch.setattr(ini._Loop, "_cell_tests", counting)
     assert loop.crossovers(loop.ts * 1e-4 / math.sqrt(ind * cap)).size == 3
     assert count[0] <= 2500
+
+
+# ------------------------------------------------------------ 5回目の修正（E1b-review-4、E1b-verifier-4）
+
+HUGE_R_CIRCUITS = [((24.0, 47e-6, 100e-6), 40e3), ((24.0, 22e-6, 100e-6), 100e3),
+                   ((12.0, 4.7e-6, 22e-6), 1e6), ((24.0, 47e-6, 100e-6), 200e3)]
+
+
+def _outcome(*args, **opts):
+    best, err = _design(*args, **opts)
+    return (err.reason if err else "ok"), best, err
+
+
+@pytest.mark.parametrize("r_load", [1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e20, 1e30])
+@pytest.mark.parametrize("circuit", HUGE_R_CIRCUITS, ids=lambda c: f"L{c[0][1]:g}-f{c[1]:g}")
+def test_huge_load_gives_the_same_design_as_its_high_q_limit(circuit, r_load):
+    """R = 1e13〜1e30 Ω（Q = R·√(C/L) が 1e13〜1e30）: 植物は Q = 1e10 のときと見分けられないので、理由・
+    余裕・ゲインは Q = 1e10 にした同じ回路と一致する（余裕 1e-6°、ゲイン相対 1e-6）。以前は Q ≳ 1e16 で植物の
+    極の |z|² − 1（本当は −Ts/(RC)）が固有値の丸めで正になり、極を単位円の外として位相を 360° ずらし、
+    (24 V, 47 µH, 100 µF, 1e16 Ω, 40 kHz) を「位相余裕 254.8°（目標の 55° は満たす）」と書いた（真は約
+    −105°）。(12 V, 4.7 µH, 22 µF, 1e17 Ω, 1 MHz) は成功するのに断った。
+    この試験の別の開ループは Q が 1e9 を超えると共振を格子で分けられないので、Q = 1e8 の同じ回路の最良の
+    候補で確かめる（Q を 1e8 から無限大にしても余裕の変化は 1e-5° 程度。許容差 0.01° に十分小さい）。"""
+    (v_in, ind, cap), f_ctrl = circuit
+    r_limit = 1e10 / math.sqrt(cap / ind)
+    reason, best, err = _outcome(v_in, ind, cap, r_load, f_ctrl)
+    reason0, best0, err0 = _outcome(v_in, ind, cap, r_limit, f_ctrl)
+    assert reason == reason0
+    assert best.phase_margin_deg == pytest.approx(best0.phase_margin_deg, abs=1e-6)
+    assert best.ki == pytest.approx(best0.ki, rel=1e-6) and best.kp == pytest.approx(best0.kp, rel=1e-6)
+    assert best.phase_margin_deg <= 180.0
+    assert ("は満たす）" in str(err)) == ("は満たす）" in str(err0)) if err else True
+    r_ref = 1e8 / math.sqrt(cap / ind)
+    _, best_ref, _ = _outcome(v_in, ind, cap, r_ref, f_ctrl)
+    pm, _, radius = independent_margin_and_radius(best_ref, f_ctrl, v_in=v_in, inductance=ind,
+                                                  capacitance=cap, r_load=r_ref)
+    assert best.phase_margin_deg == pytest.approx(pm, abs=0.01)
+    assert radius == pytest.approx(best.pole_radius, rel=1e-6)
+    if err is None:
+        assert pm >= TARGET - 0.01 and radius < 1.0
+
+
+def test_huge_load_reproductions():
+    """レビュー（重大1）と検証（軽微1）の再現例: 断る2つは R = 1e12 と同じ margin_not_reached（17.3° と
+    38.8°）、「満たす」と書かない。成功するはずの例は成功する。"""
+    cases = (((24, 47e-6, 100e-6, 1e16, 40e3), "17.3"), ((24, 22e-6, 100e-6, 1e17, 100e3), "38.8"))
+    for args, shown in cases:
+        _, best, err = _outcome(*args)
+        assert err.reason == "margin_not_reached" and "満たす" not in str(err)
+        assert f"位相余裕 {shown}°（目標まで" in str(err)
+    g = buck_voltage_mode_pid(12, 4.7e-6, 22e-6, 1e17, 1e6)
+    assert g.phase_margin_deg == pytest.approx(TARGET, abs=1e-6) and g.pole_radius < 1.0
+
+
+def test_plant_poles_of_a_lossless_like_lc_are_inside_the_unit_circle():
+    """植物の極の組の |z|² − 1 は det Ad − 1 = expm1(−Ts/(R·C))（この試験の式）で与え、R が 1e30 Ω でも内側と
+    数える（丸めの 2·Re x + |x|² では 1e-17 程度の正の値になりうる）。単位円までの距離は Ts/(2RC) に合う。"""
+    f_ctrl, r_load = 100e3, 1e17
+    g = buck_voltage_mode_pid(24, 47e-6, 100e-6, 6.0, f_ctrl)
+    loop = _loop_of(g, f_ctrl, r_load=r_load)
+    n = len(loop._zeros)
+    plant = [n + i for i, x in enumerate(loop._poles) if abs(x.imag) > 1e-3]   # 植物の極の組（共振）
+    assert len(plant) == 2 and all(loop._inside[i] for i in plant)
+    ts = 1.0 / f_ctrl
+    for i in plant:
+        assert loop._gap[i] == pytest.approx(ts / (2 * r_load * C), rel=1e-6)
+
+
+def test_radius_is_written_with_digits_that_agree_with_the_judgement():
+    """半径の書き方: 安定なら 1 より小さく、不安定なら 1 より大きく見える桁まで書く（以前は 0.99999998616 を
+    「1.0000（1 未満で安定）」と書いた）。1 から遠ければ小数4桁。安定の余裕が無いときは 17 桁。"""
+    def text(radius):
+        return str(GainDesignError("margin_not_reached", "例。", TARGET,
+                                   PidGains(0.01, 100.0, 1e-6, 2.5e-6, 3e3, 60.0, radius)))
+
+    for radius in (0.99999998616, 1 - 2 * ini.STABILITY_EPS, 0.99996, 0.97):
+        m = re.search(r"極の半径 ([\d.]+)（1 未満で安定）", text(radius))
+        assert m and float(m.group(1)) < 1.0
+    assert "極の半径 0.9700（1 未満で安定）" in text(0.97)
+    for radius in (1 + 2 * ini.STABILITY_EPS, 1.00004, 1.2):
+        m = re.search(r"極の半径 ([\d.]+)（1 以上で不安定）", text(radius))
+        assert m and float(m.group(1)) > 1.0
+    assert "極の半径 0.99999999999999989（" in text(1 - 1.1e-16)
+
+
+def test_largest_reachable_margin_is_not_rounded_up_to_the_target():
+    """本文の「取れるのは最大 …°」は、目標に届かないのに届いたように丸めない（以前は 29.998° を 30.0° と
+    書いた）。本文の最大と最良の候補の余裕は、この試験の別の開ループの余裕（29.998°）と合う。"""
+    plant, f_ctrl = (24.0, 470e-6, 10e-6, 15.793045736999451), 15e3
+    best, err = _design(*plant, f_ctrl, zero_damping=0.1653846153846154, filter_ratio=0.0,
+                        phase_margin_deg=30.0)
+    shown = float(re.search(r"取れるのは最大 (-?[\d.]+)°", str(err)).group(1))
+    assert shown < 30.0 and shown == pytest.approx(29.998, abs=5e-4)
+    pm, _, _ = independent_margin_and_radius(best, f_ctrl, inductance=470e-6, capacitance=10e-6,
+                                             r_load=15.793045736999451)
+    assert pm == pytest.approx(shown, abs=1e-3) and pm < 30.0 - 1e-6
+
+
+@pytest.mark.parametrize("name,value", [
+    ("r_load", 5e-324), ("r_load", np.float32(1e-45)), ("r_load", 1e-7), ("r_load", 2e30),
+    ("r_load", 10**400), ("v_in", 5e-324), ("v_in", np.longdouble("1e-4000")), ("v_in", 2e9),
+    ("inductance", 1e-13), ("inductance", 2e4),
+    ("capacitance", 1e-16), ("capacitance", 2e6), ("f_ctrl", 1e-4), ("f_ctrl", 2e12), ("zero_ratio", 5e-324),
+    ("zero_ratio", 1e-10), ("filter_ratio", 1e300), ("filter_ratio", 1001.0), ("phase_margin_deg", 10**400),
+    ("f_cross_max", 10**400), ("f_cross_max", np.longdouble("1e-4000")),
+])
+def test_values_outside_the_physical_ranges_are_refused(name, value):
+    """物理として意味のある範囲（ARGUMENT_RANGES）の外、倍精度にできない値（10**400）、倍精度で 0 になる値
+    （np.longdouble('1e-4000')）は、ほかの例外でなく invalid_argument で断る（以前は ZeroDivisionError、
+    LinAlgError、OverflowError が出た）。"""
+    args = {"v_in": VIN, "inductance": L, "capacitance": C, "r_load": R, "f_ctrl": 100e3}
+    kwargs = {}
+    (args if name in args else kwargs)[name] = value
+    with pytest.raises(GainDesignError) as info:
+        buck_voltage_mode_pid(**args, **kwargs)
+    assert info.value.reason == "invalid_argument" and name in str(info.value)
+
+
+@pytest.mark.parametrize("name", ["v_in", "inductance", "capacitance", "r_load", "f_ctrl", "zero_ratio",
+                                  "filter_ratio"])
+@pytest.mark.parametrize("end", [0, 2])
+def test_values_at_the_ends_of_the_physical_ranges_are_computed(name, end):
+    """範囲の端（両端を含む）の値は計算する: 結果か、invalid_argument 以外の理由の GainDesignError（最良の
+    候補の値は有限）。ほかの例外や、警告（あふれ、0 割り）は出さない。"""
+    import warnings
+
+    value = ini.ARGUMENT_RANGES[name][end]
+    args = {"v_in": VIN, "inductance": L, "capacitance": C, "r_load": R, "f_ctrl": 100e3}
+    kwargs = {}
+    (args if name in args else kwargs)[name] = value
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        g, err = _design(**args, **kwargs)
+    assert err is None or err.reason != "invalid_argument"
+    if g is not None:
+        assert all(math.isfinite(x) for x in (g.kp, g.ki, g.kd, g.phase_margin_deg, g.pole_radius))
+
+
+def test_search_uses_the_same_meets_judgement_as_acceptance():
+    """交差周波数の探索でも「目標を満たす」は受け入れと同じ判定（目標 − TARGET_TOL_DEG 以上）: 探索の格子で
+    取れる最大の余裕が目標を 0.5e-6° だけ下回るときは margin_not_reached にしない（最良の候補を「満たす」と
+    書きながら「取れる交差周波数が無い」と書く食い違いを作らない）。2e-6° 下回るときは margin_not_reached で、
+    本文の最大は目標より小さく書く。格子の最大は、実装の部品（形の開ループと格子）で求める（境目を作るため）。"""
+    v_in, ind, cap, r_load, f_ctrl = 24.0, 470e-6, 10e-6, 15.793045736999451, 15e3
+    zeta, ratio, kappa = 0.1653846153846154, 0.0, 0.5
+    ts, w0 = 1.0 / f_ctrl, 1.0 / math.sqrt(ind * cap)
+    wz = kappa * w0
+    kp1, kd1 = ini._shape_gains(1.0, wz, zeta, 0.0)
+    shape = ini._Loop(*ini._loop_factors(kp1, 1.0, kd1, 0.0, v_in, ind, cap, r_load, ts), ts, 1e-3 * wz)
+    grid = np.geomspace(1.05 * w0, 0.5 * math.pi / ts, ini.GRID_POINTS)
+    vmax = float(np.max(180.0 + shape.phase_deg(grid)))
+    _, err = _design(v_in, ind, cap, r_load, f_ctrl, zero_damping=zeta, filter_ratio=ratio,
+                     phase_margin_deg=vmax + 0.5 * ini.TARGET_TOL_DEG)
+    assert err is None or err.reason != "margin_not_reached"
+    _, err = _design(v_in, ind, cap, r_load, f_ctrl, zero_damping=zeta, filter_ratio=ratio,
+                     phase_margin_deg=vmax + 2 * ini.TARGET_TOL_DEG)
+    assert err.reason == "margin_not_reached"
+    shown = float(re.search(r"取れるのは最大 (-?[\d.]+)°", str(err)).group(1))
+    assert shown < vmax + 2 * ini.TARGET_TOL_DEG and "は満たす）" not in str(err)

@@ -108,6 +108,28 @@ def _format_hz(value: float) -> str:
     return f"{value:.4g} Hz"
 
 
+def _format_radius(radius: float) -> str:
+    """閉ループの極の半径の書き方。判定（stability_of）と食い違わない桁で書く: 安定なら 1 より小さく、
+    不安定なら 1 より大きく見える桁まで（小数4桁から足す。0.99999998616 を「1.0000」と書かない）。
+    安定の余裕が無い（1 との差が ε 未満）なら 17 桁。"""
+    stability = stability_of(radius)
+    if stability != "no_margin":
+        for digits in range(4, 17):
+            shown = float(f"{radius:.{digits}f}")
+            if (shown < 1.0) if stability == "stable" else (shown > 1.0):
+                return f"{radius:.{digits}f}"
+    return f"{radius:.17g}"
+
+
+def _format_below(value: float, target: float) -> str:
+    """目標に届かない値の書き方。目標以上に見えないよう、小数1桁から桁を足す（29.998 を「30.0」と
+    書かない）。"""
+    for digits in range(1, 17):
+        if float(f"{value:.{digits}f}") < target:
+            return f"{value:.{digits}f}"
+    return f"{value:.17g}"
+
+
 def _format_deg_pair(margin_deg: float, shortfall_deg: float) -> tuple[str, str]:
     """（余裕、不足）の書き方。不足が 0.05° 未満でも「0.0°」にしないよう、0 でない最初の桁まで書く。"""
     digits = 1
@@ -155,13 +177,13 @@ class GainDesignError(ValueError):
             else:
                 shown, short = _format_deg_pair(pm, target_deg - pm)
                 margin = f"位相余裕 {shown}°（目標まで {short}° 足りない）"
-            radius = best.pole_radius
+            radius = _format_radius(best.pole_radius)
             stability = {
-                "stable": f"閉ループの極の半径 {radius:.4f}（1 未満で安定）",
-                "no_margin": (f"閉ループの極の半径 {radius:.17g}（1 との差が {STABILITY_EPS:g} より小さく、"
+                "stable": f"閉ループの極の半径 {radius}（1 未満で安定）",
+                "no_margin": (f"閉ループの極の半径 {radius}（1 との差が {STABILITY_EPS:g} より小さく、"
                               "安定の余裕が無い）"),
-                "unstable": f"閉ループの極の半径 {radius:.4f}（1 以上で不安定）",
-            }[stability_of(radius)]
+                "unstable": f"閉ループの極の半径 {radius}（1 以上で不安定）",
+            }[stability_of(best.pole_radius)]
             message += (
                 f" 最良の候補: Kp {best.kp:.4g} 1/V、Ki {best.ki:.4g} 1/(V·s)、Kd {best.kd:.4g} s/V、"
                 f"{margin}、{stability}。"
@@ -237,8 +259,8 @@ def _quadratic_roots(a2: float, a1: float, a0: float) -> list[complex]:
 def _loop_factors(
     kp: float, ki: float, kd: float, t_filter: float,
     v_in: float, inductance: float, capacitance: float, r_load: float, ts: float,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """開ループ L(z) = k·Π(z − zi)/Π(z − pk) の（k、零点 − 1、極 − 1）。
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """開ループ L(z) = k·Π(z − zi)/Π(z − pk) の（k、零点 − 1、極 − 1、根ごとの |r|² − 1（零点、極の順））。
 
     根は z = 1 からのずれ x = r − 1 で持つ（LC の共振や PID の零点が制御周波数よりずっと低いと、根が z = 1 に
     集まる。z で持つと 1 との差の桁が落ち、PID の零点が重根に近いと np.roots の誤差 √u ≈ 1e-8 が 1 との差を
@@ -248,6 +270,14 @@ def _loop_factors(
       零点: PID の分子を x で書いた a2·x² + a1·x + a0 の根（a2 = Kp·g + Ki·Ts·g + Kd、
           a1 = Kp·Ts + Ki·Ts·(g + Ts)、a0 = Ki·Ts²、g = Tf + Ts。Kp, Ki, Kd ≥ 0 なら係数がみな正で
           打ち消しが無い）と、植物の分子 b1·z + b0 の根 −(b0 + b1)/b1。
+    |r|² − 1（単位円の内外と、単位円までの距離を決める）は、x から 2·Re x + |x|² で作ると、根が単位円に
+    丸め（約 1e-17）より近いとき符号まで埋もれる（負荷抵抗がとても大きいと植物の極がそうなる）。複素数の組は
+    積が分かっているので、それで与える:
+      植物の極の組: |r|² = det Ad = e^{tr(A)·Ts} = e^{−Ts/(R·C)} → |r|² − 1 = expm1(−Ts/(R·C))
+        （R > 0 なら必ず内側）。
+      PID の零点の組: |r|² = （z の多項式の定数項）/（最高次の係数）= (Kp·Tf + Kd)/a2
+        → |r|² − 1 = −Ts·(Kp + Ki·g)/a2。
+    実根は x·(2 + x)（打ち消しが無い）。
     """
     delta, bd = _plant_delta(v_in, inductance, capacitance, r_load, ts)
     (d11, _), (d21, _) = delta
@@ -263,29 +293,49 @@ def _loop_factors(
         zeros, lead = [complex(-a0 / a1)], a1
     else:
         zeros, lead = [], a0
+    zero_excess = [_real_excess(x) for x in zeros]
+    if len(zeros) == 2 and zeros[0].imag != 0.0:          # PID の零点が複素数の組
+        zero_excess = [-ts * (kp + ki * g) / a2] * 2
     if b1 != 0.0:
         zeros.append(-b0_plus_b1 / b1)
+        zero_excess.append(_real_excess(zeros[-1]))
         gain = lead * b1 / g
     else:
         gain = lead * b0_plus_b1 / g
-    poles = [0.0, -ts / g, *np.linalg.eigvals(delta), -1.0]
-    return float(gain), np.array(zeros, dtype=complex), np.array(poles, dtype=complex)
+    plant_poles = list(np.linalg.eigvals(delta))
+    plant_excess = [_real_excess(x) for x in plant_poles]
+    if plant_poles[0].imag != 0.0:                        # 植物の極が複素数の組（共振）
+        plant_excess = [math.expm1(-ts / (r_load * capacitance))] * 2
+    poles = [0.0, -ts / g, *plant_poles, -1.0]
+    pole_excess = [0.0, _real_excess(-ts / g), *plant_excess, -1.0]
+    return (float(gain), np.array(zeros, dtype=complex), np.array(poles, dtype=complex),
+            np.array(zero_excess + pole_excess, dtype=float))
+
+
+def _real_excess(x: complex) -> float:
+    """|1 + x|² − 1。実数の x は x·(2 + x)（打ち消しが無い）、複素数は 2·Re x + |x|²。"""
+    x = complex(x)
+    if x.imag == 0.0:
+        return x.real * (2.0 + x.real)
+    return 2.0 * x.real + abs(x) ** 2
 
 
 class _Loop:
     """開ループの周波数応答、低い周波数から連続な位相、ゲインが 1 を横切る点（因子の形で計算する）。
 
     零点と極は z = 1 からのずれ x = r − 1 で受け取る。e^{jθ} − r = (e^{jθ} − 1) − x を expm1(jθ) − x で
-    計算するので、θ と x が小さくても距離を相対の精度で測れる。
+    計算するので、θ と x が小さくても距離を相対の精度で測れる。excess は根ごとの |r|² − 1（零点、極の順。
+    _loop_factors が丸めに頼らない形で与える）で、単位円の内外（位相の数え方）と単位円までの距離に使う。
     """
 
-    def __init__(self, gain: float, zeros: np.ndarray, poles: np.ndarray, ts: float, w_low: float):
+    def __init__(self, gain: float, zeros: np.ndarray, poles: np.ndarray, excess: np.ndarray, ts: float,
+                 w_low: float):
         self.gain, self.ts = gain, ts
         self._zeros, self._poles = zeros, poles
         self._x = np.concatenate([zeros, poles])
         self._signs = np.concatenate([np.ones(len(zeros)), -np.ones(len(poles))])   # 零点 +1、極 −1
         self._abs = np.abs(1.0 + self._x)                       # |r|
-        excess = 2.0 * self._x.real + np.abs(self._x) ** 2      # |r|² − 1（桁落ちしない形）
+        self._inside = np.asarray(excess) <= 0.0                # |r| ≤ 1
         self._gap = np.abs(excess) / (self._abs + 1.0)          # 根と単位円の距離 ||r| − 1|
         self._log_k = math.log(abs(gain))
         self._sign = math.atan2(0.0, gain)                     # k の偏角（0 か π）
@@ -310,13 +360,13 @@ class _Loop:
             return self._log_k + (self._signs[None, :] * np.log(np.abs(self._distance(theta)))).sum(axis=1)
 
     @staticmethod
-    def _arg_sum(x_roots: np.ndarray, theta: np.ndarray) -> np.ndarray:
-        """Σ arg(e^{jθ} − r) を、θ について折り返さない形で（r = 1 + x）。
+    def _arg_sum(x_roots: np.ndarray, inside: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Σ arg(e^{jθ} − r) を、θ について折り返さない形で（r = 1 + x。inside は |r| ≤ 1 か）。
         |r| ≤ 1: θ + arg(1 − r·e^{−jθ})、1 − r·e^{−jθ} = −expm1(−jθ) − x·e^{−jθ}（実部が正）。
         |r| > 1: arg(−r) + arg(1 − e^{jθ}/r)、1 − e^{jθ}/r = (x − expm1(jθ))/r（実部が正）。"""
         total = np.zeros_like(theta)
-        for x in x_roots:
-            if 2.0 * x.real + abs(x) ** 2 <= 0.0:
+        for x, is_inside in zip(x_roots, inside, strict=True):
+            if is_inside:
                 total += theta + np.angle(-np.expm1(-1j * theta) - x * np.exp(-1j * theta))
             else:
                 r = 1.0 + x
@@ -325,7 +375,9 @@ class _Loop:
 
     def _raw_phase(self, w: np.ndarray) -> np.ndarray:
         theta = np.asarray(w, dtype=float) * self.ts
-        return self._sign + self._arg_sum(self._zeros, theta) - self._arg_sum(self._poles, theta)
+        n = len(self._zeros)
+        return (self._sign + self._arg_sum(self._zeros, self._inside[:n], theta)
+                - self._arg_sum(self._poles, self._inside[n:], theta))
 
     def phase_deg(self, w: np.ndarray) -> np.ndarray:
         """位相 [deg]。低い周波数の端（w_low）で主値と一致し、そこから連続。"""
@@ -505,28 +557,64 @@ def closed_loop_pole_radius(
     return float(np.max(np.abs(np.linalg.eigvals(m))))
 
 
-def _is_real(v) -> bool:
-    """有限の実数か（Python の int・float、numpy の整数・浮動小数点数など numbers.Real）。
-    真偽値は数えない。"""
-    return (isinstance(v, numbers.Real) and not isinstance(v, bool | np.bool_)
-            and math.isfinite(float(v)))
+# 設計の引数の範囲（SI）: 名前 → (下限, 下限を含むか, 上限, 上限を含むか, 単位)。外は invalid_argument。
+# 回路の値は、実用の範囲（Vin 0.1 V〜1 MV、L 1 nH〜10 H、C 10 pF〜数 kF、R 1 mΩ〜1 MΩ と無負荷、制御周波数
+# 10 Hz〜10 MHz）の外側に 3 桁以上の余裕を取った。これより外は物理として意味が無く、倍精度では 0 割り・あふれ
+# （r_load = 5e-324、10**400 など）を起こす。r_load の上限 1e30 Ω は無負荷を表す値（どの回路でも Q が 1e20 を
+# 超え、平均モデルは無損失の LC と区別できない）。零点の比の下限 1e-9: それより小さいと積分の零点が共振の
+# 1e9 分の 1 より下に来て、閉ループの極の半径が丸めの範囲で 1 に乗る（安定の余裕が無い）ことしか起きない。
+# 微分のフィルタの比の上限 1e3: 時定数が制御周期の 1000 倍を超えると微分は交差周波数より 3 桁下で切れる。
+ARGUMENT_RANGES: dict[str, tuple[float, bool, float, bool, str]] = {
+    "v_in": (1e-6, True, 1e9, True, " V"),
+    "inductance": (1e-12, True, 1e4, True, " H"),
+    "capacitance": (1e-15, True, 1e6, True, " F"),
+    "r_load": (1e-6, True, 1e30, True, " Ω"),
+    "f_ctrl": (1e-3, True, 1e12, True, " Hz"),
+    "f_cross_max": (0.0, False, math.inf, False, " Hz"),
+    "zero_ratio": (1e-9, True, ZERO_RATIO_MAX, True, ""),
+    "zero_damping": (0.0, False, ZERO_DAMPING_MAX, True, ""),
+    "filter_ratio": (0.0, True, 1e3, True, ""),
+    "phase_margin_deg": (0.0, False, 180.0, False, "°"),
+}
 
 
-def _check_arguments(target_deg, *, positive: dict, ratio: dict, non_negative: dict) -> None:
-    """設計の引数を確かめる。範囲の外、NaN、inf、数でない値は GainDesignError（理由 invalid_argument）。
+def _as_real(v) -> float | None:
+    """有限の実数なら倍精度の値（Python の int・float、numpy の整数・浮動小数点数など numbers.Real）。
+    真偽値、倍精度にできない値（10**400 など）、NaN、inf は None。"""
+    if not isinstance(v, numbers.Real) or isinstance(v, bool | np.bool_):
+        return None
+    try:
+        x = float(v)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return x if math.isfinite(x) else None
 
-    ratio は零点の比と減衰（上限は ZERO_RATIO_MAX、ZERO_DAMPING_MAX）: {名前: (値, 上限)}。
-    """
-    rules = [(k, v, "0 より大きい有限値", _is_real(v) and v > 0) for k, v in positive.items()]
-    rules += [(k, v, f"0 より大きく {upper:g} 以下の値", _is_real(v) and 0 < v <= upper)
-              for k, (v, upper) in ratio.items()]
-    rules += [(k, v, "0 以上の有限値", _is_real(v) and v >= 0) for k, v in non_negative.items()]
-    rules.append(("phase_margin_deg", target_deg, "0° より大きく 180° より小さい値",
-                  _is_real(target_deg) and 0 < target_deg < 180))
-    bad = [f"{k} は {rule}にする（現在 {v!r}）" for k, v, rule, ok in rules if not ok]
+
+def _range_text(lo: float, lo_closed: bool, hi: float, hi_closed: bool, unit: str) -> str:
+    low = f"{lo:g}{unit} {'以上' if lo_closed else 'より大きく'}"
+    if math.isinf(hi):
+        return f"{lo:g}{unit} より大きい有限値" if not lo_closed else f"{low}の有限値"
+    return f"{low} {hi:g}{unit} {'以下' if hi_closed else 'より小さい'}の値"
+
+
+def _check_arguments(values: dict) -> dict[str, float]:
+    """設計の引数を ARGUMENT_RANGES で確かめ、倍精度の値にして返す。範囲の外、NaN、inf、数でない値は
+    GainDesignError（理由 invalid_argument。すべての誤りを1つの文に書く）。範囲は倍精度に直した後の値で比べる
+    （np.longdouble('1e-4000') は 0 になるので断る）。"""
+    out, bad = {}, []
+    for name, v in values.items():
+        lo, lo_closed, hi, hi_closed, unit = ARGUMENT_RANGES[name]
+        x = _as_real(v)
+        ok = (x is not None and (x >= lo if lo_closed else x > lo) and (x <= hi if hi_closed else x < hi))
+        if ok:
+            out[name] = x
+        else:
+            bad.append(f"{name} は {_range_text(lo, lo_closed, hi, hi_closed, unit)}にする（現在 {v!r}）")
     if bad:
+        target = _as_real(values.get("phase_margin_deg"))
         raise GainDesignError("invalid_argument", "設計の引数が範囲の外。" + "。".join(bad) + "。",
-                              float(target_deg) if _is_real(target_deg) else math.nan, None)
+                              math.nan if target is None else target, None)
+    return out
 
 
 def _shape_gains(ki: float, wz: float, zeta: float, t_filter: float) -> tuple[float, float]:
@@ -542,9 +630,10 @@ def buck_voltage_mode_pid(
 ) -> PidGains:
     """電圧モードの降圧コンバータのPIDの初期値（モジュールの説明の手順）。
 
-    zero_ratio   : PID の零点の角周波数の、LC の共振に対する比 κ（0 < κ ≤ 1）
+    v_in, inductance, capacitance, r_load, f_ctrl : 回路の値と制御周波数（SI。範囲は ARGUMENT_RANGES）
+    zero_ratio   : PID の零点の角周波数の、LC の共振に対する比 κ（1e-9 ≤ κ ≤ 1）
     zero_damping : PID の零点の減衰係数 ζz（0 < ζz ≤ 2。1 未満で複素数の組、1 で重根、1 より上で2つの実根）
-    filter_ratio : 微分のフィルタの時定数の、制御周期に対する比（0 以上）
+    filter_ratio : 微分のフィルタの時定数の、制御周期に対する比（0〜1000）
     phase_margin_deg : 目標の位相余裕 [deg]（0 < PM < 180）
     f_cross_max  : 交差周波数を探す範囲の上端 [Hz]（既定は f_ctrl/4。ナイキスト周波数の半分）。
                    ナイキスト周波数の NYQUIST_LIMIT 倍より上を指定したら、そこまでに制限し、結果
@@ -553,7 +642,7 @@ def buck_voltage_mode_pid(
     直して使う。
     目標を満たせなければ GainDesignError（理由と最良の候補つき。ValueError の一種）。
 
-    零点の範囲（0 < κ ≤ 1、0 < ζz ≤ 2）: 零点は、LC の共振で位相が −180° 近くまで落ちる分を進みで
+    零点の範囲（κ ≤ 1、ζz ≤ 2）: 零点は、LC の共振で位相が −180° 近くまで落ちる分を進みで
     取り戻すためのもの。電圧モードの PID（タイプ III）では、2つの零点を共振の少し下〜共振に置く
     （κ = 0.5〜1。ζz = 1 の重根も普通）。κ が 1 を超えると零点が共振の上に来て、共振と零点の間で
     |L| > 1 のまま位相が −180° を下回る（条件つき安定。起動やデューティの飽和でループのゲインが下がると
@@ -562,18 +651,16 @@ def buck_voltage_mode_pid(
     共振の近くに置く設計）。それより大きいと上の零点が交差周波数の近くまで上がり、1つの ωz で2つの零点を
     表す意味が無くなる。
     """
-    _check_arguments(
-        phase_margin_deg,
-        positive={"v_in": v_in, "inductance": inductance, "capacitance": capacitance, "r_load": r_load,
-                  "f_ctrl": f_ctrl, **({} if f_cross_max is None else {"f_cross_max": f_cross_max})},
-        ratio={"zero_ratio": (zero_ratio, ZERO_RATIO_MAX), "zero_damping": (zero_damping, ZERO_DAMPING_MAX)},
-        non_negative={"filter_ratio": filter_ratio},
-    )
-    v_in, inductance, capacitance, r_load = map(float, (v_in, inductance, capacitance, r_load))
-    f_ctrl = float(f_ctrl)
-    zero_ratio, zero_damping = float(zero_ratio), float(zero_damping)
-    filter_ratio, phase_margin_deg = float(filter_ratio), float(phase_margin_deg)
-    f_cross_max = None if f_cross_max is None else float(f_cross_max)
+    given = {"v_in": v_in, "inductance": inductance, "capacitance": capacitance, "r_load": r_load,
+             "f_ctrl": f_ctrl, "zero_ratio": zero_ratio, "zero_damping": zero_damping,
+             "filter_ratio": filter_ratio, "phase_margin_deg": phase_margin_deg}
+    if f_cross_max is not None:
+        given["f_cross_max"] = f_cross_max
+    a = _check_arguments(given)                 # 倍精度の値
+    v_in, inductance, capacitance, r_load, f_ctrl = (a[k] for k in ("v_in", "inductance", "capacitance",
+                                                                    "r_load", "f_ctrl"))
+    zero_ratio, zero_damping, filter_ratio = a["zero_ratio"], a["zero_damping"], a["filter_ratio"]
+    phase_margin_deg, f_cross_max = a["phase_margin_deg"], a.get("f_cross_max")
     ts = 1.0 / f_ctrl
     w0 = 1.0 / math.sqrt(inductance * capacitance)
     wz, t_filter = zero_ratio * w0, filter_ratio * ts
@@ -623,22 +710,25 @@ def buck_voltage_mode_pid(
                         closed_loop_pole_radius(kp, ki, kd, t_filter, *plant),
                         f_search_max=f_hi, f_cross_max_limited_from=limited_from)
 
-    # 共振の上から探索の上端まで、位相余裕が目標以上の最初の区間を探し、その上の端を二分法で詰める
+    # 共振の上から探索の上端まで、位相余裕が目標を満たす（meets_target。受け入れと同じ判定）最初の区間を探し、
+    # その上の端を二分法で詰める（二分法は目標ちょうどを狙う）
     grid = np.geomspace(1.05 * w0, w_hi, GRID_POINTS)
     values = margin(grid)
-    above = np.nonzero(values >= phase_margin_deg)[0]
+    meets = values >= phase_margin_deg - TARGET_TOL_DEG
+    above = np.nonzero(meets)[0]
     if above.size == 0:
         best = candidate(float(grid[int(np.argmax(values))]))
         raise fail(
             "margin_not_reached",
             f"制御周波数 {f_ctrl:g} Hz では、LC の共振（{f0:.4g} Hz）より上の "
             f"{1.05 * f0:.4g}〜{f_hi:.4g} Hz に、"
-            f"位相余裕 {phase_margin_deg:g}° を取れる交差周波数が無い（取れるのは最大 {values.max():.1f}°）。"
+            f"位相余裕 {phase_margin_deg:g}° を取れる交差周波数が無い（取れるのは最大 "
+            f"{_format_below(float(values.max()), phase_margin_deg)}°）。"
             "制御周波数を上げるか、目標の位相余裕を下げる。",
             best,
         )
     i = int(above[0])
-    while i + 1 < len(grid) and values[i + 1] >= phase_margin_deg:
+    while i + 1 < len(grid) and meets[i + 1]:
         i += 1
     if i == len(grid) - 1:
         best = candidate(float(grid[-1]))
