@@ -18,7 +18,7 @@ import math
 import numpy as np
 import pytest
 
-from circuit_sim import CircuitError, Component, Netlist, Sine, simulate
+from circuit_sim import DC, CircuitError, Component, Netlist, Sine, simulate
 
 F, LS, RL, RG, H, R_ON = 50.0, 1e-3, 10.0, 1e6, 1e-5, 1e-3
 N = round(1 / (F * H))        # 電源の1周期の点数
@@ -90,19 +90,60 @@ def test_check_detects_missing_commutation_drop():
     assert abs(mean - ideal) / ideal > 0.02
 
 
+def rounding_band(x0: np.ndarray, n_nodes: int) -> float:
+    """丸め誤差とみなす幅（仕様: 節点電圧の最大の 1e-8 倍、下限 1e-9 V）。"""
+    return max(1e-9, 1e-8 * float(np.abs(x0[:n_nodes]).max()))
+
+
 @pytest.mark.parametrize("vm", [48.0, 400.0])
-def test_zero_initial_currents_start_with_all_diodes_off(vm):
-    """t = 0 でインダクタ電流がすべて 0 のときは、ダイオードはどれも電流 0。全オフから始め、すぐ導通する。"""
+def test_zero_initial_currents_are_rescued_at_start(vm):
+    """t = 0 でインダクタ電流がすべて 0 だと、どのダイオードも電流 0 で、電圧は丸め誤差だけになる。
+    オンにしてもオフにしても判定と食い違って落ち着かないので、違反が丸め誤差の幅の中の状態を採る（救済）。
+    採った状態は、その幅の中で物理的に正しい（オンなら逆電圧が幅以下、オフなら順電圧が幅以下）。"""
     net, _ = bridge(vm)
     res = simulate(net, 2e-3, H)
-    assert all(res[f"on({d})"][0] in (0.0, 1.0) for d in ("D1", "D2", "D3", "D4", "D5", "D6"))
+    assert res.stats["rescues_at_start"] == 1
+    n_nodes = sum(name.startswith("v(") for name in res.unknowns)
+    x0, code0 = res.x[0], int(res.sample_state[0])
+    band = rounding_band(x0, n_nodes)
+    for j, cid in enumerate(res.devices):
+        anode, cathode = net.component(cid).nodes
+        vd = (0.0 if anode == "0" else x0[res.unknowns.index(f"v({anode})")]) - (
+            0.0 if cathode == "0" else x0[res.unknowns.index(f"v({cathode})")])
+        assert (vd >= -band) if (code0 >> j) & 1 else (vd <= band), f"{cid}: {vd} V（幅 {band} V）"
     # 初期値は整合の計算（擬似逆行列）を通るので、0 からのずれは丸め誤差だけ
-    assert np.all(np.abs(res.x[0][[res.unknowns.index(f"i(L{p})") for p in "abc"]]) < 1e-9)
-    assert np.isfinite(res.x).all()
+    assert np.all(np.abs(x0[[res.unknowns.index(f"i(L{p})") for p in "abc"]]) < 1e-9)
     # 1 ms 後には、いちばん高い相と低い相のダイオードが導通している
     k = round(1e-3 / H)
     assert sum(res[f"on({d})"][k] for d in ("D1", "D3", "D5")) >= 1
     assert sum(res[f"on({d})"][k] for d in ("D4", "D6", "D2")) >= 1
+
+
+def test_no_rescue_when_the_start_is_not_a_tie():
+    """初期電流がある（電流 0 の引き分けでない）ときは、救済は働かない。"""
+    net, _ = bridge(400.0, (5.0, -2.0, -3.0))
+    assert simulate(net, 2e-3, H).stats["rescues_at_start"] == 0
+
+
+def test_a_real_violation_is_not_rescued(monkeypatch):
+    """丸め誤差より大きい違反は救済しない（幅を広げすぎる誤りを落とす）。
+
+    10 V の部分（節点電圧の最大を決める）の横に、1 mV の電源 - ダイオード - 抵抗。t = 0 ではダイオードを
+    オンにする必要がある（順電圧 1 mV。幅は 1e-8 × 10 V = 1e-7 V）。反転の上限を 0 回にすると、
+    落ち着かないまま違反 1 mV が残り、幅を超えるのでエラーになる。"""
+    import importlib
+    sim = importlib.import_module("circuit_sim.simulate")
+    net = Netlist(components=[
+        Component(id="V1", type="V", nodes=("a", "0"), waveform=DC(value=10.0)),
+        Component(id="R1", type="R", nodes=("a", "0"), value=1e3),
+        Component(id="V2", type="V", nodes=("b", "0"), waveform=DC(value=1e-3)),
+        Component(id="D1", type="D", nodes=("b", "c")),
+        Component(id="R2", type="R", nodes=("c", "0"), value=1e3),
+    ])
+    assert simulate(net, 1e-3, H)["on(D1)"][0] == 1.0                    # 対照: 普通はオンで始まる
+    monkeypatch.setattr(sim, "_flip_limit", lambda n_diodes: 0)
+    with pytest.raises(CircuitError, match="時刻 t=0 でダイオードの状態が"):
+        simulate(net, 1e-3, H)
 
 
 def test_states_are_continuous_and_reproducible():
@@ -130,7 +171,8 @@ def test_with_dc_capacitor_and_random_initial_values():
 
 
 def test_floating_dc_side_error_names_the_inductors_and_the_fix():
-    """直流側も中性点も接地しないと、直流側はインダクタだけで外とつながる。原因と直し方をエラーに書く。"""
+    """中性点だけを接地し、直流側をどこにも接地しないと、直流側はインダクタだけで外とつながる。
+    原因と直し方をエラーに書く。"""
     net, _ = bridge(48.0)
     net = Netlist(components=[c for c in net.components if c.id != "Rg"])
     with pytest.raises(CircuitError) as exc:
@@ -139,3 +181,60 @@ def test_floating_dc_side_error_names_the_inductors_and_the_fix():
     assert "La, Lb, Lc だけで回路の残りとつながって" in text
     assert "大きな抵抗" in text and "基準節点" in text
     assert "ダイオードだけで閉じたループ" not in text
+
+
+def twelve_pulse(vm: float) -> Netlist:
+    """12パルス整流: 30° ずらした2組の三相（相電圧の振幅 vm、Ls 1 mH）とブリッジ2つを直列にして負荷 10 Ω。
+    1組目の中性点を接地し、2組目の中性点と、2つのブリッジの間の節点を 1 MΩ で接地する。"""
+    comps = []
+    for side, (neutral, top, bot, shift) in {"y": ("0", "P", "M", 0.0), "d": ("Nd", "M", "Q", 30.0)}.items():
+        for k, ph in enumerate("abc"):
+            node = f"{side}{ph}"
+            comps += [
+                Component(id=f"V{node}", type="V", nodes=(f"s{node}", neutral),
+                          waveform=Sine(amplitude=vm, frequency=F, phase_deg=shift - 120.0 * k)),
+                Component(id=f"L{node}", type="L", nodes=(f"s{node}", node), value=LS),
+                Component(id=f"D{node}1", type="D", nodes=(node, top)),
+                Component(id=f"D{node}2", type="D", nodes=(bot, node)),
+            ]
+    comps += [Component(id="RL", type="R", nodes=("P", "Q"), value=RL),
+              Component(id="Rg1", type="R", nodes=("M", "0"), value=RG),
+              Component(id="Rg2", type="R", nodes=("Nd", "0"), value=RG)]
+    return Netlist(components=comps)
+
+
+@pytest.mark.parametrize("vm", [1e3, 1e4])
+def test_rescue_at_start_for_high_voltage_twelve_pulse(vm):
+    """電圧が高いと、t = 0 の丸め誤差が下限の 1e-9 V を超える。
+
+    幅の比（節点電圧の 1e-8 倍）で救済できること（比を 1e-13 にすると、この試験は落ちる）。"""
+    net = twelve_pulse(vm)
+    res = simulate(net, 2e-3, H)
+    assert res.stats["rescues_at_start"] == 1
+    n_nodes = sum(name.startswith("v(") for name in res.unknowns)
+    x0, code0 = res.x[0], int(res.sample_state[0])
+    band = rounding_band(x0, n_nodes)
+    for j, cid in enumerate(res.devices):
+        anode, cathode = net.component(cid).nodes
+        vd = (0.0 if anode == "0" else x0[res.unknowns.index(f"v({anode})")]) - (
+            0.0 if cathode == "0" else x0[res.unknowns.index(f"v({cathode})")])
+        assert (vd >= -band) if (code0 >> j) & 1 else (vd <= band), f"{cid}: {vd} V（幅 {band} V）"
+
+
+def test_fast_mode_from_the_grounding_resistor_names_its_elements_instead_of_an_impossible_step():
+    """1 MΩ の接地抵抗と3つの Ls が作る成分（時定数 L / (3·Rg) = 0.33 ns）。刻みで見るにはステップ数が上限を
+    超えるので、h を細かくするよう勧めるのではなく、成分を作る素子を挙げ、
+    見る必要が無ければ対処が要らないと書く。"""
+    net, _ = bridge(100.0)
+    res = simulate(net, 3 / F, H)
+    fast = [n for n in res.notes if "最も速い時定数" in n]
+    assert len(fast) == 1 and "3.33e-10 s" in fast[0]
+    assert "La, Lb, Lc, Rg" in fast[0] and "上限" in fast[0] and "対処は要らない" in fast[0]
+    assert "この成分を見るには h を" not in fast[0]                    # 実行できない直し方を勧めない
+    # 勧める h で足りる場合は、従来どおり h を勧める（1 ms の RC を h = 10 ms で）
+    rc = Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=DC(value=1.0)),
+        Component(id="R1", type="R", nodes=("in", "out"), value=1e3),
+        Component(id="C1", type="C", nodes=("out", "0"), value=1e-6),
+    ])
+    assert "この成分を見るには h を 0.0001 s 以下にする" in simulate(rc, 1.0, 1e-2).notes[0]

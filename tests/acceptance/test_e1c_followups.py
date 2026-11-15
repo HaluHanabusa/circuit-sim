@@ -247,14 +247,6 @@ def test_c2_off_state_ringing_with_high_q_is_noted():
     assert oscillation_notes(res.notes)
 
 
-@product_bug(
-    "軽微",
-    "スイッチの経路の注意は、r_off を10倍にして複素固有値が相対 1% 以上動く成分を見かけの成分として除く。",
-    "オフ・オフの区間の L とスイッチ節点の容量の振動は、減衰（実部）だけがオフ抵抗で決まるので、",
-    "Q が約45未満だと本物の振動まで除かれる。既定の r_off = 1 MΩ でも、L = 1 mH・5 pF（周期 444 ns、",
-    "1周期 8.9 点、Q = 35）や 470 µH・2 pF（3.9 点）で、振れ 20 V の振動が2500点以上あるのに注意が出ない。",
-    "抵抗に置き換えた回路では出る",
-)
 @pytest.mark.parametrize("L,csw", [(1e-3, 5e-12), (470e-6, 2e-12)])
 def test_c2_off_state_ringing_with_moderate_q_is_noted(L, csw):
     res = simulate(dcm_ring(L, csw), 2e-4, H_SW, gates=[Pwm(name="g", frequency=1e5, duty=0.3)])
@@ -310,12 +302,6 @@ def test_c3_error_above_one_percent_is_never_silent(R, t_end):
     assert error < TOL_ANALYTIC or any("精度" in n or "正しく出ない" in n for n in notes)
 
 
-@product_bug(
-    "軽微",
-    "見込みの誤差が頭打ち（73.6%）になる領域では、注意が勧める刻み（『ずれを入力の 0.5% 程度にするには』）が",
-    "粗すぎる。R = 1 Ω・t_end = 5 s で 2.6%、R = 0.01 Ω・t_end = 1 s で 10.4%、R = 10 Ω・t_end = 20 s では",
-    "元の 0.04% が 2.0% に悪化する。従った後の計算には新しい注意が出て、2回目に従うと 0.5〜0.7% になる",
-)
 @pytest.mark.parametrize("R,t_end", [(1.0, 5.0), (0.01, 1.0), (10.0, 20.0)])
 def test_c3_following_the_advice_once_is_enough(R, t_end):
     _, notes = rlc_error(R, {"t_end": t_end})

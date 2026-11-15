@@ -76,25 +76,30 @@ def _values(spec: Spec, names: list[str], notes: list[str]) -> dict[str, float]:
     return values
 
 
-def _phase_error(poles: np.ndarray, t_end: float, h: float) -> tuple[float, complex | None]:
-    """台形則の位相のずれで、振動の成分が入力に対してどれだけずれるかの見積もり（比）と、その極。
+def _phase_error(poles: np.ndarray, t_end: float, h: float) -> tuple[float, float, complex | None]:
+    """台形則の位相のずれで、振動の成分が入力に対してどれだけずれるかの見積もり（比）。
 
+    戻り値: （見積もり、頭打ちにする前の見積もり、その極）。
     台形則の振動の角周波数は (2/h)·atan(ωh/2) で、相対的に約 (ωh)² / 12 遅れる。時刻 t までに
-    位相が ω·t·(ωh)² / 12 ずれ、振幅 e^(−αt) の成分（ステップ応答では入力と同じ大きさ）が
-    その分ずれる。t·e^(−αt) は t = 1/α で最大なので、計算時間の中の最大を取る。
-    振れ幅は2倍を超えないので、位相のずれは 2 で頭打ちにする。
+    位相が d·t（d = ω·(ωh)² / 12）ずれ、振幅 e^(−αt) の成分（ステップ応答では入力と同じ大きさ）が
+    その分ずれる。ずれは振れ幅の2倍を超えないので、見積もりは計算時間の中での
+    e^(−αt)·min(d·t, 2) の最大（d·t = 2 で頭打ちになるなら、その時刻での値）。
+    頭打ちにする前の値 e^(−αt)·d·t の最大は t = min(1/α, t_end) にあり、h² に比例する。
+    勧める刻みはこちらから逆算する（頭打ちの値からだと、ずれを小さく見て刻みを粗く勧めてしまう）。
     """
-    worst, which = 0.0, None
+    worst, worst_raw, which = 0.0, 0.0, None
     for p in poles:
         omega, alpha = abs(p.imag), abs(p.real)
         if omega <= alpha:          # 振動しない（または減衰の方が速い）成分は数えない
             continue
         drift = omega * (omega * h) ** 2 / 12.0
         t_peak = t_end if alpha * t_end <= 1.0 else 1.0 / alpha
-        error = math.exp(-alpha * t_peak) * min(drift * t_peak, 2.0)
-        if error > worst:
-            worst, which = error, p
-    return worst, which
+        raw = math.exp(-alpha * t_peak) * drift * t_peak
+        t_cap = 2.0 / drift                         # この時刻でずれが振れ幅の2倍に届く
+        error = 2.0 * math.exp(-alpha * t_cap) if t_cap < t_peak else raw
+        if raw > worst_raw:
+            worst, worst_raw, which = error, raw, p
+    return worst, worst_raw, which
 
 
 def _timing(spec: Spec, poles: np.ndarray, notes: list[str]) -> tuple[float, float]:
@@ -146,11 +151,11 @@ def _timing(spec: Spec, poles: np.ndarray, notes: list[str]) -> tuple[float, flo
                     "速い成分の変化を見るには simulation.h と simulation.t_end を指定する"
                 )
         h = t_end / max(1, round(t_end / h))
-    error, pole = _phase_error(poles, t_end, h)
+    error, raw, pole = _phase_error(poles, t_end, h)
     if error > PHASE_NOTE and pole is not None:
         period = 2.0 * math.pi / abs(pole.imag)
-        # 位相のずれは (ωh)² に比例するので、ずれを PHASE_TARGET にする刻み
-        h_fine = h * math.sqrt(PHASE_TARGET / error)
+        # 頭打ちにする前のずれは (ωh)² に比例するので、ずれを PHASE_TARGET にする刻み
+        h_fine = h * math.sqrt(PHASE_TARGET / raw)
         notes.append(
             f"回路の振動（周期 {period:.3g} s）を1周期 {period / h:.3g} 点で計算するので、"
             "台形則の位相のずれが"
