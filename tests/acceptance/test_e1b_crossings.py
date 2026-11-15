@@ -328,11 +328,6 @@ def test_unstable_reason_is_reachable_and_true():
     assert "1 以上で不安定" in str(err)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微。文言）: 設計した点の余裕は二分法で目標に合わせるので、丸めで目標を 1e-11° ほど下回る"
-    "ことがある。そのとき最良の候補を「目標まで 0.0° 足りない」と書き、理由 unstable では本文の「位相余裕は"
-    "目標を満たすが」と食い違う。受け入れの判定（目標 − 1e-6°）と文言の判定（目標ちょうど）の許容差がそろって"
-    "いない"))
 def test_candidate_at_the_target_within_rounding_is_not_called_short():
     plant, f_ctrl = UNSTABLE_CASE
     opts = {"zero_damping": 0.1437543236478271, "filter_ratio": 0.0, "phase_margin_deg": 24.361861916713153,
@@ -393,10 +388,6 @@ def test_design_argument_boundaries(name, value, ok):
     assert (reason != "invalid_argument") == ok
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微。前の版からの後退）: 引数の確かめが isinstance(v, int | float) なので、numpy の"
-    " np.int64 と np.float32 を、値が正の有限値でも「0 より大きい有限値にする（現在 np.int64(24)）」と断る。"
-    "前の版（math.isfinite(v) and v > 0）は通していた"))
 @pytest.mark.parametrize("value", [np.int64(24), np.float32(24.0)])
 def test_numpy_scalar_arguments_are_accepted(value):
     g = _call(v_in=value)
