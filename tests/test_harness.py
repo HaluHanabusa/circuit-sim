@@ -297,7 +297,11 @@ def install_claude(
 def fake_claude(
     tmp_path: Path, output: object, script: str = "", exit_code: int = 0, stderr: str = "",
 ) -> dict[str, str]:
-    """偽の claude を PATH の先頭に置く環境変数を返す。script（Python）を実行してから output を出力する。"""
+    """偽の claude を PATH の先頭に置く環境変数を返す。script（Python）を実行してから output を出力する。
+
+    後ろに続くのは、試験のセッションの始めに claude のある場所を取り除き、末尾に見張り役を置いた PATH
+    （tests/conftest.py）。偽が飛ばされたり起動に失敗したりしても、本物には届かず、見張り役が全体を失敗にする。
+    """
     fake = tmp_path / "bin"
     install_claude(fake, output, script, exit_code, stderr)
     return {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
@@ -1642,6 +1646,57 @@ def test_merge_requires_committed_worktree(repo):
     assert main_log(repo) == ["init"]
 
 
+def test_status_gives_the_same_reason_as_merge_for_uncommitted_changes(repo):
+    """status が「できる」と言うのに merge が拒む、が無い。違うファイルの名前を示す。"""
+    wt = implement(repo)
+    pass_all(repo)
+    status = cycle(repo, "status", "U1").stdout
+    refused = cycle(repo, "merge", "U1")
+    reason = "作業ツリーに未コミットの変更がある（product.py）。コミットしてから統合する"
+    assert "統合: まだできない" in status and reason in status
+    assert refused.returncode == 1 and reason in refused.stdout
+    commit(wt)
+    assert "統合: できる" in cycle(repo, "status", "U1").stdout
+
+
+def test_files_only_the_users_git_settings_ignore_are_named_with_the_way_out(repo, tmp_path):
+    """利用者の無視の設定（core.excludesFile）だけで外したファイルは、git status に出ないが、内容に数える
+    （ツリーIDは利用者の無視の指定を読まない。決まり9）。status と merge は同じ理由で止まり、そのファイルの
+    名前と、リポジトリの無視の指定に足す案内を出す。案内のとおりに足せば、内容から外れる。"""
+    users = users_setting_file(tmp_path, "excludesFile", ".vscode/")
+    users_env = {**TEST_ENV, **users}
+    wt = implement(repo)
+    (wt / ".vscode").mkdir()
+    (wt / ".vscode" / "settings.json").write_text("{}\n", encoding="utf-8")
+    pass_all(repo)
+    for args in (("add", "-A"), ("commit", "-q", "-m", "work")):
+        assert subprocess.run(["git", *args], cwd=wt, env=users_env, capture_output=True).returncode == 0
+    porcelain = subprocess.run(["git", "status", "--porcelain"], cwd=wt, env=users_env, capture_output=True)
+    assert porcelain.stdout == b""                                  # 利用者の git では、変更が無い
+    ignored = "利用者の git の設定（core.excludesFile など）だけで無視しているファイルがある"
+    ignored += "（.vscode/settings.json）"
+    way_out = "リポジトリの .gitignore か .git/info/exclude に足す"
+    status = cycle(repo, "status", "U1", env=users).stdout
+    refused = cycle(repo, "merge", "U1", env=users)
+    assert "統合: まだできない" in status and ignored in status and way_out in status
+    assert refused.returncode == 1 and ignored in refused.stdout and way_out in refused.stdout
+    assert "未コミットの変更がある" not in refused.stdout
+    # ほかの変更は、別に示す
+    (wt / "extra.py").write_text("y = 1\n", encoding="utf-8")
+    status = cycle(repo, "status", "U1", env=users).stdout
+    assert "作業ツリーに未コミットの変更がある（extra.py）" in status and ignored in status
+    (wt / "extra.py").unlink()
+    # 案内のとおり、リポジトリの無視の指定に足す（内容が変わるので、確認はやり直す）
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write("\n.vscode/\n")
+    pass_all(repo)
+    assert "統合: できる" in cycle(repo, "status", "U1", env=users).stdout
+    merged = cycle(repo, "merge", "U1", env=users)
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+
+
 def test_merge_sees_changes_hidden_from_git_status(repo):
     wt = implement(repo)
     pass_all(repo)
@@ -2025,6 +2080,9 @@ USERS_GIT_SETTINGS = {
     "属性を読むツリーの指定（GIT_ATTR_SOURCE）": lambda tmp, root: {
         "GIT_ATTR_SOURCE": attribute_source(root),
     },
+    "属性を読むツリーの設定（attr.tree）": lambda tmp, root: users_git_config(
+        tmp, f"[attr]\n\ttree = {attribute_source(root)}\n",
+    ),
 }
 
 
