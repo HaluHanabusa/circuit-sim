@@ -21,6 +21,8 @@ from test_harness import (
     fake_claude,
     headless,
     install_claude,
+    make_repo,
+    sh,
     was_run,
     write_text_like_windows,
 )
@@ -223,7 +225,7 @@ def test_doctor_reports_the_environment(root, tmp_path):
     code, result, screen = doctor(root, env=fake_claude(tmp_path, good_output()))
     assert code == 0, screen
     assert result["ok"] is True and result["problems"] == []
-    assert set(result) >= {"os", "python", "encoding", "git", "claude", "check", "headless"}
+    assert set(result) >= {"os", "python", "encoding", "git", "claude", "content", "check", "headless"}
     assert result["os"]["system"] and result["os"]["release"]
     assert result["python"]["version"] == ".".join(str(part) for part in sys.version_info[:3])
     assert result["python"]["supported"] is True
@@ -266,6 +268,21 @@ def test_missing_check_script_is_a_problem(root, tmp_path):
     assert result["check"] == {"ran": False, "reason": "missing"} and result["problems"] == ["check"]
 
 
+def test_check_run_by_doctor_does_not_get_the_callers_pytest_settings(root, tmp_path):
+    """呼び出し元の PYTEST_ で始まる変数（試験を選び直せる）は、確認に渡さない（cycle.py の check と同じ）"""
+    seen = tmp_path / "seen.json"
+    script = (
+        "import json, os, pathlib\n"
+        "names = sorted(name for name in os.environ if name.startswith('PYTEST_'))\n"
+        f"pathlib.Path({str(seen)!r}).write_text(json.dumps(names), encoding='utf-8')\n"
+    )
+    (root / "scripts" / "check.py").write_text(script, encoding="utf-8")
+    env = {**fake_claude(tmp_path, good_output()), "PYTEST_ADDOPTS": "-k nothing", "PYTEST_PLUGINS": "x"}
+    code, result, screen = doctor(root, env=env)
+    assert code == 0 and result["check"]["passed"] is True, screen
+    assert json.loads(seen.read_text(encoding="utf-8")) == []
+
+
 def in_process(root: Path, *args: str, find=None) -> tuple[int, dict]:
     """doctor.py を試験のプロセスの中で実行する（コマンドの見つけ方などを差し替える試験用）。"""
     patches = [mock.patch.dict(os.environ, {**TEST_ENV, "CYCLE_ROOT": str(root)}, clear=True)]
@@ -288,6 +305,21 @@ def without(*missing: str):
     def find(name: str, avoid: tuple = ()) -> str | None:
         return None if name in missing or name != "git" else real(name, avoid)
     return find
+
+
+def test_doctor_turns_the_error_dialogs_off_first(root):
+    """doctor.py は、git や claude を探して起動する前に、Windows のエラー画面を出さない設定にする。"""
+    order = []
+    real = without("claude")
+
+    def noted_find(name: str, avoid: tuple = ()) -> str | None:
+        order.append(name)
+        return real(name, avoid)
+
+    with mock.patch.object(DOCTOR.cycle, "quiet_error_dialogs", lambda: order.append("quiet")):
+        code, _ = in_process(root, "--no-check", find=noted_find)
+    assert code == 0
+    assert order[0] == "quiet" and "git" in order
 
 
 def test_missing_claude_is_reported_but_is_not_a_problem(root, capsys):
@@ -316,6 +348,57 @@ def test_old_python_is_a_problem(root, capsys):
     assert code == 1
     assert result["python"]["supported"] is False and result["problems"] == ["python"]
     assert "99.0 以上が必要" in capsys.readouterr().out
+
+
+UNKNOWN_CONTENT = {"commit": None, "tree": None, "branch": None, "dirty": None}
+
+
+def test_doctor_records_which_content_it_checked(tmp_path, capsys):
+    """結果に、確かめた内容（コミットID、ツリーID、ブランチ、未コミットの変更の有無）が入る。
+
+    ツリーIDは、ハーネス（scripts/cycle.py）と同じ求め方。
+    """
+    repo = make_repo(tmp_path)
+    commit, tree = sh(repo, "git", "rev-parse", "HEAD"), sh(repo, "git", "rev-parse", "HEAD^{tree}")
+    code, result = in_process(repo, "--no-check", find=without("claude"))
+    assert code == 0
+    assert result["content"] == {"commit": commit, "tree": tree, "branch": "main", "dirty": False}
+    assert f"内容        : コミット {commit[:10]}、ツリー {tree[:10]}（main）" in capsys.readouterr().out
+
+    # 未コミットの変更と新しいファイルを含む内容。ブランチから切り離されていれば、ブランチは無い
+    (repo / "product.py").write_text("x = 5\n", encoding="utf-8")
+    (repo / "new.py").write_text("y = 1\n", encoding="utf-8")
+    sh(repo, "git", "checkout", "-q", "--detach")
+    code, result = in_process(repo, "--no-check", find=without("claude"))
+    with mock.patch.dict(os.environ, TEST_ENV, clear=True):
+        changed = DOCTOR.cycle.tree_id(repo)
+    assert changed != tree
+    assert result["content"] == {"commit": commit, "tree": changed, "branch": None, "dirty": True}
+    shown = f"コミット {commit[:10]}、ツリー {changed[:10]}（ブランチから切り離されている、未コミットの"
+    assert shown in capsys.readouterr().out
+
+
+def test_content_is_unknown_outside_a_repository_with_a_commit(root, tmp_path, capsys):
+    """git の作業ツリーの最上位でなければ、内容は「分からない」。上の階層のリポジトリの内容を、書かない。"""
+    code, result = in_process(root, "--no-check", find=without("claude"))
+    assert code == 0 and result["content"] == UNKNOWN_CONTENT
+    assert "内容        : 分からない" in capsys.readouterr().out
+
+    below = make_repo(tmp_path) / "below"           # リポジトリの中の、下の階層
+    below.mkdir()
+    code, result = in_process(below, "--no-check", find=without("claude"))
+    assert code == 0 and result["content"] == UNKNOWN_CONTENT
+
+    empty = tmp_path / "empty"                      # コミットがまだ無いリポジトリ
+    empty.mkdir()
+    sh(empty, "git", "init", "-q", "-b", "main")
+    code, result = in_process(empty, "--no-check", find=without("claude"))
+    assert code == 0 and result["content"] == UNKNOWN_CONTENT
+
+    # git を起動できなくても、止まらない（git が無いことは、別の項目が問題として知らせる）
+    with mock.patch.object(DOCTOR.cycle, "run_git", side_effect=FileNotFoundError("git")):
+        code, result = in_process(root, "--no-check", find=without("claude"))
+    assert code == 0 and result["content"] == UNKNOWN_CONTENT
 
 
 def test_version_text_that_does_not_look_like_a_version_is_not_recorded(root):

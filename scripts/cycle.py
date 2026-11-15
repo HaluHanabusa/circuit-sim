@@ -13,10 +13,13 @@
                                                  セッション内で動かしたエージェントの結果を記録する
                                                  （--tree を省けるのは implement だけ）
   scripts/cycle.py check <ID>                    作業ツリーで scripts/check.py を実行して記録する
+  scripts/cycle.py record-ci <ID> --result <ファイル>
+                                                 Windows での手元の確認（scripts/local_ci.py）の結果を取り込む
   scripts/cycle.py status [<ID>]                 ゲートの状況を表示する
   scripts/cycle.py merge <ID>                    必要なゲートがすべて合格のときだけ main に取り込む
 
-ゲート: implement（実装）、check（自動確認）、review（レビュー）、verify（独立検証）、ux（UX確認）
+ゲート: implement（実装）、check（自動確認）、review（レビュー）、verify（独立検証）、ux（UX確認）、
+        windows（Windows での確認。仕様の見出しに needs_windows: true と書いた作業単位だけ）
 標準ライブラリだけで動く。Windows、macOS、Linux のどれでも同じ決まりを強制する
 （Windows では `python scripts/cycle.py …` の形で実行する。OSで違う箇所は「OSの違い」の節にまとめてある）。
 """
@@ -57,13 +60,45 @@ TREE_REQUIRED_GATES = ("review", "verify", "ux")
 # 許すのは、ゲートの時点で無かったファイルの追加だけ。それ以外の変更があれば、そのゲートは古いものとして扱う。
 AFTER_GATE_PATHS = ("tests/acceptance/", "docs/verification/")
 
-HEADER_KEYS = ("id", "owner", "needs_ux", "gates")
+HEADER_KEYS = ("id", "owner", "needs_ux", "gates", "needs_windows")
+# 見出しのうち、true か false だけで書くもの
+HEADER_FLAGS = ("needs_ux", "needs_windows")
+
+# Windows での確認のゲート。見出しの needs_windows: true で必要になり、記録は record-ci だけが作る
+# （gates: には書けない。record と run でも記録できない）。
+WINDOWS_GATE = "windows"
+WINDOWS_SYSTEM = "Windows"          # 結果の os.system（platform.system() の値）
+
+# 手元の確認（scripts/local_ci.py）の結果のファイルの形
+LOCAL_CI_SCRIPT = "scripts/local_ci.py"
+CI_SCHEMA = 1
+CI_KIND = "local-ci"
+CI_VERDICTS = ("pass", "fail", "error")
+CI_COUNTS = ("total", "passed", "failed", "errors", "skipped")
 
 # git の置き場所を外から差し替える環境変数。持ち込むと、対象でないリポジトリや索引を見てしまう。
 GIT_LOCATION_VARS = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
 )
+
+# 内容（ツリーID、確認のための取り出し）を扱う git では、利用者とシステムの設定のうち、内容の読み方を
+# 変えるものを、ここで決めた値にする。同じ内容なら、誰が、どの環境（設定）で求めても、同じツリーIDになる
+# （決まり9）。
+# 読むのは、リポジトリ自身の設定（.git/config。実行できる印やリンクを表せるか、など）と、
+# リポジトリの中の .gitattributes、.gitignore、.git/info/ の指定だけ。
+#   core.autocrlf: 改行の変換（Git for Windows は、システムの設定で true にする）
+#   core.safecrlf: 改行の変換の警告で、内容を読むのを止める
+#   attr.tree: 属性を、作業ツリーの .gitattributes ではなく、指定したツリーから読む（git 2.43 から。
+#     空の値は、どのツリーも指さないので、git は読み方を変えない。それより前の git は、この名前を読まない）
+#   ほかに、リポジトリの外の属性（core.attributesFile、システムの属性 GIT_ATTR_NOSYSTEM、GIT_ATTR_SOURCE）、
+#   利用者の無視の指定（core.excludesFile）、フック（core.hooksPath）は、pinned_git_options が空に向ける。
+# 署名、認証、safe.directory、長いパスの扱いなど、内容の読み方を変えない設定は、利用者のものを使う。
+PINNED_GIT_SETTINGS = (("core.autocrlf", "false"), ("core.safecrlf", "false"), ("attr.tree", ""))
+PINNED_GIT_DROP = ("GIT_ATTR_SOURCE",)
+
+# 確認（pytest）の、試験の選び方を変えうる環境変数の名前の始まり（check_env）
+PYTEST_VARS_PREFIX = "PYTEST_"
 
 GATE_TOOLS = {
     "implement": "Read,Edit,Write,Bash,Grep,Glob",
@@ -138,7 +173,9 @@ VERDICT_SCHEMA = {
 }
 
 NOT_ADOPTED = "実行中に同じゲートの別の記録が入ったので、この合格は採用しない。やり直す"
-HEADER_DRIFT = "仕様の見出し（owner、needs_ux、gates）が start の後で変わっている。start をやり直す"
+HEADER_DRIFT = (
+    "仕様の見出し（owner、needs_ux、needs_windows、gates）が start の後で変わっている。start をやり直す"
+)
 
 
 class CycleError(Exception):
@@ -171,6 +208,30 @@ DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 # 一時的に拒まれることがある。この秒数までは、待ってやり直す。
 BUSY_WAIT_SECONDS = 5.0 if WINDOWS else 0.0
 POLL_SECONDS = 0.05
+
+# Windows の、OSのエラー画面（人が OK を押すまで、起動した側を止める）を出さない設定（SetErrorMode の印）。
+# SEM_FAILCRITICALERRORS: 起動できない実行ファイル（壊れた claude.exe で出る「サポートされていない 16 ビット
+# アプリケーション」など）や、見つからない DLL の画面。SEM_NOGPFAULTERRORBOX: 異常終了の画面。
+# SEM_NOOPENFILEERRORBOX: ファイルを開けない画面。
+SEM_FAILCRITICALERRORS = 0x0001
+SEM_NOGPFAULTERRORBOX = 0x0002
+SEM_NOOPENFILEERRORBOX = 0x8000
+QUIET_ERROR_MODE = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+
+
+def quiet_error_dialogs() -> None:
+    """Windows で、OSのエラー画面を出させずに、エラーとして返させる（人が見ていない実行が止まらないように）。
+
+    このプロセスに設定する。起動する子プロセス（git、claude、確認の python と pytest）にも引き継がれる
+    （Popen に CREATE_DEFAULT_ERROR_MODE を付けると引き継がれないので、どこにも付けない）。もとの印は残す。
+    scripts/cycle.py、scripts/local_ci.py、scripts/doctor.py の main が、最初に呼ぶ。
+    """
+    if not WINDOWS:
+        return
+    import ctypes  # Windows でだけ読む（ctypes の無い Python の作りでも、ほかのOSで動くように）
+
+    kernel32 = ctypes.WinDLL("kernel32")        # 印は 16 ビットに収まるので、ctypes の既定の型（int）で渡せる
+    kernel32.SetErrorMode(kernel32.GetErrorMode() | QUIET_ERROR_MODE)
 
 
 def lock_handle(handle: IO[str]) -> None:
@@ -273,26 +334,47 @@ def shell_line(cwd: Path, cmd: list[str]) -> str:
     return f"cd {shlex.quote(str(cwd))} && {shlex.join(cmd)}"
 
 
+def group_options() -> dict:
+    """起動するプロセスを、その先のプロセスごと止められるようにする Popen の指定（kill_tree と組で使う）。
+
+    Linux / macOS では、新しいセッション（プロセスのまとまり）で起動する。端末の Ctrl-C はこのスクリプトだけに
+    届き、こちらがまとまりごと止める。Windows では指定しない（taskkill /T が、その先のプロセスをたどる）。
+    """
+    return {} if WINDOWS else {"start_new_session": True}
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
-    """起動したプロセスを止める。Windows では、起動用のファイル（claude.cmd）の先のプロセスも一緒に止める。"""
+    """起動したプロセスを、その先のプロセスごと止める（group_options で起動したもの）。
+
+    Windows では、起動用のファイル（claude.cmd）の先の本体や、確認の先の pytest まで、taskkill /T でたどる。
+    Linux / macOS では、プロセスのまとまりごと止める（起動したプロセスが先に終わっていても、残りを止める）。
+    """
     if WINDOWS:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        with contextlib.suppress(ProcessLookupError):       # まとまりが、もう無い（どれも終わっている）
+            os.killpg(proc.pid, signal.SIGKILL)
     proc.kill()
 
 
-def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess.CompletedProcess:
+def run_captured(
+    cmd: list[str], cwd: Path, timeout: float | None, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """コマンドを実行して、出力を UTF-8 の文字列で受け取る。
 
     呼び出し元の標準入力は渡さない（人が見ていない実行で、入力を待って止まり続けないように）。
-    時間切れなら、起動したプロセスを止めてから subprocess.TimeoutExpired を送出する。
+    時間切れなら、起動したプロセスを、その先のプロセスごと止めてから subprocess.TimeoutExpired を送出する。
 
     止めた後は、出力の終わりを待たない。起動したプロセスが残した子プロセスが出力の口を持ったままだと、
     その子が終わるまで戻れなくなる（打ち切りは、人が見ていない実行の最後の歯止め）。
     打ち切った実行の出力は使わないので、読み残してよい。
+
+    終了の合図（SIGTERM、SIGHUP。端末を閉じたときなど）も例外に変えて、同じく止める。起動したプロセスは
+    別のまとまりにいるので、合図は届かない。こちらだけが終わると、起動したプロセスが動き続ける。
     """
-    with subprocess.Popen(
+    with termination_as_exception(), subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
+        text=True, encoding="utf-8", errors="replace", env=env, **group_options(),
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -305,6 +387,16 @@ def run_captured(cmd: list[str], cwd: Path, timeout: float | None) -> subprocess
 def python_env() -> dict[str, str]:
     """Python のスクリプトを起動するときの環境変数。出力を UTF-8 で受け取れるようにする。"""
     return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def check_env(base: dict[str, str]) -> dict[str, str]:
+    """確認（scripts/check.py → pytest）を起動するときの環境変数。base から、pytest の環境変数を除いたもの。
+
+    PYTEST_ で始まる変数（PYTEST_ADDOPTS の -k、-m、--deselect、--ignore、--lf、PYTEST_PLUGINS の差し込み、
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD など）は、実行する試験を選び直せる。呼び出し元から引き継ぐと、
+    一部の試験だけを実行した結果が、合格として記録される（Windows の os.environ の名前は、もとから大文字）。
+    """
+    return {key: value for key, value in base.items() if not key.startswith(PYTEST_VARS_PREFIX)}
 
 
 def retry_while_busy(action: Callable[[], T]) -> T:
@@ -334,28 +426,56 @@ def repo_root() -> Path:
     return Path(env).resolve() if env else Path(__file__).resolve().parents[1]
 
 
+def git_env() -> dict[str, str]:
+    """git を起動するときの環境変数。置き場所を差し替える変数（GIT_DIR など）は、持ち込まない。"""
+    return {key: value for key, value in os.environ.items() if key not in GIT_LOCATION_VARS}
+
+
+def pinned_git_options(folder: Path) -> list[str]:
+    """内容を扱う git に渡す設定（-c の並び。PINNED_GIT_SETTINGS の説明）。
+
+    リポジトリの外の属性、利用者の無視の指定、フックは、folder の中の、作らない名前に向ける（git は、無い
+    ファイルを空のファイルとして、無いフォルダをフックの無いフォルダとして扱う）。folder は、確かめる内容の
+    外の一時フォルダ（ツリーIDを求める間、取り出す間だけある。ほかの誰も書かない）。
+    """
+    nothing = (folder / "pinned-nothing").as_posix()
+    settings = (
+        *PINNED_GIT_SETTINGS, ("core.attributesFile", nothing), ("core.excludesFile", nothing),
+        ("core.hooksPath", nothing),
+    )
+    return [option for key, value in settings for option in ("-c", f"{key}={value}")]
+
+
 def run_git(
-    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None,
+    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None, pinned: Path | None = None,
 ) -> subprocess.CompletedProcess:
-    env = {key: value for key, value in os.environ.items() if key not in GIT_LOCATION_VARS}
+    """git を実行する。pinned を渡すと、内容の読み方を変える設定を決めた値にする（pinned_git_options）。"""
+    env = git_env()
+    options = []
+    if pinned is not None:
+        options = pinned_git_options(pinned)
+        env = {key: value for key, value in env.items() if key not in PINNED_GIT_DROP}
+        env["GIT_ATTR_NOSYSTEM"] = "1"
     if index is not None:
         env["GIT_INDEX_FILE"] = str(index)
     return subprocess.run(
-        ["git", "-C", str(cwd), *args],
+        ["git", *options, "-C", str(cwd), *args],
         input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
     )
 
 
-def git(cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None) -> str:
-    proc = run_git(cwd, *args, index=index, stdin=stdin)
+def git(
+    cwd: Path, *args: str, index: Path | None = None, stdin: str | None = None, pinned: Path | None = None,
+) -> str:
+    proc = run_git(cwd, *args, index=index, stdin=stdin, pinned=pinned)
     if proc.returncode != 0:
         raise CycleError(f"git {' '.join(args)} が失敗: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout.strip()
 
 
-def git_paths(cwd: Path, *args: str, index: Path | None = None) -> list[str]:
+def git_paths(cwd: Path, *args: str, index: Path | None = None, pinned: Path | None = None) -> list[str]:
     """-z を付けた git の出力（NUL 区切りのファイル名）を一覧にする。"""
-    proc = run_git(cwd, *args, index=index)
+    proc = run_git(cwd, *args, index=index, pinned=pinned)
     if proc.returncode != 0:
         raise CycleError(f"git {' '.join(args)} が失敗: {proc.stderr.strip()}")
     return [path for path in proc.stdout.split("\0") if path]
@@ -385,9 +505,10 @@ def find_spec(root: Path, uid: str) -> Path:
 def read_header(spec: Path) -> dict:
     """仕様ファイル先頭の `---` で囲まれた部分を読む。
 
-    書けるのは id、owner、needs_ux、gates だけ。読めない行、知らない値、食い違いはエラーにする
-    （書き間違いが「ゲートは不要」と読まれないように）。
-    返すのは id、owner、needs_ux（真偽）、gates_required（見出しに gates があればその一覧、無ければ空）。
+    書けるのは id、owner、needs_ux、needs_windows、gates だけ。読めない行、知らない値、食い違いは
+    エラーにする（書き間違いが「ゲートは不要」と読まれないように）。
+    返すのは id、owner、needs_ux と needs_windows（真偽）、gates_required（見出しに gates があれば
+    その一覧、無ければ空）。
     """
     lines = spec.read_text(encoding="utf-8").splitlines()
     if not lines or lines[0].strip() != "---":
@@ -415,13 +536,14 @@ def read_header(spec: Path) -> dict:
         if not raw.get(key):
             raise CycleError(f"{spec.name}: 見出しに {key} が無い")
 
-    header = {"id": raw["id"], "owner": raw["owner"], "needs_ux": False, "gates_required": []}
-    if "needs_ux" in raw:
-        if raw["needs_ux"].lower() not in ("true", "false"):
+    header = {"id": raw["id"], "owner": raw["owner"], "gates_required": []}
+    for flag in HEADER_FLAGS:
+        value = raw.get(flag, "false").lower()
+        if value not in ("true", "false"):
             raise CycleError(
-                f"{spec.name}: needs_ux は true か false だけで書く（書かれている値: {raw['needs_ux']}）"
+                f"{spec.name}: {flag} は true か false だけで書く（書かれている値: {raw[flag]}）"
             )
-        header["needs_ux"] = raw["needs_ux"].lower() == "true"
+        header[flag] = value == "true"
     if "gates" in raw:
         gates = [g.strip() for g in raw["gates"].split(",")]
         unknown = [g for g in gates if g not in ALL_GATES]
@@ -437,11 +559,18 @@ def read_header(spec: Path) -> dict:
 
 
 def required_gates(source: dict) -> list[str]:
-    """必要なゲート。source は見出し（read_header の結果）か、状態（start が保存したもの）。"""
+    """必要なゲート。source は見出し（read_header の結果）か、状態（start が保存したもの）。
+
+    needs_windows: true なら、見出しに gates: があっても windows を必ず加える（gates: には windows を
+    書けないので、食い違いにはならない。gates: で必要なゲートを絞っても、Windows での確認は外れない）。
+    """
     wanted = list(source.get("gates_required") or DEFAULT_GATES)
     if source.get("needs_ux"):
         wanted.append("ux")
-    return [g for g in ALL_GATES if g in wanted]
+    gates = [g for g in ALL_GATES if g in wanted]
+    if source.get("needs_windows"):
+        gates.append(WINDOWS_GATE)
+    return gates
 
 
 def header_changed(header: dict, state: dict) -> bool:
@@ -507,40 +636,65 @@ def pending_file(root: Path) -> Path:
 
 @contextlib.contextmanager
 def termination_as_exception() -> Iterator[None]:
-    """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。"""
+    """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。
+
+    合図を受けたら、例外を送出する前に、終了の合図をすべて無視に切り替え、この枠を出るときに元に戻す。
+    端末を閉じると、前面のジョブに SIGHUP が続けて2回届く。2回目で後始末（起動した claude を止める、
+    取り込みを取り消す）が途中で切られると、claude が動き続け、こちらはその終わりを待ち続ける
+    （W2 の3回目のレビュー）。枠が入れ子なら、外側の枠を出るまで無視を続ける（外側の後始末も切らせない）。
+    """
+    signals = stop_signals()
+    stopping = False
+
     def stop(signum: int, frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
+    stop.raises_on_stop = True      # 入れ子の内側が、外側の枠の扱いだと見分ける印
     try:
-        saved = {sig: signal.signal(sig, stop) for sig in stop_signals()}
+        saved = {sig: signal.signal(sig, stop) for sig in signals}
     except ValueError:          # メインのスレッド以外からは設定できない
         saved = {}
     try:
         yield
     finally:
         for sig, handler in saved.items():
-            signal.signal(sig, handler)
+            outer_stop = getattr(handler, "raises_on_stop", False)
+            signal.signal(sig, signal.SIG_IGN if stopping and outer_stop else handler)
 
 
 def tree_id(worktree: Path) -> str:
     """作業ツリーのいまの内容（未コミットと新規ファイルを含む）を表すツリーID。
 
     一時的な索引で計算するので、作業ツリーの索引（選んでステージした状態、競合の解決の途中）は変えない。
-    空の索引から組み直すので、索引に付けた「変更を見ない」印にも左右されない。
+    索引は HEAD のコミットから組み直すので、索引に付けた「変更を見ない」印にも左右されない。
+
+    空の索引からではなく HEAD から始めるのは、同じ内容なら、どのOSでも同じIDにするため。
+    実行できる印とリンクを表せないファイルシステム（Windows の既定）では、git は、索引に無いファイルを
+    「実行できない普通のファイル」として足す。空の索引から始めると、実行できる印の付いたファイルを含む内容で、
+    コミットのツリーとも、Linux で求めたIDとも食い違う。索引にあるファイルは、その印を引き継ぐ。
+
+    利用者とシステムの git の設定のうち、内容の読み方を変えるもの（改行の変換、リポジトリの外の属性と
+    無視の指定、フック）は、決めた値にする（PINNED_GIT_SETTINGS）。同じ内容なら、どの環境で求めても同じIDになる。
     """
     with tempfile.TemporaryDirectory(prefix="cycle-index-") as tmp:
-        index = Path(tmp) / "index"
-        git(worktree, "add", "-A", index=index)
+        index, pinned = Path(tmp) / "index", Path(tmp)
+        # コミットがまだ無いリポジトリでは失敗する。その場合は、空の索引から始める
+        run_git(worktree, "read-tree", "HEAD", index=index, pinned=pinned)
+        git(worktree, "add", "-A", index=index, pinned=pinned)
         # 無視の対象でも、追跡しているファイル（git add -f で足したもの）は内容に含める
-        taken = set(git_paths(worktree, "ls-files", "-z", index=index))
+        taken = set(git_paths(worktree, "ls-files", "-z", index=index, pinned=pinned))
         forced = [
-            path for path in git_paths(worktree, "ls-files", "-z")
+            path for path in git_paths(worktree, "ls-files", "-z", pinned=pinned)
             if path not in taken and ((worktree / path).is_file() or (worktree / path).is_symlink())
         ]
         if forced:
             names = "\0".join(forced) + "\0"
-            git(worktree, "update-index", "--add", "-z", "--stdin", index=index, stdin=names)
-        return git(worktree, "write-tree", index=index)
+            git(worktree, "update-index", "--add", "-z", "--stdin", index=index, stdin=names, pinned=pinned)
+        return git(worktree, "write-tree", index=index, pinned=pinned)
 
 
 def is_tree_id(value: object) -> bool:
@@ -570,6 +724,66 @@ def worktree_branch(worktree: Path) -> str:
     return head.stdout.strip()
 
 
+def content_info(root: Path) -> dict:
+    """その場所のいまの内容が、どれかを表す情報: コミットID、ツリーID、ブランチ、未コミットの変更の有無。
+
+    ツリーIDは tree_id と同じ求め方（未コミットの変更と新しいファイルを含む）。
+    gitの作業ツリーの最上位でない、コミットがまだ無い、git を起動できない、のどれかなら、すべて None。
+    """
+    unknown = {"commit": None, "tree": None, "branch": None, "dirty": None}
+    try:
+        top = run_git(root, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root.resolve():
+            return unknown
+        commit = git(root, "rev-parse", "--verify", "HEAD^{commit}")     # コミットがまだ無ければ、失敗する
+        tree = tree_id(root)
+        dirty = tree != git(root, "rev-parse", f"{commit}^{{tree}}")
+    except (OSError, CycleError):
+        return unknown
+    branch = run_git(root, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+    return {"commit": commit, "tree": tree, "branch": branch or None, "dirty": dirty}
+
+
+def is_count(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def ci_result_problem(data: object) -> str:
+    """手元の確認（scripts/local_ci.py）の結果が、決まった形でなければ、その理由を返す。正しければ空文字。
+
+    合格（verdict: pass）と書かれた結果は、中身が合格と矛盾しないことも確かめる:
+    確認の終了コードが 0、試験の件数があり、通過が1件以上、失敗とエラーが 0、失敗した試験の名前が無い。
+    """
+    if not isinstance(data, dict):
+        return "JSON のオブジェクトでない"
+    if data.get("schema") != CI_SCHEMA or data.get("kind") != CI_KIND:
+        return f"{LOCAL_CI_SCRIPT} の結果ではない（schema、kind）"
+    if not is_tree_id(data.get("commit")) or not is_tree_id(data.get("tree")):
+        return "commit か tree が、git のIDの形でない"
+    system, python, check = data.get("os"), data.get("python"), data.get("check")
+    if not isinstance(system, dict) or not isinstance(system.get("system"), str):
+        return "os.system が無い"
+    if not isinstance(python, dict) or not isinstance(python.get("version"), str):
+        return "python.version が無い"
+    if data.get("verdict") not in CI_VERDICTS:
+        return "verdict が pass、fail、error のどれでもない"
+    if not isinstance(check, dict):
+        return "check が無い"
+    tests, failed = data.get("tests"), data.get("failed")
+    if tests is not None and not (isinstance(tests, dict) and all(is_count(tests.get(k)) for k in CI_COUNTS)):
+        return "tests の件数が、0 以上の整数でない"
+    if not isinstance(failed, list) or not all(isinstance(name, str) for name in failed):
+        return "failed が、名前の一覧でない"
+    if data["verdict"] == "pass":
+        if type(check.get("returncode")) is not int or check["returncode"] != 0:
+            return "verdict は pass だが、確認の終了コードが 0 でない"
+        if tests is None:
+            return "verdict は pass だが、試験の件数が無い"
+        if tests["passed"] < 1 or tests["failed"] or tests["errors"] or failed:
+            return "verdict は pass だが、通過した試験が無いか、失敗した試験がある"
+    return ""
+
+
 def record_count(state: dict, gate: str) -> int:
     """このゲートの記録と、記録の消去が、これまでに何回あったか。"""
     return sum(1 for h in state.get("history", []) if h.get("gate") == gate or h.get("event") == "reset")
@@ -577,15 +791,16 @@ def record_count(state: dict, gate: str) -> int:
 
 def add_record(
     root: Path, uid: str, gate: str, verdict: str, tree: str, by: str, source: str,
-    report: str = "", seen: int | None = None,
+    report: str = "", seen: int | None = None, extra: dict | None = None,
 ) -> bool:
     """ゲートの結果を記録する。ロックを取り、状態を読み直してから書く（並行する実行の記録を失わない）。
 
     seen は、実行を始めたときの record_count。実行中に同じゲートの別の記録が入っていたら、
     この結果が合格でも採用しない（先に始めた実行の合格で、後から入った結果を上書きしない）。
-    採用したら True を返す。採用しなかった結果も履歴には残す。
+    採用したら True を返す。採用しなかった結果も履歴には残す。extra は、記録に付け足す項目。
     """
     entry = {"verdict": verdict, "tree": tree, "by": by, "source": source, "report": report, "at": now()}
+    entry.update(extra or {})
     with locked(unit_lock(root, uid)):
         state = load_state(root, uid)
         adopted = verdict != "pass" or seen is None or record_count(state, gate) == seen
@@ -608,6 +823,7 @@ def run_check(cwd: Path) -> tuple[str, str, str]:
     返すのは（判定、確認した内容のツリーID、出力）。
 
     合格にするのは、終了コードが 0 で、実行の前後で内容が変わっていないときだけ。
+    呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（check_env。試験を選び直させない）。
     """
     before = tree_id(cwd)
     if not (cwd / CHECK_SCRIPT).is_file():
@@ -615,7 +831,7 @@ def run_check(cwd: Path) -> tuple[str, str, str]:
     try:
         proc = subprocess.run(
             [sys.executable, CHECK_SCRIPT], cwd=cwd, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", env=python_env(),
+            text=True, encoding="utf-8", errors="replace", env=check_env(python_env()),
         )
     except OSError as exc:
         return "error", before, f"{CHECK_SCRIPT} を起動できない: {exc}"
@@ -642,7 +858,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             raise CycleError(f"{args.id} は統合済み。start はやり直せない")
         if old.get("gates") and not args.reset and header_changed(header, old):
             raise CycleError(
-                f"{args.id}: ゲートの記録があるのに、見出し（owner、needs_ux、gates）が変わっている。"
+                f"{args.id}: ゲートの記録があるのに、見出し（owner、needs_ux、needs_windows、gates）が"
+                "変わっている。"
                 "やり直すなら start --reset で記録を消す（消したことは履歴に残る）"
             )
         if worktree.exists():
@@ -664,6 +881,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "spec": spec.relative_to(root).as_posix(),
             "owner": header["owner"],
             "needs_ux": header["needs_ux"],
+            "needs_windows": header["needs_windows"],
             "gates_required": header["gates_required"],
             "worktree": str(worktree),
             "branch": branch,
@@ -831,6 +1049,68 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if verdict == "pass" and adopted else 1
 
 
+def cmd_record_ci(args: argparse.Namespace) -> int:
+    """Windows での手元の確認（scripts/local_ci.py）の結果を、ゲート windows の記録として取り込む。
+
+    取り込むのは、形が正しく、Windows で、コミットを取り出して（mode: checkout、未コミットの変更なし、
+    内容の食い違いなし）実行された、作業ツリーのいまの内容に対する結果だけ。
+    それ以外は、記録を変えずにエラーで終わる。結果が不合格なら、不合格として記録する。
+    内容の突き合わせは、ほかの確認系のゲートと同じ決まり（結果の後で増えてよいのは、例外の場所への
+    新しいファイルだけ）。
+    """
+    root = repo_root()
+    state = load_state(root, args.id)
+    worktree = Path(state["worktree"])
+    source = Path(args.result)
+    try:
+        data = source.read_bytes()
+        result = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError) as exc:        # 読めない、UTF-8 でない、JSON でない
+        raise CycleError(f"結果のファイル {source} を読めない: {exc}") from exc
+    refused = f"結果のファイル {source.name} は取り込めない: "
+    problem = ci_result_problem(result)
+    if problem:
+        raise CycleError(refused + problem)
+    system = result["os"]["system"]
+    if system != WINDOWS_SYSTEM:
+        raise CycleError(refused + f"Windows での結果ではない（{system[:40]}）")
+    # 取り込むのは、コミットを取り出して、その内容のまま確かめた結果だけ。作業フォルダで確かめた結果
+    # （--current）は、無視の対象のファイル（コミットに無い）に助けられた合格でも、ツリーが同じになるので
+    # 取り込まない
+    if result.get("mode") != "checkout":
+        raise CycleError(
+            refused + "コミットを取り出して確かめた結果ではない（--current の結果は取り込まない）。"
+            "Windows のPCで python scripts\\local_ci.py --ref origin/<ブランチ> を実行した結果を渡す"
+        )
+    if result.get("dirty") is not False:
+        raise CycleError(refused + "未コミットの変更を含む内容に対する結果（dirty）")
+    if result.get("changed") != []:
+        raise CycleError(refused + "確かめた内容が、対象のコミットと食い違っていた結果（changed）")
+    tree = result["tree"]
+    current = tree_id(worktree)
+    try:
+        differing = changed_after_gate(worktree, tree, current)
+    except CycleError as exc:
+        raise CycleError(
+            refused + f"結果のツリー（{tree[:10]}）が、このリポジトリに無い"
+            "（別の内容に対する結果。確かめたコミットを取得してから、やり直す）"
+        ) from exc
+    if differing:
+        raise CycleError(
+            refused + f"結果のツリー（{tree[:10]}）が、作業ツリーのいまの内容（{current[:10]}）と"
+            f"一致しない（違うファイル: {', '.join(differing[:5])}）"
+        )
+    copy = runs_dir(root) / f"{args.id}-{WINDOWS_GATE}-{stamp()}.json"
+    copy.write_bytes(data)                      # 取り込んだ結果の写し（中身は変えない）
+    extra = {"os": system, "commit": result["commit"]}
+    add_record(
+        root, args.id, WINDOWS_GATE, result["verdict"], tree, LOCAL_CI_SCRIPT, "ci",
+        copy.relative_to(root).as_posix(), extra=extra,
+    )
+    print(f"{args.id} {WINDOWS_GATE}: {result['verdict']} を記録（対象 {tree[:10]}、{system}）")
+    return 0 if result["verdict"] == "pass" else 1
+
+
 def changed_after_gate(worktree: Path, gate_tree: str, current: str) -> list[str]:
     """ゲートの後で変わったファイルのうち、許されないもの。
 
@@ -888,15 +1168,53 @@ def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list
     return problems
 
 
-def unit_problems(root: Path, state: dict) -> tuple[list[str], str]:
-    """統合を妨げる理由（作業ツリーとゲート）と、作業ツリーのいまの内容のツリーID。"""
+def uncommitted_problem(worktree: Path, committed: str, current: str) -> str:
+    """作業ツリーの内容（current）が、HEAD のコミットのツリー（committed）と違うときの、理由の文。
+
+    違うファイルの名前を示す。利用者の git の設定（core.excludesFile など）だけで無視しているファイルは、
+    git status には出ないが、ツリーIDは利用者の無視の指定を読まないので、内容に数える（決まり9）。
+    それらは、リポジトリの無視の指定に足すよう案内する。
+    """
+    names = git_paths(worktree, "diff", "--no-renames", "--name-only", "-z", committed, current)
+    # 利用者の設定のままの git で、無視の対象と出るもの（追跡しているファイルは出ない）
+    proc = run_git(worktree, "check-ignore", "-z", "--stdin", stdin="".join(f"{name}\0" for name in names))
+    ignored = [name for name in proc.stdout.split("\0") if name in names]
+    others = [name for name in names if name not in ignored]
+
+    def listed(items: list[str]) -> str:
+        more = f" ほか {len(items) - 5} 件" if len(items) > 5 else ""
+        return f"（{', '.join(items[:5])}{more}）" if items else ""
+
+    parts = []
+    if others or not ignored:
+        parts.append(f"作業ツリーに未コミットの変更がある{listed(others)}。コミットしてから統合する")
+    if ignored:
+        parts.append(
+            f"作業ツリーに、利用者の git の設定（core.excludesFile など）だけで無視しているファイルがある"
+            f"{listed(ignored)}。ハーネスは利用者の無視の指定を読まないので、内容に数える。"
+            "リポジトリの .gitignore か .git/info/exclude に足す（または消す）"
+        )
+    return "。".join(parts)
+
+
+def unit_problems(root: Path, state: dict) -> tuple[list[str], str, str]:
+    """統合を妨げる理由（作業ツリーとゲート）、作業ツリーのいまの内容のツリーID、HEAD のコミット。
+
+    status と merge は、同じこの判定を使う（status が「できる」と言うのに、merge が拒む、をなくす）。
+    """
     worktree = Path(state["worktree"])
     try:
         worktree_branch(worktree)
         current = tree_id(worktree)
+        head = git(worktree, "rev-parse", "HEAD")
+        committed = git(worktree, "rev-parse", f"{head}^{{tree}}")
     except CycleError as exc:
-        return [str(exc)], ""
-    return gate_problems(root, state, worktree, current), current
+        return [str(exc)], "", ""
+    problems = gate_problems(root, state, worktree, current)
+    # 取り込むのは HEAD のコミット。そのツリーが、いまの内容（＝ゲートを判定した内容）と同じであること
+    if committed != current:
+        problems.append(uncommitted_problem(worktree, committed, current))
+    return problems, current, head
 
 
 def reset_count(state: dict) -> int:
@@ -919,7 +1237,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if reset_count(state):
             print(f"  ゲートの記録を消した回数: {reset_count(state)}")
         if not state.get("merged_at"):
-            problems, _ = unit_problems(root, state)
+            problems, _, _ = unit_problems(root, state)
             print("  統合: " + ("できる" if not problems else "まだできない"))
             for p in problems:
                 print(f"    - {p}")
@@ -986,15 +1304,9 @@ def merge_unit(root: Path, uid: str) -> int:
     if state.get("merged_at"):
         print(f"{uid}: 既に統合済み（{str(state.get('merged_commit', ''))[:10]}）")
         return 1
-    worktree = Path(state["worktree"])
-    # 取り込むのは、作業ツリーの HEAD のコミット。そのツリーが、いまの内容（＝ゲートを判定した内容）と
-    # 同じであることを確かめる。状態に控えたブランチ名は使わない。
-    problems, current = unit_problems(root, state)
-    head = ""
-    if current:
-        head = git(worktree, "rev-parse", "HEAD")
-        if git(worktree, "rev-parse", f"{head}^{{tree}}") != current:
-            problems.append("作業ツリーに未コミットの変更がある。コミットしてから統合する")
+    # 取り込むのは、作業ツリーの HEAD のコミット（unit_problems が、そのツリーと、いまの内容＝ゲートを判定した
+    # 内容が同じであることを確かめる）。状態に控えたブランチ名は使わない。
+    problems, current, head = unit_problems(root, state)
     if not on_main(root):
         problems.append("本体のチェックアウトが main ではない")
     elif git(root, "status", "--porcelain") or tree_id(root) != git(root, "rev-parse", "HEAD^{tree}"):
@@ -1050,6 +1362,7 @@ def merge_unit(root: Path, uid: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    quiet_error_dialogs()
     parser = argparse.ArgumentParser(prog="cycle.py", description="開発サイクルのゲートを運ぶ")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1084,6 +1397,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check", help="scripts/check.py を実行して記録する")
     p.add_argument("id")
     p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("record-ci", help="Windows での手元の確認（scripts/local_ci.py）の結果を取り込む")
+    p.add_argument("id")
+    p.add_argument("--result", required=True, help="結果のファイル（.cycle/ci/ の下の JSON）")
+    p.set_defaults(func=cmd_record_ci)
 
     p = sub.add_parser("status", help="ゲートの状況")
     p.add_argument("id", nargs="?")
