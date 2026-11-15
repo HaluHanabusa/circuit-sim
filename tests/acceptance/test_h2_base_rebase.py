@@ -174,7 +174,6 @@ def test_c1_branch_behind_by_several_commits_is_merged(unit):
 
 # ------------------------------------------------------------------ 検証担当が考えた別の手口
 
-@pytest.mark.xfail(strict=True, reason="H2 の不具合: 分かれ目を snapshot ではなく record の時点で求めている")
 def test_c1_rebase_between_snapshot_and_record_is_refused(unit):
     """確認を始める前に snapshot で控え、確認の途中で土台を付け替え、確認の後で record --tree で記録する。
 
@@ -189,7 +188,6 @@ def test_c1_rebase_between_snapshot_and_record_is_refused(unit):
     assert_refused_and_main_kept(unit)
 
 
-@pytest.mark.xfail(strict=True, reason="H2 の不具合: 分かれ目が2つあるとき、merge-base の1つだけを比べている")
 def test_c1_second_merge_base_added_by_merging_an_older_unit_without_its_content_is_refused(tmp_path):
     """main に入った別の作業単位 A の先端（main の先端ではない）を -s ours で取り込み、分かれ目を2つにする。
 

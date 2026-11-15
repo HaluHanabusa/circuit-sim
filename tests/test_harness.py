@@ -192,14 +192,25 @@ def cycle(root: Path, *args: str, env: dict[str, str] | None = None) -> subproce
     return subprocess.CompletedProcess(args, code, out.getvalue(), err.getvalue())
 
 
+# 試験が送る終了の合図。呼び出し元が無視に設定していても（nohup の下の SIGHUP、SIGINT を無視したシェルの
+# 下の SIGINT）、試験が起動するプロセスでは既定の扱いに戻す（無視のまま引き継ぐと、合図が届かない）
+STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP")
+
+
+def default_stop_signals() -> None:
+    """Linux / macOS で、起動する子プロセスの終了の合図を、既定の扱いに戻す（Popen の preexec_fn）。"""
+    for name in STOP_SIGNALS:
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
 def start_cycle(
     root: Path, *args: str, env: dict[str, str] | None = None, stdin: int | None = None,
 ) -> subprocess.Popen:
     """cycle.py をコマンドラインから起動し、終わるのを待たずに返す（並行する実行、ロック、中断の確認用）。"""
     if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    else:           # 呼び出し元が SIGINT を無視していても、既定の扱い（KeyboardInterrupt）に戻す
-        options = {"preexec_fn": lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)}
+    else:           # 呼び出し元が終了の合図を無視していても、既定の扱いに戻す
+        options = {"preexec_fn": default_stop_signals}
     return subprocess.Popen(
         [sys.executable, str(CYCLE), *args], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", env=cycle_env(root, env), **options,
@@ -424,6 +435,20 @@ def test_failed_verdict_blocks_merge(repo, gate):
     assert result.returncode == 1
     assert f"{gate}: fail" in result.stdout
     assert main_log(repo) == ["init"]
+
+
+def test_gate_that_did_not_pass_gives_only_that_reason(repo):
+    """合格でないゲートは、その理由（fail）だけを挙げ、古さの理由を重ねない（どれをやり直すかが読める）。"""
+    wt = implement(repo)
+    tree = snap(repo)
+    record(repo, "review", "rev-1", tree=tree)
+    record(repo, "verify", "ver-1", verdict="fail", tree=tree)
+    (wt / "product.py").write_text("x = 3\n", encoding="utf-8")       # 記録の後で、製品のコードが変わる
+    assert cycle(repo, "check", "U1").returncode == 0
+    commit(wt)
+    lines = [line for line in cycle(repo, "merge", "U1").stdout.splitlines() if line.startswith("  - ")]
+    assert [line for line in lines if line.startswith("  - verify:")] == ["  - verify: fail"]
+    assert "  - review: 確認の後で変わったファイルがある（product.py）。やり直す" in lines
 
 
 def test_needs_ux_adds_the_ux_gate(repo):
@@ -755,6 +780,7 @@ def test_record_requires_tree_for_confirmation_gates(repo):
 def test_record_resolves_tree_at_the_time_of_recording(repo):
     wt = implement(repo)
     commit(wt)
+    snap(repo)                              # 確認を始める前に控えた内容（HEAD と同じ）
     record(repo, "review", "rev-1", tree="HEAD")
     record(repo, "verify", "ver-1", tree="U1")
     reviewed = sh(wt, "git", "rev-parse", "HEAD^{tree}")
@@ -1095,19 +1121,38 @@ def test_headless_pass_with_minor_findings_is_a_pass(repo, tmp_path):
     assert state(repo)["gates"]["review"]["verdict"] == "pass"
 
 
-def test_confirmation_run_records_the_content_seen_before_the_run(repo, tmp_path):
-    wt = implement(repo)
-    # レビューの実行中に、製品のコードが変わる
-    script = "pathlib.Path('product.py').write_text('x = 7', encoding='utf-8')"
-    env = fake_claude(tmp_path, headless(), script=script)
-    assert cycle(repo, "run", "U1", "review", env=env).returncode == 0
-    record(repo, "verify", "ver-1", tree=snap(repo))
-    assert cycle(repo, "check", "U1").returncode == 0
-    commit(wt)
-    result = cycle(repo, "merge", "U1")
+# 実行の間に、製品のコードを書き換える（レビューに許している Bash での書き込みの模擬）
+CHANGES_PRODUCT = "pathlib.Path('product.py').write_text('x = 7', encoding='utf-8')"
+
+
+@pytest.mark.parametrize("gate, verdict, expected", [
+    ("review", "pass", "error"), ("verify", "pass", "error"), ("review", "fail", "fail"),
+])
+def test_confirmation_run_that_changes_the_content_is_not_a_pass(repo, tmp_path, gate, verdict, expected):
+    """確認系のゲートの実行の間に内容が変わったら（Bash での書き込みなど。起動の側の道具の指定では
+    止まらない）、合格にしない（error）。不合格の判定は、そのまま。記録の対象は、実行前の内容。"""
+    implement(repo)
+    before = snap(repo)
+    env = fake_claude(tmp_path, headless({**PASS, "verdict": verdict}), script=CHANGES_PRODUCT)
+    result = cycle(repo, "run", "U1", gate, env=env)
     assert result.returncode == 1
-    assert "review: 確認の後で変わったファイルがある（product.py）。やり直す" in result.stdout
-    assert "verify:" not in result.stdout
+    entry = state(repo)["gates"][gate]
+    assert (entry["verdict"], entry["tree"]) == (expected, before)
+    changed = f"{gate}: error（実行の間に、作業ツリーの内容が変わった（product.py）。"
+    assert (changed in result.stdout) is (expected == "error")
+
+
+def test_confirmation_run_may_only_add_new_files_in_the_exception_places(repo, tmp_path):
+    """検証の実行が、受け入れ試験を新しいファイルとして足すのは、合格のまま（記録は実行前の内容）。"""
+    implement(repo)
+    before = snap(repo)
+    script = (
+        "pathlib.Path('tests/acceptance').mkdir(parents=True); "
+        "pathlib.Path('tests/acceptance/test_u1.py').write_text('def test_ok(): pass', encoding='utf-8')"
+    )
+    env = fake_claude(tmp_path, headless(), script=script)
+    assert cycle(repo, "run", "U1", "verify", env=env).returncode == 0
+    assert state(repo)["gates"]["verify"]["tree"] == before != snap(repo)
 
 
 def test_headless_run_that_times_out_is_not_a_pass(repo, tmp_path):
@@ -1399,6 +1444,33 @@ def test_git_inside_the_main_checkout_is_not_started(repo, tmp_path):
     assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == expected
     assert not marker.exists()
     with mock.patch.dict(os.environ, {"PATH": str(planted), "CYCLE_ROOT": str(repo)}):
+        with pytest.raises(CYCLE_MODULE.CycleError, match="git が見つからない"):
+            CYCLE_MODULE.git_program()
+
+
+def test_git_is_taken_only_as_an_exe_on_windows(tmp_path):
+    """Windows で、PATH の先に git.cmd や git.bat があっても、PATHEXT によらず git.exe を採る
+    （cmd.exe を通ると、merge -m の改行や --by の % と & が崩れる）。claude は PATHEXT のとおり
+    （npm 版の claude.cmd を採る）。
+
+    Linux でも、Windows の探し方（区切りの ;、拡張子の付く名前）を模擬して確かめる。大文字と小文字を区別しない
+    ファイルの名前は、拡張子を小文字にして模擬する。
+    """
+    first, later = tmp_path / "first", tmp_path / "later"
+    for place, names in ((first, ("git.cmd", "git.bat", "claude.cmd")), (later, ("git.exe",))):
+        place.mkdir()
+        for name in names:
+            (place / name).write_text("", encoding="utf-8")
+            (place / name).chmod(0o755)
+    env = {"PATH": f"{first};{later}", "PATHEXT": ".cmd;.bat;.exe", "CYCLE_ROOT": str(tmp_path / "root")}
+    with (
+        mock.patch.object(os, "pathsep", ";"),
+        mock.patch.object(CYCLE_MODULE, "WINDOWS", True),
+        mock.patch.dict(os.environ, env),
+    ):
+        assert CYCLE_MODULE.git_program() == str(later / "git.exe")
+        assert CYCLE_MODULE.find_command("claude") == str(first / "claude.cmd")
+        os.environ["PATH"] = str(first)                     # git.cmd と git.bat しか無い
         with pytest.raises(CYCLE_MODULE.CycleError, match="git が見つからない"):
             CYCLE_MODULE.git_program()
 
@@ -1760,7 +1832,7 @@ def other_repo(tmp_path: Path) -> Path:
 
 
 def location_case(name: str, wt: Path, other: Path) -> dict[str, str]:
-    """呼び出し元に置かれていると、対象でないリポジトリ、索引、オブジェクトを見せる値。"""
+    """呼び出し元に置かれていると、対象でないリポジトリ、索引、オブジェクト、参照を見せる値。"""
     objects = other / ".git" / "objects"
     return {
         "GIT_DIR": {"GIT_DIR": str(other / ".git")},
@@ -1768,25 +1840,36 @@ def location_case(name: str, wt: Path, other: Path) -> dict[str, str]:
         "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(other / ".git" / "index")},
         "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(objects)},
         "GIT_ALTERNATE_OBJECT_DIRECTORIES": {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(objects)},
+        # GIT_DIR が無くても、git（2.43 で確かめた）は読む。参照（refs/heads/main）とオブジェクトを、
+        # 別のリポジトリから読ませる（作業ツリーの HEAD は、作業ツリーの側に残る）
+        "GIT_COMMON_DIR": {"GIT_COMMON_DIR": str(other / ".git")},
     }[name]
 
 
 @pytest.mark.parametrize("name", [
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
 ])
 def test_each_git_location_variable_of_the_caller_is_ignored(repo, tmp_path, name):
-    """変数ごとに、置かれていても、対象の作業ツリーの内容を見る（別のリポジトリの内容を受け入れない）。"""
+    """変数ごとに、置かれていても、対象の作業ツリーの内容を見る（別のリポジトリの内容を受け入れない）。
+    記録する分かれ目（main との merge-base）も、対象のリポジトリのもの。"""
     wt = implement(repo)
     (wt / "forced.log").write_text("f\n", encoding="utf-8")
     sh(wt, "git", "add", "-f", "forced.log")
     (wt / ".gitignore").write_text(".cycle/\n*.log\n", encoding="utf-8")
     expected = snap(repo)
     other = other_repo(tmp_path)
+    sh(other, "git", "commit", "-q", "-m", "other")         # 別のリポジトリにも main がある
     foreign = sh(other, "git", "write-tree")                 # 別のリポジトリにだけあるツリー
     env = location_case(name, wt, other)
     assert cycle(repo, "snapshot", "U1", env=env).stdout.strip() == expected
     args = ["record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", foreign]
     assert cycle(repo, *args, env=env).returncode == 2
+    args = ["record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", expected]
+    recorded = cycle(repo, *args, env=env)
+    assert recorded.returncode == 0, recorded.stderr
+    entry = state(repo)["gates"]["review"]
+    assert (entry["tree"], entry["base"]) == (expected, sh(wt, "git", "merge-base", "main", "HEAD"))
     assert name in CYCLE_MODULE.GIT_LOCATION_VARS
 
 
@@ -2108,6 +2191,112 @@ def test_base_of_each_gate_is_the_one_seen_when_it_was_recorded(repo, tmp_path):
     assert CYCLE_MODULE.main_base(tmp_path) is None        # git の作業ツリーでない場所では、求められない
 
 
+@pytest.mark.parametrize("rebase", [
+    ["reset", "--soft", "main"],
+    ["merge", "-q", "-s", "ours", "main", "-m", "main を取り込む（中身は採らない）"],
+])
+def test_confirmation_is_recorded_with_the_base_seen_at_the_snapshot(repo, rebase):
+    """確認系のゲートは、snapshot（確認の始め）の時点の分かれ目を記録する（record の時点のものではない）。
+    record の時点で違っていれば、そのことを知らせ、統合は、その記録を古いものとして拒む。
+
+    レビューの再現: snapshot の後、レビューの最中に土台を付け替えてから record --tree <控えたツリー>
+    とすると、record の時点の（新しい）分かれ目が控えられ、merge が通って main の other.py が消えていた。
+    """
+    wt = implement(repo)
+    commit(wt)
+    tree = snap(repo)                       # レビューの前に控える
+    seen = sh(wt, "git", "merge-base", "main", "HEAD")
+    assert state(repo)["snapshots"][tree]["base"] == seen
+    main_moves_on(repo)
+    sh(wt, "git", *rebase)
+    if rebase[0] == "reset":
+        sh(wt, "git", "commit", "-q", "-m", "付け替え")      # ツリーは同じ、土台は main の先頭
+    assert sh(wt, "git", "rev-parse", "HEAD^{tree}") == tree
+    for gate, by in (("review", "rev-1"), ("verify", "ver-1")):
+        result = cycle(repo, "record", "U1", gate, "--verdict", "pass", "--by", by, "--tree", tree)
+        assert result.returncode == 0, result.stderr
+        assert "注意: snapshot の後で、main との分かれ目（土台）が変わっている" in result.stderr
+        assert f"（控えた分かれ目 {seen[:10]}、いま " in result.stderr
+        assert state(repo)["gates"][gate]["base"] == seen
+    assert cycle(repo, "check", "U1").returncode == 0
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1 and (repo / "other.py").exists()
+    for gate in ("review", "verify"):
+        assert f"{gate}: 確認の後で、main との分かれ目（土台）が変わっている" in refused.stdout
+    assert "check: 確認の後で、main との分かれ目" not in refused.stdout        # check は付け替えた後に流した
+    # 付け替えた後の内容で、確認を始めからやり直せば（snapshot を控え直せば）、その分かれ目で記録する
+    assert snap(repo) == tree
+    result = cycle(repo, "record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", tree)
+    assert result.returncode == 0 and "注意" not in result.stderr
+    assert state(repo)["gates"]["review"]["base"] == sh(wt, "git", "merge-base", "main", "HEAD") != seen
+
+
+def test_second_base_made_by_taking_in_another_unit_without_its_content_is_stale(repo):
+    """分かれ目は、すべて（git merge-base --all）を比べる。
+
+    H2 の独立検証の手口: main に入った別の作業単位 A の先端（U1 の分かれ目より古い日時）を、U1 に -s ours で
+    取り込むと、分かれ目が2つになる。git merge-base は控えた方を返すので、1つだけ比べると統合が通り、
+    A の成果が main から消えていた。
+    """
+    sh(repo, "git", "branch", "A")                          # A は、main の最初のコミットから
+    main_moves_on(repo)                                     # M1
+    wt = implement(repo)                                    # U1 は M1 から
+    commit(wt)
+    a_tree = repo.parent / "wt" / "A"
+    sh(repo, "git", "worktree", "add", "-q", str(a_tree), "A")
+    (a_tree / "a_unit.py").write_text("a = 1\n", encoding="utf-8")
+    old = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00"}
+    subprocess.run(["git", "add", "-A"], cwd=a_tree, env=TEST_ENV, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "A1"], cwd=a_tree, env={**TEST_ENV, **old}, check=True)
+    a1 = sh(a_tree, "git", "rev-parse", "HEAD")
+    pass_all(repo)
+    seen = state(repo)["gates"]["review"]["base"]
+    sh(repo, "git", "merge", "-q", "--no-ff", "A", "-m", "A を統合")
+    sh(wt, "git", "merge", "-q", "-s", "ours", a1, "-m", "A1 を中身なしで取り込む")
+    bases = sh(wt, "git", "merge-base", "--all", "main", "HEAD").split()
+    assert len(bases) == 2 and sh(wt, "git", "merge-base", "main", "HEAD") == seen     # 1つだけなら同じ
+    assert CYCLE_MODULE.main_base(wt) == " ".join(sorted(bases))
+    refused = cycle(repo, "merge", "U1")
+    assert refused.returncode == 1
+    assert "review: 確認の後で、main との分かれ目（土台）が変わっている" in refused.stdout
+    assert (repo / "a_unit.py").exists()
+
+
+def test_main_moving_on_between_the_snapshot_and_the_record_is_merged_as_before(repo):
+    """遅れているだけのブランチ（main だけが先に進んだ）は、分かれ目が変わらないので、今までどおり通る。"""
+    wt = implement(repo)
+    commit(wt)
+    tree = snap(repo)
+    main_moves_on(repo)
+    record(repo, "review", "rev-1", tree=tree)
+    record(repo, "verify", "ver-1", tree=tree)
+    assert cycle(repo, "check", "U1").returncode == 0
+    merged = cycle(repo, "merge", "U1")
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+    assert (repo / "other.py").exists() and (repo / "product.py").read_text(encoding="utf-8") == "x = 2\n"
+
+
+def test_record_needs_a_snapshot_of_the_tree_it_names(repo):
+    """確認系のゲートの --tree は、snapshot で控えた内容に限る（控えた分かれ目が無いと、確認の始めの
+    土台が分からない）。start のやり直しでは控えを引き継ぎ、start --reset では消す（消す前に始めた確認は
+    やり直す）。"""
+    wt = implement(repo)
+    commit(wt)
+    named = sh(wt, "git", "rev-parse", "HEAD^{tree}")
+    result = cycle(repo, "record", "U1", "review", "--verdict", "pass", "--by", "rev-1", "--tree", "HEAD")
+    assert result.returncode == 2
+    assert f"--tree の内容（{named[:10]}）を snapshot で控えた記録が無い" in result.stderr
+    tree = snap(repo)
+    assert cycle(repo, "start", "U1").returncode == 0           # やり直し（記録と控えは引き継ぐ）
+    record(repo, "review", "rev-1", tree=tree)
+    assert cycle(repo, "start", "U1", "--reset").returncode == 0
+    result = cycle(repo, "record", "U1", "verify", "--verdict", "pass", "--by", "ver-1", "--tree", tree)
+    assert result.returncode == 2 and "snapshot で控えた記録が無い" in result.stderr
+    assert state(repo)["gates"] == {} and state(repo)["snapshots"] == {}
+    # implement は、控えを要らない（内容とも分かれ目とも比べない）
+    record(repo, "implement", "impl-1", tree=named)
+
+
 def test_merge_is_undone_when_check_cannot_be_started_on_main(repo):
     wt = implement(repo)
     pass_all(repo)
@@ -2118,6 +2307,31 @@ def test_merge_is_undone_when_check_cannot_be_started_on_main(repo):
     result = cycle(repo, "merge", "U1")
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+    assert "取り込みを取り消した" in result.stdout
+    assert_main_untouched(repo, before)
+
+
+# 取り込んだ内容の確認スクリプトは、本体の中で動く。.cycle/ の中を片付けて（控えを消して）、失敗する
+CLEANS_UP_AND_FAILS_ON_MAIN = """\
+import pathlib
+import sys
+
+pending = pathlib.Path(".cycle", "merge-pending.json")
+if pending.exists():            # 本体での確認（取り込みの控えがある）
+    pending.unlink()
+    sys.exit(1)
+"""
+
+
+def test_merge_is_undone_when_the_check_on_main_removes_the_pending_note_and_fails(repo):
+    """控えが、取り込んだ内容の確認で消されていても、取り込みを取り消して、理由を表示して終わる。"""
+    wt = implement(repo)
+    (wt / "scripts" / "check.py").write_text(CLEANS_UP_AND_FAILS_ON_MAIN, encoding="utf-8")
+    pass_all(repo)
+    commit(wt)
+    before = sh(repo, "git", "rev-parse", "HEAD")
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 1, result.stdout + result.stderr
     assert "取り込みを取り消した" in result.stdout
     assert_main_untouched(repo, before)
 
@@ -2628,6 +2842,19 @@ def test_result_for_another_content_is_not_recorded(waiting_for_windows):
     assert refused.returncode == 1 and "windows: まだ記録が無い" in refused.stdout
 
 
+def test_result_whose_commit_does_not_hold_the_checked_tree_is_not_recorded(waiting_for_windows):
+    """分かれ目は、結果のコミットから求める。そのコミットが、結果のツリーを持たなければ（別のコミットを書いた、
+    このリポジトリに無い）、取り込まない。"""
+    root, tree = waiting_for_windows
+    before = sh(root, "git", "rev-parse", "main")               # 作業単位の変更が入る前のコミット
+    for commit_id in (before, "1" * 40):
+        result = record_ci(root, ci_result(tree, commit=commit_id))
+        assert result.returncode == 2
+        assert f"結果のコミット（{commit_id[:10]}）が、このリポジトリに無いか、そのツリーが" in result.stderr
+    assert "windows" not in state(root)["gates"]
+    assert not list((root / ".cycle" / "runs").glob("U1-windows-*"))
+
+
 @pytest.mark.parametrize("verdict", ["fail", "error"])
 def test_windows_result_that_did_not_pass_is_recorded_and_blocks_merge(repo, verdict):
     wt, tree = windows_unit(repo)
@@ -2684,7 +2911,7 @@ def test_windows_result_goes_stale_when_the_branch_is_moved_onto_main(repo, when
 def test_verifier_may_add_acceptance_tests_after_the_windows_result(repo):
     """Windows での結果の後で増えてよいのは、ほかの確認系のゲートと同じ。例外の場所への新しいファイルだけ。"""
     wt, tree = windows_unit(repo)
-    result = ci_result(tree)                    # この内容を、Windows で確かめた
+    result = ci_result(tree, commit=sh(wt, "git", "rev-parse", "HEAD"))     # このコミットを確かめた
     (wt / "tests" / "acceptance").mkdir(parents=True)
     (wt / "tests" / "acceptance" / "test_u1.py").write_text("def test_ok():\n    pass\n", encoding="utf-8")
     assert cycle(repo, "check", "U1").returncode == 0

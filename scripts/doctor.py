@@ -69,11 +69,12 @@ NUMBER_FIELDS = ("total_cost_usd", "num_turns", "duration_ms")
 # 失敗の切り分けに使う、種類を表す語（値まで記録する）
 WORD_FIELDS = ("type", "subtype", "stop_reason", "terminal_reason")
 
-# 失敗の原因の種類。応答（result）とエラーの文面を、この順に照らして、最初に当たったものにする。
-# 文面そのものは記録しない（種類の名前だけ）。
+# 失敗の原因の種類。結果の種類（subtype。error_max_budget_usd など）、応答（result）、エラーの文面を、
+# この順に照らして、最初に当たったものにする。文面そのものは記録しない（種類の名前だけ）。
 FAILURE_KINDS = (
     ("usage_limit", (
-        r"usage limit|rate limit|limit reached|quota|too many requests|credit balance|out of credits"
+        r"usage limit|rate[ _]limit|limit reached|hit your limit|quota|too many requests|credit balance|"
+        r"out of credits"
     )),
     ("model_unavailable", (
         r"model[^\n]{0,120}(not found|not available|unavailable|not exist|not supported|access|"
@@ -311,7 +312,10 @@ def describe_output(returncode: int, stdout: str, stderr: str, options: list[str
     messages = stderr if data is not None else "\n".join(part for part in (stdout, stderr) if part)
     keys, other_keys = key_names(data, KNOWN_KEYS)
     answer = data.get("result") if data is not None and isinstance(data.get("result"), str) else ""
-    failure = None if verdict == "pass" else failure_kind(answer + "\n" + messages)
+    # 結果の種類（subtype）は、文面が無くても原因を表すことがある
+    # （上限額で止まった error_max_budget_usd など）
+    subtype = data.get("subtype") if data is not None and isinstance(data.get("subtype"), str) else ""
+    failure = None if verdict == "pass" else failure_kind("\n".join((subtype, answer, messages)))
     return {
         "returncode": returncode,
         "stdout": {"form": form, "characters": len(stdout)},

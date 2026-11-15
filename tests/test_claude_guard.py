@@ -193,10 +193,13 @@ def test_quiet():
 """
 
 
-def run_session(tmp_path: Path, *args: str, encoding: str = "utf-8") -> subprocess.CompletedProcess:
+def run_session(
+    tmp_path: Path, *args: str, encoding: str = "utf-8", extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """この仕組み（conftest.py の写し）を持つ、別の試験のセッションを実行する。PATH の先頭に身代わりがある。
 
     このリポジトリの試験は含まない（写した先の小さな試験だけ）ので、入れ子の目印を外して起動してよい。
+    extra は、呼び出し元の環境に足す変数。
     """
     inner = tmp_path / "inner"
     inner.mkdir(exist_ok=True)
@@ -207,7 +210,7 @@ def run_session(tmp_path: Path, *args: str, encoding: str = "utf-8") -> subproce
     dropped = (guard.RUNNING, guard.SENTINEL_VAR, guard.SAFE_PATH_VAR)
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_") and k not in dropped}
     env.update(PATH=f"{real}{os.pathsep}{os.environ['PATH']}", STAND_IN=str(real), PYTHONIOENCODING=encoding)
-    env.update(SEEN=str(tmp_path / "sentinel-place.txt"))
+    env.update(SEEN=str(tmp_path / "sentinel-place.txt"), **(extra or {}))
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_inner.py", *args],
         cwd=inner, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=120,
@@ -228,6 +231,14 @@ def test_session_fails_when_the_sentinel_is_started_even_if_every_test_passes(tm
     assert shown, proc.stderr
     assert "見張り役の claude が 1 回起動された" in proc.stderr
     assert "起動した試験: test_inner.py::test_calls_claude" in proc.stderr
+
+
+def test_callers_mark_that_silences_the_sentinel_is_dropped(tmp_path):
+    """見張り役に記録を残させない印（セッションの始めの確かめに使うもの）が呼び出し元の環境にあっても、
+    セッションの始めに消すので、見張り役は記録を残し、セッションは失敗する。"""
+    proc = run_session(tmp_path, extra={guard.SENTINEL_PROBE_VAR: "1"})
+    assert proc.returncode == guard.SENTINEL_EXIT_CODE, proc.stdout + proc.stderr
+    assert "見張り役の claude が 1 回起動された" in proc.stderr
 
 
 def test_session_passes_when_the_sentinel_is_not_started(tmp_path):
@@ -354,8 +365,30 @@ def test_session_does_not_start_when_the_sentinel_cannot_be_started(tmp_path):
     ):
         (tmp_path / "place").mkdir()
         guard.pytest_sessionstart(session)
-    assert stopped.value.returncode == guard.SENTINEL_EXIT_CODE
+    # 試験を始めなかった終了コードは、見張り役が起動されたとき（71）と分ける（壊す確認が「落ちた」と数えない）
+    assert stopped.value.returncode == guard.GUARD_EXIT_CODE != guard.SENTINEL_EXIT_CODE
     assert "見張り役の claude を、一時フォルダ" in str(stopped.value.msg)
+    assert dict(os.environ) == before and not (tmp_path / "place").exists()
+
+
+def test_session_does_not_start_when_the_guard_cannot_be_set_up(tmp_path):
+    """遮断を組めない（Windows で、git が claude と同じ場所にしか無い）なら、理由を表示して試験を始めない。
+    終了コードは、見張り役を起動できないときと同じ GUARD_EXIT_CODE。"""
+    session = mock.Mock(spec=["config"])
+    session.config = mock.Mock(spec=["option"])
+    session.config.option.collectonly = False
+    before = dict(os.environ)
+    failing = mock.Mock(side_effect=guard.GuardError("git が、claude と同じ場所にしか無い（模擬）"))
+    with (
+        mock.patch.dict(os.environ, {guard.RUNNING: ""}),
+        mock.patch.object(guard, "guard_path", failing),
+        mock.patch.object(guard.tempfile, "mkdtemp", return_value=str(tmp_path / "place")),
+        pytest.raises(pytest.exit.Exception) as stopped,
+    ):
+        (tmp_path / "place").mkdir()
+        guard.pytest_sessionstart(session)
+    assert stopped.value.returncode == guard.GUARD_EXIT_CODE
+    assert "claude と同じ場所にしか無い（模擬）" in str(stopped.value.msg)
     assert dict(os.environ) == before and not (tmp_path / "place").exists()
 
 

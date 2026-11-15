@@ -44,43 +44,163 @@ DOCTOR = load("doctor")
 
 # ------------------------------------------------------------ scripts/check.py
 
-def run_steps(steps: list[str]) -> int:
-    """終了コードの並びを、確認の手順（ruff、pytest の代わり）として実行する。"""
-    commands = [[sys.executable, "-c", code] for code in steps]
-    with mock.patch.object(CHECK, "STEPS", commands):
+def run_main(ruff: str, tests: str) -> int:
+    """確認の手順を、ruff の代わり（ruff）と pytest の代わり（tests）のコードで実行する。
+
+    pytest の代わりは、引数の1つ目に、試験のセッションの結果（Report が書くもの）を書くファイルを受け取る。
+    """
+    def command(report: Path) -> list[str]:
+        return [sys.executable, "-c", tests, str(report)]
+
+    with (
+        mock.patch.object(CHECK, "RUFF", [sys.executable, "-c", ruff]),
+        mock.patch.object(CHECK, "pytest_command", command),
+    ):
         return CHECK.main()
 
 
+# 合格と矛盾しない、試験のセッションの結果
+GOOD_REPORT = {
+    "collected": 3, "deselected": 0, "finished": 3, "passed": 2, "failed": 0, "skipped": 1, "errors": 0,
+}
+
+
+def pytest_stand_in(report: object = GOOD_REPORT, code: int = 0) -> str:
+    """結果（report。文字列ならそのまま、None なら書かない）を書いて、終了コード code で終わる、
+    pytest の代わり。"""
+    text = report if isinstance(report, str) else json.dumps(report)
+    body = "" if report is None else f"open(sys.argv[1], 'w', encoding='utf-8').write({text!r}); "
+    return f"import sys; {body}sys.exit({code})"
+
+
 def test_check_runs_ruff_and_pytest_with_the_running_python():
-    assert [step[:3] for step in CHECK.STEPS] == [
-        [sys.executable, "-m", "ruff"], [sys.executable, "-m", "pytest"],
-    ]
+    assert CHECK.RUFF[:3] == [sys.executable, "-m", "ruff"]
+    command = CHECK.pytest_command(Path("report.json"))
+    assert command[:2] == [sys.executable, "-c"] and "check.run_pytest(" in command[2]
+    assert command[3:] == [str(ROOT / "scripts" / "check.py"), "report.json", "-q", "-rs"]
 
 
 def test_check_passes_only_when_every_step_passes(tmp_path):
     mark = tmp_path / "second-step-ran"
-    second = f"import pathlib; pathlib.Path({str(mark)!r}).touch()"
-    assert run_steps(["import sys; sys.exit(0)", second]) == 0
+    tests = f"import pathlib; pathlib.Path({str(mark)!r}).touch(); " + pytest_stand_in()
+    assert run_main("import sys; sys.exit(0)", tests) == 0
     assert mark.exists()                    # 1つ目が通れば、2つ目も実行する
-    assert run_steps([second, "import sys; sys.exit(3)"]) == 3
+    assert run_main("import sys; sys.exit(0)", pytest_stand_in(code=3)) == 3
 
 
 def test_check_stops_at_the_first_failure(tmp_path):
     mark = tmp_path / "second-step-ran"
-    second = f"import pathlib; pathlib.Path({str(mark)!r}).touch()"
-    assert run_steps(["import sys; sys.exit(7)", second]) == 7
+    tests = f"import pathlib; pathlib.Path({str(mark)!r}).touch(); " + pytest_stand_in()
+    assert run_main("import sys; sys.exit(7)", tests) == 7
     assert not mark.exists()
 
 
 def test_check_runs_at_the_top_of_the_repository_wherever_it_is_started(tmp_path, monkeypatch):
-    out = tmp_path / "cwd.txt"
-    code = f"import os, pathlib; pathlib.Path({str(out)!r}).write_text(os.getcwd(), encoding='utf-8')"
+    places = tmp_path / "places.txt"
+    note = (
+        f"import os; open({str(places)!r}, 'a', encoding='utf-8').write(os.getcwd() + chr(10)); "
+    )
     monkeypatch.chdir(tmp_path)             # リポジトリの直下でない場所から起動する
-    assert run_steps([code]) == 0
-    assert Path(out.read_text(encoding="utf-8")).resolve() == ROOT
+    assert run_main(note, note + pytest_stand_in()) == 0
+    assert [Path(line).resolve() for line in places.read_text(encoding="utf-8").splitlines()] == [ROOT, ROOT]
 
 
-def run_copy_of_check(base: Path, files: dict[str, str]) -> tuple[int, str]:
+# pytest の終了コードが 0 でも、合格にしない結果: （書かれた結果、理由の文）
+NOT_A_PASS_REPORT = {
+    "結果が書かれていない（途中で終わった）": (None, "試験のセッションが終わりまで届かなかった"),
+    "JSON でない": ("{", "試験のセッションが終わりまで届かなかった"),
+    "集めた試験が 0": ({**GOOD_REPORT, "collected": 0, "finished": 0}, "集めた試験が無い"),
+    "集めた試験の数が無い": ({**GOOD_REPORT, "collected": None}, "集めた試験が無い"),
+    "集めた試験の数が真偽": ({**GOOD_REPORT, "collected": True, "finished": True}, "集めた試験が無い"),
+    "外された試験がある": ({**GOOD_REPORT, "deselected": 1}, "外された試験がある（1 件"),
+    "終わりまで流れない試験がある": (
+        {**GOOD_REPORT, "finished": 2}, "集めた試験 3 件のうち、終わりまで流れたのは 2 件",
+    ),
+    "失敗がある": ({**GOOD_REPORT, "failed": 1}, "失敗かエラーがある"),
+    "エラーがある": ({**GOOD_REPORT, "errors": 1}, "失敗かエラーがある"),
+    "通過が 0": ({**GOOD_REPORT, "passed": 0, "skipped": 3}, "通過した試験が無い"),
+}
+
+
+@pytest.mark.parametrize("case", NOT_A_PASS_REPORT)
+def test_pytest_ending_with_zero_is_not_a_pass_unless_its_report_agrees(case, capsys):
+    report, reason = NOT_A_PASS_REPORT[case]
+    assert run_main("import sys; sys.exit(0)", pytest_stand_in(report)) == 1
+    error = capsys.readouterr().err
+    assert "pytest は終了コード 0 で終わったが、" in error and reason in error and "合格にしない" in error
+
+
+def test_a_single_passing_test_is_a_pass():
+    one = {**GOOD_REPORT, "collected": 1, "finished": 1, "passed": 1, "skipped": 0}
+    assert run_main("import sys; sys.exit(0)", pytest_stand_in(one)) == 0
+
+
+# 本物の pytest で、試験のセッションの結果の数え方を確かめる試験
+COUNTED_TESTS = """\
+import pytest
+
+
+@pytest.fixture
+def broken_setup():
+    raise RuntimeError("setup")
+
+
+@pytest.fixture
+def broken_teardown():
+    yield
+    raise RuntimeError("teardown")
+
+
+def test_pass():
+    pass
+
+
+def test_fail():
+    assert False
+
+
+@pytest.mark.skip(reason="skip")
+def test_skip():
+    pass
+
+
+@pytest.mark.xfail(reason="xfail")
+def test_xfail():
+    assert False
+
+
+def test_setup_error(broken_setup):
+    pass
+
+
+def test_teardown_error(broken_teardown):
+    pass
+"""
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ([], {
+        "collected": 6, "deselected": 0, "finished": 6, "passed": 2, "failed": 1, "skipped": 2, "errors": 2,
+    }),
+    (["-k", "test_pass"], {
+        "collected": 1, "deselected": 5, "finished": 1, "passed": 1, "failed": 0, "skipped": 0, "errors": 0,
+    }),
+])
+def test_report_counts_what_real_pytest_collected_and_ran(tmp_path, extra, expected):
+    """結果は、本物の pytest が集めた数、外した数、終わりまで流れた数と、結果ごとの数（準備と後始末の失敗は
+    エラー、準備の段階で飛ばしたものと失敗を見込んだものはスキップ）。"""
+    (tmp_path / "test_counted.py").write_text(COUNTED_TESTS, encoding="utf-8")
+    report = tmp_path / "report.json"
+    command = [*CHECK.pytest_command(report)[:4], str(report), "-q", "-p", "no:cacheprovider", *extra]
+    env = {key: value for key, value in TEST_ENV.items() if not key.startswith("PYTEST_")}
+    proc = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", env=env)
+    assert proc.returncode == (0 if extra else 1), proc.stdout + proc.stderr
+    assert json.loads(report.read_text(encoding="utf-8")) == expected
+
+
+def run_copy_of_check(
+    base: Path, files: dict[str, str], extra: dict[str, str] | None = None,
+) -> tuple[int, str]:
     """check.py を別の場所に写して、コマンドラインから実行する（ruff と pytest は、そこの files を見る）。
 
     起動するのは、写した先でもこのリポジトリでもない、空の場所から。check.py が実行の場所を自分で決めずに
@@ -94,9 +214,11 @@ def run_copy_of_check(base: Path, files: dict[str, str]) -> tuple[int, str]:
     (base / "ruff.toml").write_text('[lint]\nselect = ["F"]\n', encoding="utf-8")
     for name, text in files.items():
         (base / name).write_text(text, encoding="utf-8")
+    env = {key: value for key, value in TEST_ENV.items() if not key.startswith("PYTEST_")}
     proc = subprocess.run(
         [sys.executable, str(base / "scripts" / "check.py")], capture_output=True,
-        text=True, encoding="utf-8", errors="replace", env=TEST_ENV, cwd=elsewhere, timeout=300,
+        text=True, encoding="utf-8", errors="replace", env={**env, **(extra or {})}, cwd=elsewhere,
+        timeout=300,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -108,6 +230,31 @@ def test_check_script_passes_clean_code_with_passing_tests(tmp_path):
     code, output = run_copy_of_check(tmp_path, {"test_sample.py": PASSING_TEST})
     assert code == 0, output
     assert "All checks passed" in output and "1 passed" in output
+    assert "test session starts" not in output              # pytest は短い表示（-q）で流す
+
+
+# 試験のファイルから、試験を流しきらずに、終了コード 0 で pytest を終わらせる
+EXITS_EARLY = {
+    "集める途中": "import os\nos._exit(0)\n",
+    "試験の中": "import os\n\n\ndef test_quit():\n    os._exit(0)\n",
+}
+
+
+@pytest.mark.parametrize("where", EXITS_EARLY)
+def test_check_script_does_not_pass_a_session_that_ended_early_with_zero(tmp_path, where):
+    """os._exit(0) で pytest を 0 で終えても、試験のセッションの結果が書かれないので、合格にしない。"""
+    files = {"test_sample.py": PASSING_TEST, "test_zz_quit.py": EXITS_EARLY[where]}
+    code, output = run_copy_of_check(tmp_path, files)
+    assert code == 1, output
+    assert "試験のセッションが終わりまで届かなかった" in output
+
+
+def test_check_script_does_not_pass_when_tests_are_left_out(tmp_path):
+    """一部の試験だけを選んだ実行（-k など）は、通っても合格にしない。"""
+    files = {"test_sample.py": PASSING_TEST + "\n\ndef test_other():\n    assert True\n"}
+    code, output = run_copy_of_check(tmp_path, files, {"PYTEST_ADDOPTS": "-k test_ok"})
+    assert code == 1, output
+    assert "1 passed, 1 deselected" in output and "外された試験がある（1 件" in output
 
 
 def test_check_script_fails_on_a_lint_error_without_running_the_tests(tmp_path):
@@ -420,6 +567,15 @@ def test_doctor_records_which_content_it_checked(tmp_path, capsys):
     assert result["content"] == {"commit": commit, "tree": changed, "branch": None, "dirty": True}
     shown = f"コミット {commit[:10]}、ツリー {changed[:10]}（ブランチから切り離されている、未コミットの"
     assert shown in capsys.readouterr().out
+
+
+def test_result_file_keeps_the_text_as_utf8(tmp_path):
+    """結果のファイルは、UTF-8 のまま書く（日本語のブランチ名を \\u の形にしない。人が開いて読める）。"""
+    repo = make_repo(tmp_path)
+    sh(repo, "git", "checkout", "-q", "-b", "作業-ブランチ")
+    code, result = in_process(repo, "--no-check", find=without("claude"))
+    assert code == 0 and result["content"]["branch"] == "作業-ブランチ"
+    assert "作業-ブランチ".encode() in (repo / ".cycle" / "doctor-result.json").read_bytes()
 
 
 def test_content_is_unknown_outside_a_repository_with_a_commit(root, tmp_path, capsys):
@@ -865,6 +1021,10 @@ def test_unknown_role_is_not_run(root, tmp_path):
 FAILURES = {
     "サインインしていない": ("Not logged in · Please run /login", "not_logged_in"),
     "利用枠の上限": ("Claude AI usage limit reached|1763200000", "usage_limit"),
+    "利用枠の上限（別の書き方）": ("You've hit your limit · resets 3pm", "usage_limit"),
+    "API の利用の速さの上限": (
+        'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"x"}}', "usage_limit",
+    ),
     "モデルを使えない": (
         "There's an issue with the selected model (x). It may not exist or you may not have access to it.",
         "model_unavailable",
@@ -887,6 +1047,15 @@ def test_kind_of_failure_is_recorded_without_the_text(root, tmp_path, case):
     assert head["fields"]["stop_reason"] == {"present": True, "kind": "string", "value": "end_turn"}
     assert DOCTOR.FAILURE_TEXT[expected] in screen
     assert SECRET not in json.dumps(result) and SECRET not in screen
+
+
+def test_failure_told_only_by_the_kind_of_result_is_classified(root, tmp_path):
+    """上限額で止まったことが、結果の種類（subtype）だけで示され、文面が無くても分類する。"""
+    output = good_output(is_error=True, subtype="error_max_budget_usd")
+    del output["structured_output"], output["result"]
+    code, result, screen = doctor(root, "--no-check", "--headless", env=fake_claude(tmp_path, output))
+    assert code == 1 and probe(result)["failure"] == "budget_exceeded"
+    assert DOCTOR.FAILURE_TEXT["budget_exceeded"] in screen
 
 
 def test_failure_on_the_error_output_is_classified_too(root, tmp_path):

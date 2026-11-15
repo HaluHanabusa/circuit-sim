@@ -59,8 +59,9 @@ TREE_REQUIRED_GATES = ("review", "verify", "ux")
 
 # レビューや検証の後で足してよい場所（検証担当の受け入れ試験と記録）と、そこに足してよいファイルの名前。
 # 許すのは、ゲートの時点で無かったファイルの追加だけ。それ以外の変更があれば、そのゲートは古いものとして扱う。
-# 名前を絞るのは、試験の集め方を変えるファイル（conftest.py、pytest.ini など）を後から足させないため
-# （conftest.py ひとつで、受け入れ試験を全部外せる）。
+# 名前を絞るのは、試験の集め方を変えるファイル（conftest.py、pytest.ini など）を後から足させないため。
+# 名前を絞っても、足した test_*.py の中から試験の全体を止められる（os._exit(0) で pytest を 0 で終える）。
+# それは scripts/check.py が、試験のセッションが終わりまで届き、集めた試験のすべてが流れたことで見る。
 AFTER_GATE_FILES = (("tests/acceptance/", "test_*.py"), ("docs/verification/", "*.md"))
 
 # 統合先のブランチ。ゲートの記録に、その時点の main との分かれ目（git merge-base）を控える
@@ -218,6 +219,10 @@ BATCH_UNSAFE = "%^&|<>!()\r\n"
 
 # Windows で、コマンドの名前に付けて探す拡張子（環境変数 PATHEXT が無いときの既定）
 DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+# Windows で、PATHEXT によらず、決まった拡張子だけで探すコマンド。git は .exe だけ（PATH の先に git.cmd や
+# git.bat があると、cmd.exe を通って、merge -m の改行や --by の % と & が崩れる。claude.cmd のような検査は、
+# git の引数には掛けていない）
+FIXED_PATHEXT = {"git": ".exe"}
 
 # Windows では、他のプロセスが開いているファイルの置き換えと、置き換えの最中のファイルの読み取りが、
 # 一時的に拒まれることがある。この秒数までは、待ってやり直す。
@@ -264,8 +269,8 @@ def lock_handle(handle: IO[str]) -> None:
 
 
 def unlock_handle(handle: IO[str]) -> None:
+    # Windows: 位置は、取ったとき（lock_handle）の先頭のまま（間で読み書きせず、locking は位置を動かさない）
     if WINDOWS:
-        handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
     else:
         fcntl.flock(handle, fcntl.LOCK_UN)
@@ -280,10 +285,11 @@ def command_file_names(name: str) -> list[str]:
     """その名前のコマンドとして起動できるファイルの名前。Windows では拡張子が付く（claude.cmd など）。
 
     拡張子の無い同名のファイル（npm が一緒に置く、シェル用のもの）は、Windows では起動できないので含めない。
+    FIXED_PATHEXT にある名前（git）は、そこに決めた拡張子だけ。
     """
     if not WINDOWS:
         return [name]
-    extensions = os.environ.get("PATHEXT") or DEFAULT_PATHEXT
+    extensions = FIXED_PATHEXT.get(name) or os.environ.get("PATHEXT") or DEFAULT_PATHEXT
     return [name + extension for extension in extensions.split(os.pathsep) if extension]
 
 
@@ -484,7 +490,10 @@ def pinned_git_options(folder: Path) -> list[str]:
 
 
 def git_program() -> str:
-    """起動する git の場所。claude と同じ探し方（find_command）で、実行した場所と本体の中のものは使わない。"""
+    """起動する git の場所。claude と同じ探し方（find_command）で、実行した場所と本体の中のものは使わない。
+
+    Windows では git.exe だけを採る（FIXED_PATHEXT）。
+    """
     found = find_command("git", (repo_root(),))
     if found is None:
         raise CycleError(
@@ -690,6 +699,12 @@ def pending_file(root: Path) -> Path:
     return root / ".cycle" / "merge-pending.json"
 
 
+def discard(path: Path) -> None:
+    """控えを消す。もう無くても、エラーにしない（取り込んだ内容の確認スクリプトは、本体の中で動くので、
+    .cycle/ の中を消すことがある。消えていても、後始末は済んでいる）。"""
+    path.unlink(missing_ok=True)
+
+
 @contextlib.contextmanager
 def termination_as_exception() -> Iterator[None]:
     """終了の合図（stop_signals）を例外に変えて、後始末（取り込みの取り消し）が走るようにする。
@@ -770,15 +785,21 @@ def resolve_tree(worktree: Path, value: str) -> str:
 
 
 def main_base(worktree: Path, commit: str = "HEAD") -> str | None:
-    """commit と main との分かれ目（git merge-base）。求められなければ None。
+    """commit と main との分かれ目（git merge-base --all。2つ以上あれば、並べ替えて空白でつないだもの）。
+    求められなければ None。
 
     ゲートの記録に控え、統合のときに比べる。ツリーIDが同じでも、分かれ目が変わっていれば
     （`git reset --soft main && git commit`、`git merge -s ours main` で土台を付け替えた）、
     取り込みは main に入った他の成果を消すので、ゲートは古いものとして扱う。
+    分かれ目は、すべてを比べる。main に入った別の作業単位の先端を `-s ours` で取り込むと、分かれ目が
+    2つになり、git merge-base（1つだけ返す）は、日時によって、控えたものと同じ方を返す。取り込みは
+    2つの分かれ目から作った仮の土台で行われ、その作業単位の成果が main から消える（H2 の独立検証の手口）。
     """
-    proc = run_git(worktree, "merge-base", MAIN_REF, commit)
-    base = proc.stdout.strip()
-    return base if proc.returncode == 0 and is_tree_id(base) else None
+    proc = run_git(worktree, "merge-base", "--all", MAIN_REF, commit)
+    bases = proc.stdout.split()
+    if proc.returncode != 0 or not bases or not all(is_tree_id(base) for base in bases):
+        return None
+    return " ".join(sorted(bases))
 
 
 def worktree_branch(worktree: Path) -> str:
@@ -945,6 +966,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             git(root, "worktree", "add", str(worktree), "-b", branch)      # 上の階層は git が作る
         gates = dict(old.get("gates", {}))
         history = list(old.get("history", []))
+        # 確認を始めた時点の控え（cmd_snapshot）。start のやり直しでは引き継ぐ。--reset では消す
+        # （消した記録の前に始めた確認は、やり直す）
+        snapshots = {} if args.reset else dict(old.get("snapshots", {}))
         if args.reset and gates:
             history.append({
                 "event": "reset", "at": now(), "cleared": sorted(gates),
@@ -968,6 +992,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "started_at": now(),
             "gates": gates,
             "history": history,
+            "snapshots": snapshots,
         }
         save_state(root, state)
     print(f"{args.id}: 作業ツリー {worktree}（ブランチ {branch}）、必要なゲート {required_gates(state)}")
@@ -1092,7 +1117,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         verdict, summary, data = headless_verdict(proc.returncode, proc.stdout, args.gate)
 
     # 実装は「作った結果」を、確認系は「見た対象」（実行前の内容）を記録する
-    tree = tree_id(worktree) if args.gate == "implement" else before
+    after = tree_id(worktree)
+    tree = after if args.gate == "implement" else before
+    # 確認系のゲートは、例外の場所への新しいファイルのほかは、内容を変えない。変えていたら、合格にしない
+    # （レビューにも、読むための Bash を許している。Bash での書き込みは、起動の側の道具の指定では止まらない）
+    changed = [] if args.gate == "implement" else changed_after_gate(worktree, before, after)
+    if changed and verdict == "pass":
+        verdict = "error"
+        summary = (
+            f"実行の間に、作業ツリーの内容が変わった（{', '.join(changed[:5])}）。"
+            "確認系のゲートは、例外の場所への新しいファイルのほかは変えない（Bash での書き込みを含む）"
+        )
     by = str(data["session_id"]) if data.get("session_id") else "headless-unknown"
     report = log.relative_to(root).as_posix()
     adopted = add_record(root, args.id, args.gate, verdict, tree, base, by, "headless", report, seen)
@@ -1105,9 +1140,36 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    state = load_state(repo_root(), args.id)
-    print(tree_id(Path(state["worktree"])))
+    """いまの内容のツリーIDを表示し、その時点の main との分かれ目を、状態に控える（snapshots）。
+
+    確認系のゲートの record は、控えた分かれ目を記録する（record の時点の分かれ目ではない。確認の最中に土台を
+    付け替えてから記録すると、新しい分かれ目が控えられて、統合が通ってしまうため）。record の時点で分かれ目が
+    違えば、その記録は、統合のときに古いものとして扱われる（record は、そのことを知らせる）。
+    同じツリーを控え直したら、後の分かれ目で上書きする。
+    """
+    root = repo_root()
+    worktree = Path(load_state(root, args.id)["worktree"])
+    tree, base = tree_id(worktree), main_base(worktree)
+    with locked(unit_lock(root, args.id)):
+        state = load_state(root, args.id)
+        state.setdefault("snapshots", {})[tree] = {"base": base, "at": now()}
+        save_state(root, state)
+    print(tree)
     return 0
+
+
+def snapshot_base(state: dict, tree: str) -> str | None:
+    """確認系のゲートの記録に控える分かれ目。snapshot が tree を控えたときのもの。
+
+    控えが無ければ、記録を拒む（CycleError。確認を始めた時点の土台が分からない）。
+    """
+    noted = state.get("snapshots", {}).get(tree)
+    if noted is None:
+        raise CycleError(
+            f"--tree の内容（{tree[:10]}）を snapshot で控えた記録が無い。"
+            "確認を始める前に snapshot を実行し、表示されたIDを渡す"
+        )
+    return noted.get("base")
 
 
 def cmd_record(args: argparse.Namespace) -> int:
@@ -1126,6 +1188,18 @@ def cmd_record(args: argparse.Namespace) -> int:
     else:
         tree = tree_id(worktree)
     base = main_base(worktree)
+    if args.gate in TREE_REQUIRED_GATES:        # 確認を始めた時点（snapshot）の分かれ目を記録する
+        seen = snapshot_base(state, tree)
+        if seen != base:
+            print(
+                "注意: snapshot の後で、main との分かれ目（土台）が変わっている"
+                f"（控えた分かれ目 {str(seen)[:10]}、いま {str(base)[:10]}）。"
+                "確認を始めた時点の分かれ目で記録するので、この記録は統合のときに古い。"
+                "土台を付け替えた内容を取り込むと、main に入った他の成果が消える。"
+                "snapshot から確認をやり直す",
+                file=sys.stderr,
+            )
+        base = seen
     add_record(root, args.id, args.gate, args.verdict, tree, base, by, "session", args.report or "")
     print(f"{args.id} {args.gate}: {args.verdict} を記録（対象 {tree[:10]}、担当 {by}）")
     return 0
@@ -1153,7 +1227,8 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
     """Windows での手元の確認（scripts/local_ci.py）の結果を、ゲート windows の記録として取り込む。
 
     取り込むのは、形が正しく、Windows で、コミットを取り出して（mode: checkout、未コミットの変更なし、
-    内容の食い違いなし）実行された、作業ツリーのいまの内容に対する結果だけ。
+    内容の食い違いなし）実行された、作業ツリーのいまの内容に対する結果で、結果のコミット（commit）が、
+    このリポジトリにあり、結果のツリー（tree）を持つものだけ。
     それ以外は、記録を変えずにエラーで終わる。結果が不合格なら、不合格として記録する。
     内容の突き合わせは、ほかの確認系のゲートと同じ決まり（結果の後で増えてよいのは、例外の場所への
     新しいファイルだけ）。
@@ -1200,11 +1275,20 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
             refused + f"結果のツリー（{tree[:10]}）が、作業ツリーのいまの内容（{current[:10]}）と"
             f"一致しない（違うファイル: {', '.join(differing[:5])}）"
         )
+    # 分かれ目は、結果のコミットから求める。そのコミットが、確かめた内容（tree）を持つことを確かめる
+    # （別のコミットを書いた結果から、付け替えた後の分かれ目を控えないように）
+    commit = result["commit"]
+    commit_tree = run_git(worktree, "rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}").stdout.strip()
+    if commit_tree != tree:
+        raise CycleError(
+            refused + f"結果のコミット（{commit[:10]}）が、このリポジトリに無いか、そのツリーが"
+            f"結果のツリー（{tree[:10]}）と違う（確かめたコミットを取得してから、やり直す）"
+        )
     copy = runs_dir(root) / f"{args.id}-{WINDOWS_GATE}-{stamp()}.json"
     copy.write_bytes(data)                      # 取り込んだ結果の写し（中身は変えない）
-    extra = {"os": system, "commit": result["commit"]}
+    extra = {"os": system, "commit": commit}
     # 分かれ目は、確かめたコミットのもの（取り込む時点の HEAD では、結果の後の付け替えを見逃す）
-    base = main_base(worktree, result["commit"])
+    base = main_base(worktree, commit)
     add_record(
         root, args.id, WINDOWS_GATE, result["verdict"], tree, base, LOCAL_CI_SCRIPT, "ci",
         copy.relative_to(root).as_posix(), extra=extra,
@@ -1402,7 +1486,7 @@ def recover_merge(root: Path) -> str:
             print(f"前回の {uid} の統合が途中で終わっていたので、本体を取り込み前（{before[:10]}）に戻した")
         elif now_head != before or merge_head:
             return f"前回の {uid} の統合が途中で終わっているが、本体がその後で変わっている。{manual}"
-    path.unlink(missing_ok=True)
+    discard(path)
     return ""
 
 
@@ -1458,7 +1542,7 @@ def merge_unit(root: Path, uid: str) -> int:
     except BaseException as exc:
         # 競合、中断（Ctrl-C、終了の合図）、記録を書けないなど。どの場合も本体を元に戻す。
         restore(root, before)
-        pending.unlink(missing_ok=True)
+        discard(pending)
         if not isinstance(exc, CycleError):
             raise
         print(f"{uid}: 取り込めなかったので、本体を取り込み前（{before[:10]}）に戻した")
@@ -1466,7 +1550,7 @@ def merge_unit(root: Path, uid: str) -> int:
         return 1
     if verdict != "pass":
         restore(root, before)
-        pending.unlink(missing_ok=True)
+        discard(pending)
         print(f"{uid}: main に取り込んだ状態で check が通らなかった（{verdict}）ので、取り込みを取り消した")
         print(output.strip()[-600:])
         return 1
@@ -1475,7 +1559,7 @@ def merge_unit(root: Path, uid: str) -> int:
     state["merged_head"] = head
     save_state(root, state)
     # 控えは「統合済み」を記録してから消す（逆の順だと、間で強制終了されたとき、済んだ統合を取り消してしまう）
-    pending.unlink(missing_ok=True)
+    discard(pending)
     print(f"{uid}: main に取り込んだ（{state['merged_commit'][:10]}）。push はまだ")
     return 0
 

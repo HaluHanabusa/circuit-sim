@@ -1,8 +1,12 @@
 # 1か所ずつ壊す確認（scripts/mutants.py）の一覧。
 #
 # [[mutant]]: 機械的には作れない壊し方を、手で書く。original は、file の中にちょうど1つある文字列。
-# [[equivalent]]: 壊しても動作が変わらない（同値の）ため、試験で落とせない壊し方。番号は
-#   `python scripts/mutants.py list` が表示するもの。理由を必ず書く。
+# [[equivalent]]: 壊しても動作が変わらない（同値の）ため、どのOSの試験でも落とせない壊し方。番号は
+#   `python scripts/mutants.py list` が表示するもの。理由を必ず書く。理由は、事実（git や Python の決まり、
+#   コードの流れ）で書き、確かめた方法も書く。
+# [[platform_only]]: そのOS（platform。windows か posix）でだけ通る分岐で、ほかのOSでは落とせない壊し方。
+#   同値ではない。そのOSでは流し、ほかのOSでは流さずに、結果に別に数える。確かめ方（そのOSの実物の試験、
+#   コードを読んだ判断）を書く（D-052）。
 
 [[mutant]]
 id = "hand:lock-shared"
@@ -10,44 +14,19 @@ file = "scripts/cycle.py"
 original = "fcntl.flock(handle, fcntl.LOCK_EX)"
 replacement = "fcntl.flock(handle, fcntl.LOCK_SH)"
 
-# ---- 同値（壊しても動作が変わらない）。H2 の見本（160 通り）の生き残りから
-
-[[equivalent]]
-id = "cycle:<module>:elem:35"
-reason = "GIT_COMMON_DIR を引き継いでも、git -C で作業ツリーを指すと、git は .git ファイルが指す場所を使う（GIT_DIR が無いときは読まない。git 2.x で、別のリポジトリを指させて確かめた）。GIT_DIR は外すので、効く場面が無い。害の無い用心として一覧に残す"
-
-[[equivalent]]
-id = "cycle:<module>:elem:39"
-reason = "GIT_NAMESPACE は、取得と送信（upload-pack、receive-pack）で参照の名前を分けるだけ。ハーネスが使う git のコマンド（rev-parse、merge-base、ls-files、diff、merge など）には効かない。害の無い用心として一覧に残す"
-
-[[equivalent]]
-id = "cycle:lock_handle:del:3"
-reason = "Windows の分岐（Linux では通らない）。待ちの間の sleep を消すと、取れるまで回り続ける（CPU を使う）だけで、記録と統合の決まりは変わらない"
-
-[[equivalent]]
-id = "cycle:unlock_handle:del:2"
-reason = "Windows の分岐（Linux では通らない）。ロックのファイルは、直後に閉じられ、閉じるとロックも外れる。壊す確認は Windows の実物で流す（W1 で、ロックの分岐を Windows で壊して落ちることを確かめた）"
-
-[[equivalent]]
-id = "cycle:kill_tree:del:1"
-reason = "Windows の分岐（Linux では通らない）。taskkill /T を消すと、claude.cmd の先の本体が残る。W1 で、Windows の実物（GitHub上の自動テスト）で壊して落ちることを確かめた（test_harness.py の打ち切りの試験）。Linux では落とせない"
+# ---- 同値（壊しても動作が変わらない）
 
 [[equivalent]]
 id = "cycle:run_captured:const:1"
-reason = "Popen に encoding を渡すと、text の指定によらず文字列で受け取る（text=False でも同じ）"
+reason = "Popen に encoding を渡すと、text の指定によらず文字列で受け取る。Python の subprocess は、text_mode を encoding or errors or text or universal_newlines で決める（3.11〜3.13 の Lib/subprocess.py で確かめた）。text=False にしても、encoding='utf-8' があるので、出力は同じ文字列になる"
 
-[[equivalent]]
-id = "cycle:recover_merge:const:1"
-reason = "控えのファイルは、直前で読めている（無ければ、この行に来ない）。missing_ok を外しても、消す動作は変わらない"
-
-[[equivalent]]
-id = "cycle:merge_unit:const:2"
-reason = "取り込んだ後の確認が通らなかった場合の、控えの片付け。控えは直前に書いてあり、ほかの誰も消さない（統合のロックを持っている）。missing_ok を外しても、消す動作は変わらない"
-
-[[equivalent]]
-id = "cycle:gate_problems:del:6"
-reason = "不合格のゲートの理由を挙げた後の continue。消すと、続けて古さも調べるが、そのゲートは既に統合を止める理由に挙がっていて、統合の可否は変わらない（理由の行が増えることがあるだけ）"
-
-[[equivalent]]
-id = "doctor:main:const:4"
-reason = "結果のファイルを ensure_ascii=True で書いても、読んだ中身は同じ（JSON として同じ値）。記録に入る値は、形、真偽、版、git のIDで、ほとんど英数字"
+# ---- 別枠（いまは無い）
+# Windows でだけ通る分岐のうち、OSの仕組みを模擬できるもの（msvcrt.locking、taskkill の呼び出し）は、
+# tests/test_harness_os.py が、どのOSでも模擬して流すので、Linux でも落ちる（H2 の見直しで、別枠の3件
+# cycle:lock_handle:del:3、cycle:unlock_handle:del:2、cycle:kill_tree:del:1 と、cycle:kill_tree:del:3 を落とした）。
+# 模擬できない分岐の生き残りは、次の形で書く:
+#
+# [[platform_only]]
+# id = "<番号>"
+# platform = "windows"
+# reason = "<なぜ Linux では落とせないか。Windows の実物の試験か、コードを読んだ判断で、どう確かめたか>"

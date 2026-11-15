@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """1か所ずつ壊す確認（変異）を、繰り返せる形で流す。
 
-道具のスクリプト（scripts/cycle.py、scripts/doctor.py、scripts/local_ci.py）を1か所ずつ壊し、道具の試験を
-流して、試験が落ちる（壊れたことに気づく）かを確かめる。落ちなかった壊し方（生き残り）は、試験の穴か、
-壊しても動作が変わらない書き換え（同値）のどちらか。同値のものは、理由を付けて scripts/mutants.toml に書く。
+道具のスクリプト（scripts/cycle.py、scripts/doctor.py、scripts/local_ci.py、scripts/check.py）を1か所ずつ壊し、
+道具の試験を流して、試験が落ちる（壊れたことに気づく）かを確かめる。落ちなかった壊し方（生き残り）は、
+試験の穴か、壊しても動作が変わらない書き換え（同値）のどちらか。同値のものは、理由を付けて
+scripts/mutants.toml に書く。このOSでは通らない分岐（Windows だけの分岐など）は、別枠に書く。
 
   python scripts/mutants.py list [--file F]           壊し方の一覧（番号、場所、壊し方）
   python scripts/mutants.py run [--file F] [--only ID ...] [--jobs N] [--sample N]
@@ -12,24 +13,27 @@
 壊し方は2通り:
   - 機械的に作るもの: 比べ方の反転（== と !=、< と >=、in と not in など）、and と or の入れ替え、not を外す、
     条件の反転、真偽の定数の反転、比べる数を1つずらす、文を消す（呼び出し、raise、continue、break）、
-    決まりの一覧（大文字の名前の、文字列の並び）から1つ外す。表示だけのもの（print の呼び出しの中、
-    f 文字列、説明の文字列）は作らない。
+    決まりの一覧（大文字の名前の、文字列の並び）から1つ外す（要素2つのタプルは (x,) の形のまま）。
+    表示だけのもの（print の呼び出しの中、f 文字列、説明の文字列）は作らない。
   - scripts/mutants.toml に手で書くもの（[[mutant]]。元の文字列と、置き換える文字列）。
 
-流し方（速さのため）:
-  1. 壊す前の試験を1回流し、試験ごとに、スクリプトのどの行を通ったかを記録する（標準の sys.monitoring。
-     試験が起動した Python の子プロセスも、PYTHONPATH に置いた sitecustomize で記録する）。結果は
-     .cycle/mutants/ に控え、スクリプトと試験の内容が同じなら使い回す。
-  2. 壊した行を通る試験だけを、短い順に流す（-x。最初に落ちたところで止める）。関数の外の代入（決まりの
+流し方:
+  1. 始めに、リポジトリの写し（開始時の内容）を作る。壊し方は、この写しから作り、この写しに当てる
+     （流している間に作業中のフォルダが変わっても、壊す場所はずれない）。
+  2. 壊す前の試験を、毎回流す。通らなければ（集めた試験のすべてが流れて合格、でなければ）、何も壊さずに
+     「結果を得られなかった」で終わる。試験ごとに、スクリプトのどの行を通ったかも記録する（標準の
+     sys.monitoring。試験が起動した Python の子プロセスも、PYTHONPATH に置いた sitecustomize で記録する）。
+  3. 壊した行を通る試験だけを、短い順に流す（-x。最初に落ちたところで止める）。関数の外の代入（決まりの
      一覧など）を壊したものは、その名前を使う関数を通る試験を流す。
-  3. --confirm を付けると、そこで生き残ったものを、道具の試験の全体でもう一度流す。付けなくても、生き残りを
+  4. --confirm を付けると、そこで生き残ったものを、道具の試験の全体でもう一度流す。付けなくても、生き残りを
      見逃す側には倒れない（選び方の漏れは、生き残りを多めに数えるだけ）。
 各回の後で、その回が起動して残ったプロセス（親を失った偽の claude など）を止める（環境変数の印で探す。
 Linux の /proc を読む。ほかのOSでは、探せないことを表示する）。
 
-試験は、リポジトリの写し（追跡しているファイルと、無視されていない新しいファイル）の中で流す。
-作業中のフォルダには触らない。本物の claude は起動しない（試験の遮断 tests/conftest.py が写しでも効く）。
-終了コード: 0 = 一覧に無い生き残りが無い、1 = ある、2 = 流せなかった（壊す前の試験が落ちる、など）。
+試験は写しの中で流す。作業中のフォルダには触らない。本物の claude は起動しない（試験の遮断
+tests/conftest.py が写しでも効く）。git と taskkill は、scripts/cycle.py と同じ探し方の絶対パスで起動する。
+終了コード: 0 = 一覧に無い生き残り、結果を得られなかったもの、作れなかったものが、どれも無い。1 = ある。
+2 = 流せなかった（壊す前の試験が通らない、など）。
 標準ライブラリだけで動く。
 """
 from __future__ import annotations
@@ -39,6 +43,7 @@ import ast
 import contextlib
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -54,7 +59,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIST_FILE = "scripts/mutants.toml"
-TARGETS = ("scripts/cycle.py", "scripts/doctor.py", "scripts/local_ci.py")
+TARGETS = ("scripts/cycle.py", "scripts/doctor.py", "scripts/local_ci.py", "scripts/check.py")
 # 道具の試験。壊し方ごとに、ここから選んで流す
 TOOL_TESTS = (
     "tests/test_harness.py", "tests/test_harness_os.py", "tests/test_dev_tools.py", "tests/test_local_ci.py",
@@ -68,15 +73,19 @@ MARK_VAR = "CIRCUIT_SIM_MUTANT_RUN"     # この回が起動したプロセス�
 # 試験の入れ子を止める印（tests/conftest.py）。この道具は試験の外から写しを流すので、引き継がない
 NESTED_VAR = "CIRCUIT_SIM_PYTEST_RUNNING"
 # pytest の終了コード: 1 = 失敗した試験がある、2 = 集める途中で止まった（壊した道具を読み込めない、など）、
-# 71 = 見張り役の claude が起動された（tests/conftest.py）。どれも、壊れたことに試験が気づいた
+# 71 = 見張り役の claude が起動された（tests/conftest.py の SENTINEL_EXIT_CODE）。どれも、壊れたことに試験が
+# 気づいた。それ以外（5 = 試験が無い、70 = 入れ子、72 = 遮断を組めない・見張り役を起動できない、など）は、
+# 試験を流せていないので「結果を得られなかった」
 KILLED_CODES = {1: "failed", 2: "collection", 71: "sentinel"}
 COVER_VAR = "CIRCUIT_SIM_MUTANT_COVER"  # 通った行を書く場所（壊す前の試験のときだけ）
+SESSION_VAR = "CIRCUIT_SIM_MUTANT_SESSION"  # 試験のセッションの件数を書くファイル（壊す前の試験のときだけ）
 SELECT_VAR = "CIRCUIT_SIM_MUTANT_SELECT"  # 流す試験の一覧のファイル
 KILLER_VAR = "CIRCUIT_SIM_MUTANT_KILLER"  # 最初に落ちた試験の名前を書くファイル
 KILLERS_FILE = "killers.json"             # 壊し方ごとに、前回それを落とした試験（次の回は、それを先に流す）
-# 通った行の記録の仕方の版（記録の仕方を変えたら上げる。壊す前の試験の記録を使い回す鍵に入る）
-COVER_VERSION = 1
 RUN_TIMEOUT = 900                        # 1回の試験の上限（秒）。超えたら「止まった」として落ちた扱い
+# 別枠（[[platform_only]]）に書ける OS の名前と、このOSの名前
+PLATFORMS = ("windows", "posix")
+THIS_PLATFORM = "windows" if os.name == "nt" else "posix"
 
 NEGATED_COMPARE = {
     ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE, ast.GtE: ast.Lt, ast.Gt: ast.LtE, ast.LtE: ast.Gt,
@@ -86,6 +95,17 @@ COMPARE_TEXT = {
     ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.GtE: ">=", ast.Gt: ">", ast.LtE: "<=",
     ast.In: "in", ast.NotIn: "not in", ast.Is: "is", ast.IsNot: "is not",
 }
+
+
+def load_harness():
+    """ハーネス（このファイルと同じ場所の scripts/cycle.py）。git と taskkill の探し方を、そろえて使う。"""
+    spec = importlib.util.spec_from_file_location("mutants_harness", Path(__file__).with_name("cycle.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HARNESS = load_harness()
 
 
 @dataclasses.dataclass
@@ -103,7 +123,16 @@ class Mutant:
     names: tuple[str, ...] = ()     # 関数の外の代入なら、その名前（その名前を使う関数を通る試験を選ぶ）
 
 
+class CannotRun(Exception):
+    """流せない（壊す前の試験が通らない、git を起動できない、など）。"""
+
+
 # ------------------------------------------------------------------ 壊し方を作る
+
+def source_text(root: Path, path: str) -> str:
+    """ファイルの中身。改行は変換しない（位置を、書き戻すときと同じ中身で数える）。"""
+    return (root / path).read_bytes().decode("utf-8")
+
 
 def line_offsets(text: str) -> list[int]:
     offsets, total = [0], 0
@@ -268,7 +297,11 @@ class Generator(ast.NodeVisitor):
         self.assigning = ()
 
     def assign_items(self, node: ast.Assign, names: list[str]) -> None:
-        """関数の外の、大文字の名前の、文字列の並び（決まりの一覧）から、1つずつ外す。"""
+        """関数の外の、大文字の名前の、文字列の並び（決まりの一覧）から、1つずつ外す。
+
+        要素2つのタプルから1つ外すときは、残る1つを (x,) の形にする（("a") は文字列になり、
+        別の壊し方になる）。
+        """
         value = node.value
         if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Set | ast.Tuple):
             value = value.args[0]                               # frozenset({...})
@@ -277,6 +310,9 @@ class Generator(ast.NodeVisitor):
             items = value.elts
             strings = [item for item in items if isinstance(item, ast.Constant) and type(item.value) is str]
             if len(items) >= 2 and len(strings) == len(items):
+                pair = isinstance(value, ast.Tuple) and len(items) == 2
+                last_end = self.span(items[-1])[1]
+                comma = "" if self.text[last_end:].lstrip().startswith(",") else ","
                 for index, item in enumerate(items):
                     start, _ = self.span(item)
                     # 次の要素の手前（区切りの , と空白を含む）まで、または最後なら前の , から
@@ -284,14 +320,19 @@ class Generator(ast.NodeVisitor):
                         end = self.span(items[index + 1])[0]
                     else:
                         start, end = self.span(items[index - 1])[1], self.span(item)[1]
-                    self.add(item, "elem", "", span=(start, end))
+                    replacement = ""
+                    if pair and index == 0:         # ("a", "b") → ("b",)
+                        end, replacement = last_end, self.segment(items[1]) + comma
+                    elif pair:                      # ("a", "b") → ("a",)
+                        replacement = comma
+                    self.add(item, "elem", replacement, span=(start, end))
                 return
         self.generic_visit(node)
 
 
 def name_users(root: Path, path: str) -> dict[str, list[tuple[int, int]]]:
     """関数の外の名前ごとに、それを使う関数の行の範囲（その関数を通る試験が、壊した名前の影響を受けうる）。"""
-    tree = ast.parse((root / path).read_text(encoding="utf-8"))
+    tree = ast.parse(source_text(root, path))
     users: dict[str, list[tuple[int, int]]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -306,22 +347,34 @@ def name_users(root: Path, path: str) -> dict[str, list[tuple[int, int]]]:
 def generated(root: Path, files: tuple[str, ...]) -> list[Mutant]:
     found: list[Mutant] = []
     for path in files:
-        text = (root / path).read_text(encoding="utf-8")
+        text = source_text(root, path)
         generator = Generator(path, text)
         generator.visit(ast.parse(text))
         found.extend(generator.mutants)
     return found
 
 
-def listed(root: Path) -> tuple[list[Mutant], dict[str, str]]:
-    """一覧のファイルの、手で書いた壊し方と、同値として除く壊し方（番号 → 理由）。"""
-    data = tomllib.loads((root / LIST_FILE).read_text(encoding="utf-8"))
+@dataclasses.dataclass
+class Listing:
+    """一覧のファイル（scripts/mutants.toml）の中身。"""
+    hand: list[Mutant]
+    equivalent: dict[str, str]                  # 同値: 番号 → 理由
+    platform_only: dict[str, tuple[str, str]]   # 別枠（そのOSでだけ落とせる）: 番号 → （OS、理由）
+
+    def skipped_here(self) -> set[str]:
+        """このOSでは落とせないので流さない、別枠の番号。"""
+        return {key for key, (platform, _) in self.platform_only.items() if platform != THIS_PLATFORM}
+
+
+def listed(root: Path) -> Listing:
+    """一覧のファイルの、手で書いた壊し方、同値として除く壊し方、別枠の壊し方。"""
+    data = tomllib.loads(source_text(root, LIST_FILE))
     mutants = []
     for item in data.get("mutant", []):
-        text = (root / item["file"]).read_text(encoding="utf-8")
+        text = source_text(root, item["file"])
         start = text.find(item["original"])
         if start < 0 or text.count(item["original"]) != 1:
-            raise SystemExit(f"{LIST_FILE}: {item['id']} の元の文字列が、{item['file']} にちょうど1つ無い")
+            raise CannotRun(f"{LIST_FILE}: {item['id']} の元の文字列が、{item['file']} にちょうど1つ無い")
         line = text.count("\n", 0, start) + 1
         end_line = line + item["original"].count("\n")
         mutants.append(Mutant(
@@ -330,20 +383,36 @@ def listed(root: Path) -> tuple[list[Mutant], dict[str, str]]:
             end=start + len(item["original"]), module_level=bool(item.get("module_level", False)),
         ))
     equivalent = {item["id"]: item["reason"] for item in data.get("equivalent", [])}
-    return mutants, equivalent
+    platform_only = {}
+    for item in data.get("platform_only", []):
+        if item.get("platform") not in PLATFORMS or not item.get("reason"):
+            raise CannotRun(
+                f"{LIST_FILE}: {item.get('id')} の platform（{PLATFORMS} のどれか）か reason が無い"
+            )
+        platform_only[item["id"]] = (item["platform"], item["reason"])
+    both = set(equivalent) & set(platform_only)
+    if both:
+        raise CannotRun(f"{LIST_FILE}: 同値と別枠の両方にある番号: {', '.join(sorted(both))}")
+    return Listing(mutants, equivalent, platform_only)
 
 
-def all_mutants(root: Path, files: tuple[str, ...]) -> tuple[list[Mutant], dict[str, str]]:
-    hand, equivalent = listed(root)
-    mutants = generated(root, files) + [m for m in hand if m.file in files]
+def all_mutants(root: Path, files: tuple[str, ...]) -> tuple[list[Mutant], Listing]:
+    listing = listed(root)
+    mutants = generated(root, files) + [m for m in listing.hand if m.file in files]
     ids = [m.id for m in mutants]
     if len(ids) != len(set(ids)):
-        raise SystemExit("壊し方の番号が重なっている")
-    return mutants, equivalent
+        raise CannotRun("壊し方の番号が重なっている")
+    return mutants, listing
 
 
-def mutated_text(root: Path, mutant: Mutant) -> str:
-    text = (root / mutant.file).read_text(encoding="utf-8")
+def mutated_text(root: Path, mutant: Mutant) -> str | None:
+    """root の中の、壊したファイルの中身。
+
+    壊す場所が、壊し方を作ったときの中身と違えば None（ずれた場所を壊さない）。
+    """
+    text = source_text(root, mutant.file)
+    if text[mutant.start:mutant.end] != mutant.original:
+        return None
     return text[:mutant.start] + mutant.replacement + text[mutant.end:]
 
 
@@ -380,22 +449,26 @@ if _out and hasattr(sys, "monitoring"):
     atexit.register(_save)
 '''
 
-# pytest に読ませる差し込み。壊す前の試験では、試験ごとに通った行と時間を書く。
-# 壊した後の試験では、流す試験を選び、並べ替える。
+# pytest に読ませる差し込み。壊す前の試験では、試験ごとに通った行と時間を書き、セッションの終わりに件数
+# （集めた数、終わりまで流れた数）を書く。壊した後の試験では、流す試験を選び、並べ替える。
 PLUGIN = f'''\
 import json, os, time
 import pytest
 
 SELECT = os.environ.get("{SELECT_VAR}")
 COVER = os.environ.get("{COVER_VAR}")
+SESSION = os.environ.get("{SESSION_VAR}")
 KILLER = os.environ.get("{KILLER_VAR}")
 RECORD = []
+COUNTS = {{"collected": None, "finished": set()}}
 
 
 def pytest_runtest_logreport(report):
     if KILLER and report.failed and not os.path.exists(KILLER):
         with open(KILLER, "w", encoding="utf-8") as handle:
             handle.write(report.nodeid)
+    if report.when == "teardown":
+        COUNTS["finished"].add(report.nodeid)
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -408,6 +481,10 @@ def pytest_collection_modifyitems(session, config, items):
     chosen.sort(key=lambda item: rank[item.nodeid])
     config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in rank])
     items[:] = chosen
+
+
+def pytest_collection_finish(session):
+    COUNTS["collected"] = len(session.items)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -427,6 +504,9 @@ def pytest_sessionfinish(session, exitstatus):
     if COVER:
         with open(os.path.join(COVER, "main.json"), "w", encoding="utf-8") as handle:
             json.dump(RECORD, handle)
+    if SESSION:
+        with open(SESSION, "w", encoding="utf-8") as handle:
+            json.dump({{"collected": COUNTS["collected"], "finished": len(COUNTS["finished"])}}, handle)
 '''
 
 
@@ -440,12 +520,22 @@ def helper_dir(base: Path) -> Path:
 
 # ------------------------------------------------------------------ 写しと実行（OSの違いは、ここにまとめる）
 
+def git_command(root: Path) -> str:
+    """git の場所（scripts/cycle.py と同じ探し方。実行した場所と root の中のものは使わない）。"""
+    found = HARNESS.find_command("git", (root,))
+    if found is None:
+        raise CannotRun("git が見つからない（実行した場所と、対象のリポジトリの中にあるものは使わない）")
+    return found
+
+
 def copy_repo(root: Path, target: Path) -> None:
     """追跡しているファイルと、無視されていない新しいファイルを写す（作業中のフォルダには触らない）。"""
     proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        capture_output=True, check=True,
+        [git_command(root), "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True, env=HARNESS.git_env(),
     )
+    if proc.returncode != 0:
+        raise CannotRun(f"{root} のファイルの一覧を git で読めない")
     for name in proc.stdout.decode("utf-8").split("\0"):
         source = root / name
         if not name or not source.is_file():
@@ -453,6 +543,15 @@ def copy_repo(root: Path, target: Path) -> None:
         destination = target / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+
+
+def content_digest(folder: Path) -> str:
+    """写しの中身（ファイルの名前と中身）のハッシュ。結果に、どの内容を流したかを残す。"""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in folder.rglob("*") if p.is_file()):
+        name = path.relative_to(folder).as_posix()
+        digest.update(name.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
 
 
 def processes_with_mark(token: str) -> list[int]:
@@ -492,17 +591,19 @@ def stop_leftovers(token: str) -> int:
 
 def run_tests(
     copy: Path, helpers: Path, tests: list[str], select: list[str] | None, cover: Path | None, timeout: float,
-    log: Path | None = None, killer: Path | None = None,
+    log: Path | None = None, killer: Path | None = None, session: Path | None = None,
 ) -> tuple[str, float, int]:
-    """写しの中で試験を流す。返すのは（結果: passed / failed / timeout、秒、後で止めた残りのプロセスの数）。
+    """写しの中で試験を流す。返すのは（結果、秒、後で止めた残りのプロセスの数）。
 
+    結果は passed、KILLED_CODES の値、timeout、error-<終了コード>。
     log を渡すと、試験の出力をそこに書く（渡さなければ捨てる）。
     killer を渡すと、最初に落ちた試験の名前を書く。
+    session を渡すと、セッションの終わりに件数（集めた数、終わりまで流れた数）を書く。
     """
     token = uuid.uuid4().hex
     env = {
         key: value for key, value in os.environ.items()
-        if not key.startswith(("PYTEST_", COVER_VAR, SELECT_VAR, NESTED_VAR))
+        if not key.startswith(("PYTEST_", COVER_VAR, SELECT_VAR, NESTED_VAR, SESSION_VAR))
     }
     env.update({
         MARK_VAR: token, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
@@ -510,6 +611,8 @@ def run_tests(
     })
     if killer is not None:
         env[KILLER_VAR] = str(killer)
+    if session is not None:
+        env[SESSION_VAR] = str(session)
     if cover is not None:
         env[COVER_VAR] = str(cover)
         env[f"{COVER_VAR}_TARGETS"] = json.dumps([str((copy / name).resolve()) for name in TARGETS])
@@ -519,28 +622,23 @@ def run_tests(
         listing.write_text(json.dumps(select), encoding="utf-8")
         env[SELECT_VAR] = str(listing)
     started = time.monotonic()
-    options = {} if os.name == "nt" else {"start_new_session": True}
     output = open(log, "wb") if log is not None else subprocess.DEVNULL   # noqa: SIM115  終わったら閉じる
     try:
         proc = subprocess.Popen(
             [*args, *tests], cwd=copy, env=env, stdin=subprocess.DEVNULL, stdout=output,
-            stderr=subprocess.STDOUT, **options,
+            stderr=subprocess.STDOUT, **HARNESS.group_options(),
         )
     finally:
         if log is not None:
             output.close()
     try:
         code = proc.wait(timeout=timeout)
-        # 0 = 通った。KILLED_CODES = 落ちた。それ以外（試験が無い、入れ子など）は、結果を得られなかった
+        # 0 = 通った。KILLED_CODES = 落ちた。それ以外（試験が無い、入れ子、遮断を組めないなど）は、
+        # 結果を得られなかった
         outcome = "passed" if code == 0 else KILLED_CODES.get(code, f"error-{code}")
     except subprocess.TimeoutExpired:
         outcome = "timeout"
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-        proc.kill()
+        HARNESS.kill_tree(proc)
         proc.wait()
     seconds = time.monotonic() - started
     return outcome, seconds, stop_leftovers(token)
@@ -548,35 +646,40 @@ def run_tests(
 
 # ------------------------------------------------------------------ 壊す前の試験
 
-def content_key(root: Path) -> str:
-    """壊す前の試験の記録を使い回してよいかの鍵（スクリプト、試験、記録の仕方が同じ）。"""
-    digest = hashlib.sha256(f"{COVER_VERSION}\0{SITECUSTOMIZE}".encode())
-    for name in (*TARGETS, *TOOL_TESTS, "tests/conftest.py"):
-        path = root / name
-        digest.update(name.encode() + b"\0" + (path.read_bytes() if path.is_file() else b"") + b"\0")
-    return digest.hexdigest()[:16]
+def baseline(source: Path, work: Path, helpers: Path, tests: list[str], cover: bool) -> dict | None:
+    """壊す前の試験を流す。通らなければ CannotRun。
 
-
-def baseline(root: Path, work: Path, helpers: Path, tests: list[str]) -> dict:
-    """壊す前の試験を流し、試験ごとに通った行（ファイル → 行の一覧）と時間を記録する。"""
-    key = content_key(root)
-    cache = root / STATE_DIR / f"baseline-{key}.json"
-    if cache.is_file():
-        return json.loads(cache.read_text(encoding="utf-8"))
+    通るとは、終了コードが 0 で、集めた試験が1件以上あり、そのすべてが終わりまで流れたこと（途中で
+    終了コード 0 で終わったプロセスを、通ったと数えない）。cover なら、試験ごとに通った行
+    （ファイル → 行の一覧）と時間を記録して返す（壊した行を通る試験を選ぶのに使う）。
+    cover でなければ None を返す。
+    """
     copy = work / "baseline"
-    copy_repo(root, copy)
-    cover = work / "cover"
-    cover.mkdir()
-    print("壊す前の試験を流し、試験ごとに通った行を記録します（数分かかります）", flush=True)
-    log = root / STATE_DIR / "baseline.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    outcome, seconds, _ = run_tests(copy, helpers, tests, None, cover, RUN_TIMEOUT * 2, log)
-    if outcome != "passed":
+    shutil.copytree(source, copy, symlinks=True)
+    folder = work / "cover"
+    folder.mkdir()
+    session = work / "baseline-session.json"
+    print("壊す前の試験を流して、通ることを確かめます（数分かかります）", flush=True)
+    log = work / "baseline.log"
+    outcome, seconds, _ = run_tests(
+        copy, helpers, tests, None, folder if cover else None, RUN_TIMEOUT * 2, log, session=session,
+    )
+    try:
+        counts = json.loads(session.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        counts = {"collected": None, "finished": None}
+    complete = type(counts["collected"]) is int and counts["collected"] >= 1
+    if outcome != "passed" or not complete or counts["finished"] != counts["collected"]:
         tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
         print("\n".join(tail))
-        raise SystemExit(f"壊す前の試験が通らない（{outcome}。出力は {STATE_DIR}/baseline.log）")
-    records = json.loads((cover / "main.json").read_text(encoding="utf-8"))
-    children = [json.loads(path.read_text(encoding="utf-8")) for path in cover.glob("*-*.json")]
+        raise CannotRun(
+            f"壊す前の試験が通らない（{outcome}、集めた試験 {counts['collected']}、"
+            f"終わりまで流れた試験 {counts['finished']}）。何も壊さずに終わる"
+        )
+    if not cover:
+        return None
+    records = json.loads((folder / "main.json").read_text(encoding="utf-8"))
+    children = [json.loads(path.read_text(encoding="utf-8")) for path in folder.glob("*-*.json")]
     prefix = str(copy.resolve()) + os.sep
     result: dict[str, dict] = {}
     for record in records:
@@ -589,10 +692,7 @@ def baseline(root: Path, work: Path, helpers: Path, tests: list[str]) -> dict:
             if path.startswith(prefix):
                 by_file.setdefault(path[len(prefix):].replace(os.sep, "/"), []).append(line)
         result[record["test"]] = {"seconds": record["end"] - record["start"], "lines": by_file}
-    data = {"key": key, "seconds": seconds, "tests": result}
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(data), encoding="utf-8")
-    return data
+    return {"seconds": seconds, "tests": result}
 
 
 def covering(base: dict, mutant: Mutant, users: dict[str, list[tuple[int, int]]]) -> list[str]:
@@ -616,12 +716,15 @@ def covering(base: dict, mutant: Mutant, users: dict[str, list[tuple[int, int]]]
 # ------------------------------------------------------------------ 流す
 
 def run_one(
-    root: Path, copy: Path, helpers: Path, mutant: Mutant, base: dict | None, tests: list[str],
+    copy: Path, helpers: Path, mutant: Mutant, base: dict | None, tests: list[str],
     users: dict, confirm: bool, hint: str | None,
 ) -> dict:
+    """写し（開始時の内容。各回の後で元に戻す）の中の1か所を壊して、試験を流す。"""
     target = copy / mutant.file
     original = target.read_bytes()
-    text = mutated_text(root, mutant)
+    text = mutated_text(copy, mutant)
+    if text is None:            # 写しの中身が、壊し方を作った中身と違う（壊す場所がずれている）
+        return {"id": mutant.id, "status": "error", "how": "mismatch", "seconds": 0.0, "leftovers": 0}
     try:
         ast.parse(text)
     except SyntaxError:
@@ -661,47 +764,89 @@ def describe(mutant: Mutant) -> str:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    mutants, equivalent = all_mutants(ROOT, tuple(args.file or TARGETS))
+    mutants, listing = all_mutants(ROOT, tuple(args.file or TARGETS))
     for mutant in mutants:
-        note = "  [同値]" if mutant.id in equivalent else ""
+        note = ""
+        if mutant.id in listing.equivalent:
+            note = "  [同値]"
+        elif mutant.id in listing.platform_only:
+            note = f"  [別枠: {listing.platform_only[mutant.id][0]} でだけ落とせる]"
         print(describe(mutant) + note)
-    print(f"{len(mutants)} 通り（同値として除くもの {sum(m.id in equivalent for m in mutants)}）")
+    print(
+        f"{len(mutants)} 通り（同値として除くもの {sum(m.id in listing.equivalent for m in mutants)}、"
+        f"別枠 {sum(m.id in listing.platform_only for m in mutants)}）"
+    )
     return 0
+
+
+def source_info(root: Path, source: Path) -> dict:
+    """流した内容: 作業中のフォルダの HEAD のコミット、未コミットの変更の有無、写しの中身のハッシュ。"""
+    git = git_command(root)
+    head = subprocess.run(
+        [git, "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, env=HARNESS.git_env(),
+    )
+    status = subprocess.run(
+        [git, "-C", str(root), "status", "--porcelain"], capture_output=True, text=True,
+        env=HARNESS.git_env(),
+    )
+    return {
+        "commit": head.stdout.strip() or None, "dirty": bool(status.stdout.strip()),
+        "sha256": content_digest(source),
+    }
+
+
+def write_result(root: Path, summary: dict) -> Path:
+    out = root / STATE_DIR / f"result-{time.strftime('%Y%m%dT%H%M%S')}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
+    return out
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve() if args.root else ROOT
     files = tuple(args.file or TARGETS)
-    mutants, equivalent = all_mutants(root, files)
-    stale = sorted(set(equivalent) - {m.id for m in all_mutants(root, TARGETS)[0]})
-    if args.only:
-        wanted = set(args.only)
-        mutants = [m for m in mutants if m.id in wanted]
-        missing = wanted - {m.id for m in mutants}
-        if missing:
-            print(f"知らない番号: {', '.join(sorted(missing))}")
-            return 2
-    elif not args.include_equivalent:
-        mutants = [m for m in mutants if m.id not in equivalent]
-    if args.sample and args.sample < len(mutants):         # 一覧の全体から、等間隔に選ぶ
-        mutants = [mutants[index * len(mutants) // args.sample] for index in range(args.sample)]
-    tests = list(args.tests or [t for t in TOOL_TESTS if (root / t).is_file()])
+    started = time.monotonic()
+    summary: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": list(files)}
     if not can_find_leftovers():
         print("注意: このOSでは、試験が残したプロセスを探せない（/proc が要る）。残っていたら手で止める")
     with tempfile.TemporaryDirectory(prefix="circuit-sim-mutants-") as tmp:
         work = Path(tmp)
-        helpers = helper_dir(work)
-        base = None if args.no_select else baseline(root, work, helpers, tests)
+        try:
+            # 開始時の内容。壊し方はここから作り、ここの写しに当てる（作業中のフォルダが変わってもずれない）
+            source = work / "source"
+            copy_repo(root, source)
+            summary["source"] = source_info(root, source)
+            mutants, listing = all_mutants(source, files)
+            known = {m.id for m in all_mutants(source, TARGETS)[0]}
+            stale = sorted((set(listing.equivalent) | set(listing.platform_only)) - known)
+            skipped = listing.skipped_here()
+            if args.only:
+                wanted = set(args.only)
+                mutants = [m for m in mutants if m.id in wanted]
+                missing = wanted - {m.id for m in mutants}
+                if missing:
+                    print(f"知らない番号: {', '.join(sorted(missing))}")
+                    return 2
+            elif not args.include_equivalent:
+                mutants = [m for m in mutants if m.id not in listing.equivalent and m.id not in skipped]
+            if args.sample and args.sample < len(mutants):         # 一覧の全体から、等間隔に選ぶ
+                mutants = [mutants[index * len(mutants) // args.sample] for index in range(args.sample)]
+            tests = list(args.tests or [t for t in TOOL_TESTS if (source / t).is_file()])
+            helpers = helper_dir(work)
+            base = baseline(source, work, helpers, tests, cover=not args.no_select)
+        except CannotRun as exc:
+            summary.update(verdict="error", reason=str(exc), seconds=round(time.monotonic() - started, 1))
+            out = write_result(root, summary)
+            print(f"流せなかった: {exc}\n記録: {out.relative_to(root).as_posix()}")
+            return 2
         copies = []
         for index in range(max(1, args.jobs)):
             copy = work / f"copy-{index}"
-            copy_repo(root, copy)
+            shutil.copytree(source, copy, symlinks=True)
             copies.append(copy)
         free = list(copies)
         results: list[dict] = []
-        started = time.monotonic()
-
-        users = {name: name_users(root, name) for name in files}
+        users = {name: name_users(source, name) for name in files}
         killers_path = root / STATE_DIR / KILLERS_FILE
         killers = json.loads(killers_path.read_text(encoding="utf-8")) if killers_path.is_file() else {}
 
@@ -709,14 +854,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             copy = free.pop()
             try:
                 hint = killers.get(mutant.id)
-                return run_one(root, copy, helpers, mutant, base, tests, users, args.confirm, hint)
+                return run_one(copy, helpers, mutant, base, tests, users, args.confirm, hint)
             finally:
                 free.append(copy)
 
         with ThreadPoolExecutor(max_workers=len(copies)) as pool:
             for done, result in enumerate(pool.map(work_on, mutants), 1):
                 results.append(result)
-                if result["status"] == "survived" or args.verbose:
+                if result["status"] in ("survived", "error", "invalid") or args.verbose:
                     mutant = next(m for m in mutants if m.id == result["id"])
                     print(f"[{done}/{len(mutants)}] {result['status']}: {describe(mutant)}", flush=True)
                 elif done % 25 == 0:
@@ -726,34 +871,43 @@ def cmd_run(args: argparse.Namespace) -> int:
     killers_path.write_text(json.dumps(killers, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     survived = [r for r in results if r["status"] == "survived"]
     errors = [r["id"] for r in results if r["status"] == "error"]
-    unexpected = [r for r in survived if r["id"] not in equivalent]
-    killed_listed = [r["id"] for r in results if r["status"] == "killed" and r["id"] in equivalent]
-    summary = {
-        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": list(files),
+    invalid = [r["id"] for r in results if r["status"] == "invalid"]
+    # 生き残っても数えないのは、同値と、このOSでは通らない別枠だけ（別枠は、そのOSで流せば数える）
+    excused = set(listing.equivalent) | skipped
+    unexpected = [r["id"] for r in survived if r["id"] not in excused]
+    killed_listed = [r["id"] for r in results if r["status"] == "killed" and r["id"] in excused]
+    summary.update({
+        "verdict": "fail" if unexpected or errors or invalid else "pass",
         "count": len(results), "killed": sum(r["status"] == "killed" for r in results),
-        "survived": [r["id"] for r in survived], "unexpected": [r["id"] for r in unexpected],
-        "invalid": [r["id"] for r in results if r["status"] == "invalid"],
-        "equivalent_but_killed": killed_listed, "errors": errors,
+        "survived": [r["id"] for r in survived], "unexpected": unexpected, "invalid": invalid,
+        "errors": errors,
+        "equivalent": sorted(i for i in listing.equivalent if i in known),
+        "platform_only_not_run": sorted(i for i in skipped if i in known),
+        "equivalent_but_killed": killed_listed,
         "leftovers_stopped": sum(r["leftovers"] for r in results),
-        "seconds": round(time.monotonic() - started, 1), "stale_equivalent": stale, "results": results,
-    }
-    out = root / STATE_DIR / f"result-{time.strftime('%Y%m%dT%H%M%S')}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n")
+        "seconds": round(time.monotonic() - started, 1), "stale_listed": stale, "results": results,
+    })
+    out = write_result(root, summary)
     print(
         f"{summary['count']} 通り: 落ちた {summary['killed']}、生き残り {len(survived)}"
         f"（一覧に無いもの {len(unexpected)}）、結果を得られなかった {len(errors)}、"
-        f"作れなかった {len(summary['invalid'])}、"
-        f"後で止めた残りのプロセス {summary['leftovers_stopped']}、{summary['seconds']} 秒"
+        f"作れなかった {len(invalid)}、後で止めた残りのプロセス {summary['leftovers_stopped']}、"
+        f"{summary['seconds']} 秒"
+    )
+    print(
+        f"流さなかったもの: 同値として一覧にある {len(summary['equivalent'])}、"
+        f"別枠（このOSでは落とせない分岐）{len(summary['platform_only_not_run'])}"
     )
     if killed_listed:
-        print(f"同値として一覧にあるが、落ちたもの（一覧から外す）: {', '.join(killed_listed)}")
+        print(f"同値か別枠として一覧にあるが、落ちたもの（一覧から外す）: {', '.join(killed_listed)}")
     if stale:
-        print(f"一覧の同値のうち、もう無い番号（一覧から外す）: {', '.join(stale)}")
+        print(f"一覧の同値と別枠のうち、もう無い番号（一覧から外す）: {', '.join(stale)}")
     if errors:
         print(f"結果を得られなかったもの（生き残りと同じに扱う）: {', '.join(errors)}")
+    if invalid:
+        print(f"作れなかったもの（壊すと読めない形になる。壊し方の作り方を直す）: {', '.join(invalid)}")
     print(f"記録: {out.relative_to(root).as_posix()}")
-    return 1 if unexpected or errors else 0
+    return 1 if unexpected or errors or invalid else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -773,7 +927,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     p.add_argument("--tests", nargs="+", help="流す試験（既定は道具の試験）")
     p.add_argument("--no-select", action="store_true", help="通った行で試験を選ばない（毎回、全体を流す）")
-    p.add_argument("--include-equivalent", action="store_true", help="同値として一覧にあるものも流す")
+    p.add_argument(
+        "--include-equivalent", action="store_true", help="同値と別枠として一覧にあるものも流す",
+    )
     p.add_argument(
         "--confirm", action="store_true",
         help="選んだ試験で生き残ったものを、道具の試験の全体でもう一度流す（落ちれば、生き残りから外れる）",
@@ -782,7 +938,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_run)
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except CannotRun as exc:
+        print(f"流せなかった: {exc}")
+        return 2
 
 
 if __name__ == "__main__":

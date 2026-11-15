@@ -19,7 +19,10 @@
      リンクを並べた場所に置き換える（同じ場所にある git、bash などが消えないように）。
      リンクを作れない Windows では、取り除くだけにし、そこにしか git が無ければ、試験を始めずに止める。
    - セッションの始めに、取り除いた場所（理由つき）と、リンクで残した道具を表示する（原因を追えるように）。
-   - 見張り役を起動できない（一時フォルダが実行不可）なら、理由を表示して、試験を始めずに止める。
+   - 見張り役を起動できない（一時フォルダが実行不可）か、遮断を組めない（Windows で git が claude と同じ場所に
+     しか無い）なら、理由を表示して、試験を始めずに止める（終了コード GUARD_EXIT_CODE。見張り役が起動された
+     ときの SENTINEL_EXIT_CODE とは分ける）。
+   - 呼び出し元の環境にある、見張り役に記録を残させない印（SENTINEL_PROBE_VAR）は、セッションの始めに消す。
 
 3. Windows で、OSのエラー画面（「サポートされていない 16 ビット アプリケーション」など。人が OK を押すまで
    止まる）を出させない。試験のプロセスに設定し、起動する子プロセスに引き継がれる。scripts/cycle.py の
@@ -45,9 +48,13 @@ WINDOWS = os.name == "nt"
 SENTINEL_VAR = "CIRCUIT_SIM_CLAUDE_SENTINEL"
 SAFE_PATH_VAR = "CIRCUIT_SIM_SAFE_PATH"
 SENTINEL_EXIT_CODE = 71         # 見張り役が起動された試験のセッションの終了コード
+# 遮断を組めない、見張り役を起動できない（試験を始めなかった）セッションの終了コード。71 と分ける
+# （1か所ずつ壊す確認は 71 を「壊れたことに試験が気づいた」と数える。始められなかった実行を、そう数えない）
+GUARD_EXIT_CODE = 72
 SENTINEL_RETURNCODE = 97        # 見張り役そのものの終了コード
 SENTINEL_LOG = "started.log"
-# 見張り役を、記録を残さずに起動できるかだけを確かめるときの印（セッションの始めに1回）
+# 見張り役を、記録を残さずに起動できるかだけを確かめるときの印（セッションの始めに1回）。
+# 呼び出し元の環境にあると、見張り役が記録を残さずに 0 で終わるので、セッションの始めに消す
 SENTINEL_PROBE_VAR = "CIRCUIT_SIM_SENTINEL_PROBE"
 # claude として起動されうる拡張子（PATHEXT に無くても数える。npm は claude、claude.cmd、claude.ps1 を置く）
 CLAUDE_SUFFIXES = ("", ".exe", ".cmd", ".bat", ".com", ".ps1")
@@ -255,6 +262,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    # 見張り役に記録を残させない印は、セッションの始めの確かめ（sentinel_starts）だけが、その起動に付ける。
+    # 呼び出し元から引き継いだものは、試験と、試験が起動するプロセスに渡さない
+    os.environ.pop(SENTINEL_PROBE_VAR, None)
     config = session.config
     if hasattr(config, "workerinput"):      # 並列実行の子（pytest-xdist）は、同じ1回の実行の一部
         return
@@ -269,7 +279,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         safe, guarded = guard_path(path, pathext, place)
     except GuardError as exc:
         shutil.rmtree(place, ignore_errors=True)
-        pytest.exit(str(exc), returncode=SENTINEL_EXIT_CODE)
+        pytest.exit(str(exc), returncode=GUARD_EXIT_CODE)
     if not sentinel_starts(place / "sentinel"):
         shutil.rmtree(place, ignore_errors=True)
         pytest.exit(
@@ -278,7 +288,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             "見つけられないので、"
             "試験を始めない。"
             "環境変数 TMPDIR（Windows では TEMP）を、実行できる場所に変えて流す",
-            returncode=SENTINEL_EXIT_CODE,
+            returncode=GUARD_EXIT_CODE,
         )
     # 標準エラーは、出せない文字を置き換えて書くので、UTF-8 でない端末でも落ちない（Python の決まり）
     print("\n".join(guard_report(path, pathext, place / "tools")), file=sys.stderr, flush=True)

@@ -28,6 +28,7 @@ from test_harness import (
     WINDOWS,
     commit,
     cycle,
+    default_stop_signals,
     implement,
     install_hook,
     make_repo,
@@ -183,6 +184,8 @@ def start_local_ci(root: Path, *args: str, env: dict[str, str] | None = None, **
     elsewhere.mkdir(exist_ok=True)
     if WINDOWS:     # Ctrl-Break の合図を、このプロセスだけに送れるようにする
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:           # 呼び出し元が終了の合図を無視していても（nohup の SIGHUP など）、既定の扱いに戻す
+        options.setdefault("preexec_fn", default_stop_signals)
     return subprocess.Popen(
         [sys.executable, str(SCRIPT), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace", env=ci_env(root, env), cwd=elsewhere, **options,
@@ -388,14 +391,17 @@ def with_origin(repo: Path) -> tuple[Path, Path]:
     return repo, other
 
 
-def test_default_is_the_latest_main_of_the_remote(with_origin):
+@pytest.mark.parametrize("env", [{}, {"GIT_NAMESPACE": "elsewhere"}], ids=["そのまま", "GIT_NAMESPACE"])
+def test_default_is_the_latest_main_of_the_remote(with_origin, env):
+    """呼び出し元の GIT_NAMESPACE は、取得に持ち込まない（持ち込むと、手元のリモートからの取得が、別の名前の
+    範囲の参照だけを見て、何も取得せずに 0 で終わる。古い main を「最新」として確かめてしまう）。"""
     repo, other = with_origin
     old, _ = head(repo)
     # リモートの main が、確認の失敗する内容に進む
     new = set_plan(other, junit=junit(("test_a", "failure")), exit=1)
     sh(other, "git", "push", "-q", "origin", "main")
 
-    result = local_ci(repo)
+    result = local_ci(repo, env=env)
     assert result.returncode == 1, result.stdout + result.stderr
     [written] = results(repo)
     assert written["commit"] == new != old
