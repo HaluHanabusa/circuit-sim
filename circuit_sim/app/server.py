@@ -6,38 +6,78 @@ API（画面仕様 12章の番号）:
   POST /api/open            仕様JSONを開く（4.2 の 5〜8 を確かめる。1〜4 は画面）。開けたら作業の状態に入れる
   GET  /api/session         D9 作業の状態（ブラウザを再読み込みしても、開いている仕様が戻る）
   PUT  /api/session         作業の状態を送り直す（起動し直した後。保存していない変更があるかも受け取る）
+  GET  /api/settings        画面の好み（言語、テーマ、仕切りの位置、お知らせの帯の開閉。D-050）
+  PUT  /api/settings        画面の好みを書く（端末の中の設定ファイル。番号が変わっても次の起動で戻る）
 
 エラーとお知らせは、文面ではなく番号と差し込む値で返す（文面は画面の辞書が持つ。12章）。
-外部への通信はしない。受け付けるのは、このPCの中（127.0.0.1、localhost）からの要求だけ。
+外部への通信はしない。
+
+安全（D-051。依存の版の既定の動きに頼らず、ここで確かめる）:
+  1. Host がこのPCの名前（127.0.0.1、localhost）でなければ 400（DNS の付け替えで外のページから届く要求）
+  2. 書き込みの要求（GET・HEAD・OPTIONS 以外）は、Origin がこのページと同じでなければ 403。Origin が無ければ
+     Sec-Fetch-Site を見て、same-origin 以外は 403（別のサイト、同じ PC の別の番号のページから届く要求。
+     クッキーの SameSite は番号を区別しないので、これで防ぐ）
+  3. /api/ は合言葉のクッキーが無ければ 401（同じPCの別の利用者）。クッキーは、起動したときにブラウザへ渡す
+     URL（/?k=合言葉）で付け、合言葉の無い URL（/）へ移す
+  4. 書き込みの要求の Content-Type が application/json でなければ 415
+  5. 画面のファイルは、決まった形の名前（英数字と . _ -）だけを、画面のフォルダの中からだけ出す。
+     絶対パス、UNC（\\\\ や //）、バックスラッシュ、ドライブ名（C:）は、パスを組み立てる前に拒む
+     （Windows では、組み立てたパスを realpath に渡すだけで、外の機械へ SMB の接続が起きうる）
 """
 from __future__ import annotations
 
+import hmac
+import html
 import json
+import os
+import re
 import secrets
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import SCHEMA_VERSION, Spec
 from ..templates import TEMPLATES
+from .config import PREFS, Settings, valid_pref
 
 VERSION = "0.0.1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOCAL_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
+COOKIE = "circuit_sim_key"
+TOKEN_PARAM = "k"
+COOKIE_MAX_AGE = 400 * 24 * 3600  # ブラウザが受け付ける最長（再起動の後も、開いている画面が再接続できる）
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # 画面の部品が使うもの以外を読み込ませない（外部への通信を、ブラウザの側でも止める）
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
     "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'"
+)
+
+# 画面のファイルの種類（OS の登録に頼らない。Windows では .js が text/plain に登録されていることがある）
+MEDIA_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+SAFE_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+WINDOWS_DEVICES = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"com{i}" for i in range(10)} | {f"lpt{i}" for i in range(10)}
 )
 
 
@@ -73,12 +113,135 @@ SCHEMA_PROBLEMS = {
 SCHEMA_PLACES_SHOWN = 5
 
 
+# ------------------------------------------------------------------ パスの確かめ
+
+
+def safe_parts(route_path: str) -> list[str] | None:
+    """URL の道（復号した後）を、画面のフォルダの中の名前の並びにする。認めない形なら None。
+
+    パスを組み立てる前（realpath の前）に、絶対パス、UNC、バックスラッシュ、ドライブ名、.. を拒む。
+    名前は、ビルドが書き出す形（英数字と . _ -）だけを認める。
+    """
+    if not route_path.startswith("/"):
+        return None
+    rel = route_path[1:]
+    if not rel or "\\" in rel or "\x00" in rel or ":" in rel:
+        return None  # バックスラッシュ（\\host\share）、ドライブ名（C:）、NTFS の別のストリーム（a:b）
+    if rel.startswith("/") or "//" in rel:
+        return None  # 絶対パス、UNC（//host/share）
+    parts = rel.split("/")
+    for part in parts:
+        if part in (".", "..") or not SAFE_PART.fullmatch(part) or part.endswith("."):
+            return None
+        if part.split(".")[0].lower() in WINDOWS_DEVICES:
+            return None
+    return parts
+
+
+def static_file(route_path: str, root: str, pathmod: Any = os.path) -> str | None:
+    """画面のフォルダ root の中のファイルの場所。外を指す・認めない形なら None。
+
+    pathmod は os.path（試験では ntpath を渡し、Windows での組み立てを再現する）。
+    """
+    parts = safe_parts(route_path)
+    if parts is None:
+        return None
+    real_root = pathmod.realpath(root)
+    full = pathmod.realpath(pathmod.join(real_root, *parts))
+    try:
+        if pathmod.commonpath([full, real_root]) != real_root:
+            return None
+    except ValueError:  # Windows でドライブが違う
+        return None
+    return full
+
+
 def sample_text(sample: Sample) -> str:
+    # サンプルの名前は決まった一覧から選ぶだけだが、念のため1つの名前であることを確かめてから読む
+    if len(safe_parts("/" + sample.file) or []) != 1:
+        raise ValueError(f"サンプルの名前の形が違う: {sample.file!r}")
     return resources.files(__package__).joinpath("samples", sample.file).read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ 要求の確かめ
+
+
+def token_ok(cookie: str | None, token: str | None) -> bool:
+    """合言葉のクッキーが合っているか。比べるのにかかる時間は、どこまで合っているかによらない。"""
+    if token is None:
+        return True
+    if cookie is None:
+        return False
+    return hmac.compare_digest(cookie.encode("utf-8", "replace"), token.encode("utf-8"))
+
+
+def request_problem(
+    method: str, path: str, headers: Mapping[str, str], cookie: str | None, token: str | None
+) -> tuple[int, str] | None:
+    """要求を受け付けない理由（状態の番号、内部の説明）。受け付けるなら None。headers の名前は小文字。"""
+    writing = method.upper() not in SAFE_METHODS
+    if writing:
+        origin = headers.get("origin")
+        if origin is not None:
+            own = "http://" + headers.get("host", "")
+            if origin.lower() != own.lower():
+                return 403, "cross-origin request refused"
+        else:
+            site = headers.get("sec-fetch-site")
+            if site is not None and site.lower() != "same-origin":
+                return 403, "cross-site request refused"
+    if (path == "/api" or path.startswith("/api/")) and not token_ok(cookie, token):
+        return 401, "open the app from the URL shown in the terminal"
+    if writing:
+        media = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != "application/json":
+            return 415, "content type must be application/json"
+    return None
+
+
+class Guard:
+    """要求の確かめ（request_problem）を、すべての要求に掛ける。"""
+
+    def __init__(self, app, token: str | None) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        problem = request_problem(scope["method"], scope["path"], headers, request.cookies.get(COOKIE),
+                                  self.token)
+        if problem is not None:
+            status, detail = problem
+            await JSONResponse({"detail": detail}, status_code=status)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+# ------------------------------------------------------------------ 仕様を開く
 
 
 def notice(code: str, details: str | None = None, items: list[dict] | None = None, **params: Any) -> dict:
     return {"code": code, "params": params, "details": details, "items": items or []}
+
+
+def schema_notice(file: str, places: list[dict], details: str) -> dict:
+    shown = places[:SCHEMA_PLACES_SHOWN]
+    return {
+        **notice("N-OPEN-SCHEMA", details=details, items=shown, file=file, n=len(places)),
+        "more": len(places) - len(shown),
+    }
+
+
+def schema_problem(err: dict) -> str:
+    # 版が文字列でない（数値の 0.1 など）: 版の違いではなく、形の誤り（文字列が必要）として出す
+    if err["type"] == "literal_error" and tuple(err["loc"]) == ("schema_version",):
+        if not isinstance(err.get("input"), str):
+            return "schema.string"
+    return SCHEMA_PROBLEMS.get(err["type"], "schema.other")
 
 
 def check_spec(file: str, text: str) -> tuple[dict | None, dict | None]:
@@ -87,24 +250,22 @@ def check_spec(file: str, text: str) -> tuple[dict | None, dict | None]:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         return None, notice("N-OPEN-SYNTAX", details=exc.msg, file=file, line=exc.lineno, col=exc.colno)
-    if isinstance(data, dict) and "schema_version" in data and data["schema_version"] != SCHEMA_VERSION:
-        found = data["schema_version"]
-        return None, notice("N-OPEN-VERSION", file=file, found=str(found), supported=SCHEMA_VERSION)
+    except RecursionError:
+        # 入れ子が深すぎる（[ が何万も続くなど）。仕様JSONの形ではないので、形の誤りとして案内する
+        return None, schema_notice(file, [{"path": "$", "problem": "schema.other"}], "nesting too deep")
+    found = data.get("schema_version") if isinstance(data, dict) else None
+    if isinstance(found, str) and found != SCHEMA_VERSION:
+        return None, notice("N-OPEN-VERSION", file=file, found=found, supported=SCHEMA_VERSION)
     try:
         spec = Spec.model_validate(data)
     except ValidationError as exc:
         errors = exc.errors()
-        places = [
-            {"path": ".".join(str(p) for p in err["loc"]) or "$", "problem": SCHEMA_PROBLEMS.get(err["type"],
-                                                                                            "schema.other")}
-            for err in errors
-        ]
+        places = [{"path": ".".join(str(p) for p in err["loc"]) or "$", "problem": schema_problem(err)}
+                  for err in errors]
         details = "\n".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in errors)
-        shown = places[:SCHEMA_PLACES_SHOWN]
-        return None, {
-            **notice("N-OPEN-SCHEMA", details=details, items=shown, file=file, n=len(places)),
-            "more": len(places) - len(shown),
-        }
+        return None, schema_notice(file, places, details)
+    except RecursionError:
+        return None, schema_notice(file, [{"path": "$", "problem": "schema.other"}], "nesting too deep")
     if spec.template not in TEMPLATES:
         listed = ", ".join(sorted(TEMPLATES))
         return None, notice("N-OPEN-TEMPLATE", file=file, template=spec.template, list=listed)
@@ -145,15 +306,36 @@ class SessionRequest(BaseModel):
     dirty: bool = False
 
 
+class SettingsRequest(BaseModel):
+    settings: dict[str, str | None]
+
+
+def page_with_prefs(page: str, prefs: Mapping[str, str]) -> str:
+    """画面の入口（index.html）に、設定ファイルの好みを data-prefs として書き込む。
+
+    boot.js が最初の描画の前に読む（番号が変わってブラウザの保存が空でも、暗いテーマで明るい画面が出ない）。
+    """
+    value = html.escape(json.dumps(dict(prefs), ensure_ascii=True, separators=(",", ":")), quote=True)
+    return page.replace("<html ", f'<html data-prefs="{value}" ', 1)
+
+
 def create_app(
+    *,
+    token: str | None,
+    settings: Settings,
     static_dir: Path = STATIC_DIR,
     workspace: Workspace | None = None,
     allowed_hosts: list[str] | None = None,
 ) -> FastAPI:
+    """token が None のときは合言葉を確かめない（試験用。cli.py の決まりでだけ使う）。"""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.instance = secrets.token_hex(8)
     app.state.workspace = workspace or Workspace()
+    app.state.settings = settings
     ws: Workspace = app.state.workspace
+    static_root = str(static_dir)
+    # 外側から: 安全のヘッダー → Host の確かめ → 要求の確かめ（Guard）→ 本体
+    app.add_middleware(Guard, token=token)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts or LOCAL_HOSTS)
 
     @app.middleware("http")
@@ -162,10 +344,10 @@ def create_app(
         response.headers["Content-Security-Policy"] = CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/") or request.url.path in ("/", "/index.html", "/boot.js"):
-            response.headers["Cache-Control"] = "no-store"
-        elif request.url.path.startswith("/assets/"):
+        if request.url.path.startswith("/assets/"):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/api/health")
@@ -190,7 +372,7 @@ def create_app(
                 return JSONResponse({"detail": "unknown sample"}, status_code=404)
             file, text = sample.file, sample_text(sample)
         elif req.file is not None and req.text is not None:
-            file, text = req.file, req.text
+            file, text = req.file, req.text  # file は表示に使う名前だけ（その道のファイルは読まない）
         else:
             return JSONResponse({"detail": "file and text, or sample, are required"}, status_code=422)
         summary, problem = check_spec(file, text)
@@ -213,16 +395,44 @@ def create_app(
             ws.dirty = bool(req.dirty and req.doc is not None)
             return {"doc": ws.doc, "dirty": ws.dirty}
 
-    @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        return {"settings": settings.read()}
+
+    @app.put("/api/settings")
+    def put_settings(req: SettingsRequest) -> Response:
+        # 値が null の名前は消す。知らない名前と、形の違う値は書かない
+        bad = [k for k, v in req.settings.items() if not (k in PREFS if v is None else valid_pref(k, v))]
+        if bad:
+            return JSONResponse({"detail": "unknown setting or value", "names": sorted(bad)}, status_code=422)
+        return JSONResponse({"settings": settings.update(req.settings)})
+
+    @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     def unknown_api(rest: str) -> Response:
         return JSONResponse({"detail": "not found"}, status_code=404)
 
-    index = static_dir / "index.html"
+    def index(request: Request) -> Response:
+        if token is not None and TOKEN_PARAM in request.query_params:
+            # 起動したときにブラウザへ渡した URL: 合言葉をクッキーにして、合言葉の無い URL へ移す
+            response = RedirectResponse("/", status_code=303)
+            if token_ok(request.query_params[TOKEN_PARAM], token):
+                response.set_cookie(COOKIE, token, max_age=COOKIE_MAX_AGE, path="/", httponly=True,
+                                    samesite="strict")
+            return response
+        page = (static_dir / "index.html").read_text(encoding="utf-8")
+        if token_ok(request.cookies.get(COOKIE), token):
+            page = page_with_prefs(page, settings.read())
+        return Response(page, media_type=MEDIA_TYPES[".html"])
 
-    @app.get("/", include_in_schema=False)
-    def root() -> Response:
-        return FileResponse(index, media_type="text/html")
+    @app.api_route("/{rest:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    def static(request: Request) -> Response:
+        path = request.scope["path"]
+        if path in ("/", "/index.html"):
+            return index(request)
+        found = static_file(path, static_root)
+        if found is None or not os.path.isfile(found):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        media = MEDIA_TYPES.get(os.path.splitext(found)[1].lower(), "application/octet-stream")
+        return FileResponse(found, media_type=media)
 
-    if static_dir.is_dir():
-        app.mount("/", StaticFiles(directory=static_dir), name="static")
     return app

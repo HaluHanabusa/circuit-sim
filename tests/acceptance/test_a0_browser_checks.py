@@ -147,10 +147,6 @@ def open_file(page, name: str, data: bytes) -> None:
 # ------------------------------------------------------------ AC-1-1: 長いファイル名
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(基準不適合 AC-1-1): ファイル名を 40 文字で中ほど省略してから、さらに幅 320 で"
-    "末尾を CSS で切るので、31 文字（英語）・37 文字（日本語）以上の名前で拡張子とテンプレート名が欠ける"
-    "（例: buck_converter_rev12_final.json）"))
 @pytest.mark.parametrize("lang", ["ja", "en"])
 def test_long_file_name_keeps_extension_and_template_name(page_of, lang):
     page = page_of(lang=lang)
@@ -171,9 +167,6 @@ def test_long_file_name_keeps_extension_and_template_name(page_of, lang):
 # ------------------------------------------------------------ AC-2-6 と 3.2: サンプルの説明
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(軽微、AC-2-6・design-system 4.2): 辞書の sample.rlc.desc の数値と単位の間が普通の空白"
-    "（U+0020）。英語の 1280×720 では説明が2行に折れ、「1.59」と「kHz」が別の行に分かれる"))
 @pytest.mark.parametrize("lang", ["ja", "en"])
 def test_sample_description_keeps_number_with_unit(page_of, lang):
     """数値と単位の間は改行されない空白（U+00A0）で、画面でも同じ行にある。"""
@@ -199,9 +192,6 @@ def test_sample_description_keeps_number_with_unit(page_of, lang):
 # ------------------------------------------------------------ 3.4 と AC-1-5: フォーカス
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(軽微、3.4・AC-1-5): サンプルの行を Enter で開くと、行が消えてフォーカスが body に落ちる"
-    "（3.4 は「開いた後、フォーカスが実行にある」）"))
 def test_focus_is_on_run_after_opening_a_sample_with_the_keyboard(page_of):
     page = page_of()
     page.get_by_test_id("sample-rlc_series").focus()
@@ -211,8 +201,6 @@ def test_focus_is_on_run_after_opening_a_sample_with_the_keyboard(page_of):
     assert page.evaluate("document.activeElement.getAttribute('data-testid')") == "run-button"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(軽微、AC-1-5): お知らせの行で Delete を押して閉じると、フォーカスが body に落ちる"))
 def test_focus_stays_visible_after_dismissing_a_notice(page_of):
     page = page_of()
     page.get_by_test_id("sample-rlc_series").click()

@@ -201,11 +201,6 @@ def fastapi_floor() -> tuple[int, ...]:
     return (0,)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(重大): 別サイトの POST を防いでいるのは、入っている FastAPI（0.132.0 以降）の"
-    "既定の動きだけ。pyproject は fastapi>=0.115 を許し、0.115〜0.131 では Content-Type の無い"
-    "no-cors の POST で開いている仕様が差し替わる（0.115.0 と実際の Chrome で再現。A0-verifier.md）。"
-    "サーバーが Origin / Sec-Fetch-Site を見ていない"))
 def test_cross_site_protection_does_not_depend_on_the_installed_fastapi(server):
     """下限の版の FastAPI でも守られること: 下限が 0.132.0 以上か、サーバー自身が別サイトの Origin を拒む。"""
     base, port = server

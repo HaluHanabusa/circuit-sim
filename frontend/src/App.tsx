@@ -1,7 +1,7 @@
 // 作業画面の全体（画面仕様 1章）。つながっているかの確かめ（D8）、開く処理の入口、ドロップ、ショートカット、
 // お知らせ、言語とテーマを持つ。
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Doc, type SampleInfo } from "./api";
+import { api, Unauthorized, type Doc, type SampleInfo } from "./api";
 import { Header } from "./components/Header";
 import { Frame } from "./components/Frame";
 import { Icon } from "./components/Icon";
@@ -11,14 +11,24 @@ import { I18nProvider, translate, type Lang } from "./i18n";
 import { clockTime, entry, whatKey, type Notice, type NoticeData } from "./notices";
 import { openSample, readSpecFile, type OpenResult } from "./open";
 import { hasModifier } from "./platform";
-import { applyLang, applyTheme, initialLang, initialTheme, readFlag, writePref, type Theme } from "./prefs";
+import {
+  applyLang,
+  applyTheme,
+  flushPrefs,
+  initialLang,
+  initialTheme,
+  readFlag,
+  writePref,
+  type Theme,
+} from "./prefs";
 
 /** 2秒ごとに確かめる。応答が無いとみなすまで 2秒（api.HEALTH_TIMEOUT_MS）。切断に 5秒以内に気づく（D8） */
 export const HEALTH_INTERVAL_MS = 2000;
 /** 待ちの表示は、始まってから 200 ms たってから出す（design-system 9章） */
 export const WAIT_SHOW_MS = 200;
 
-type Conn = "connecting" | "connected" | "disconnected";
+/** unauthorized: アプリ本体は動いているが、このページは合言葉のクッキーを持っていない（D-051） */
+type Conn = "connecting" | "connected" | "disconnected" | "unauthorized";
 
 export function App() {
   const [lang, setLang] = useState<Lang>(initialLang);
@@ -32,7 +42,10 @@ export function App() {
   const [openError, setOpenError] = useState<{ notice: NoticeData; file?: string } | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
   const [notices, setNotices] = useState<Notice[]>([]);
-  const [noticesOpen, setNoticesOpen] = useState(() => readFlag("layout.noticesOpen"));
+  // 帯の開閉。覚えるのは利用者が押したときだけ（layout.noticesOpen）。0 件のときはたたむ。エラーの出来事では
+  // 自動で開くが、覚えない（9.3、9.4）
+  const [noticesOpen, setNoticesOpen] = useState(false);
+  const [focusRun, setFocusRun] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [announce, setAnnounce] = useState("");
   const instance = useRef<string | null>(null);
@@ -40,10 +53,28 @@ export function App() {
   const nextId = useRef(1);
   const fileInput = useRef<HTMLInputElement>(null);
   const chooseRef = useRef<HTMLButtonElement | null>(null);
+  const runRef = useRef<HTMLButtonElement | null>(null);
+  const noticeCount = useRef(0);
   const connected = conn === "connected";
   docRef.current = doc;
 
-  useEffect(() => writePref("layout.noticesOpen", noticesOpen ? "1" : "0"), [noticesOpen]);
+  useEffect(() => {
+    const before = noticeCount.current;
+    noticeCount.current = notices.length;
+    if (notices.length === 0) setNoticesOpen(false);
+    else if (before === 0) setNoticesOpen((open) => open || readFlag("layout.noticesOpen"));
+  }, [notices.length]);
+
+  const toggleNotices = () => {
+    const next = !noticesOpen;
+    setNoticesOpen(next);
+    writePref("layout.noticesOpen", next ? "1" : "0");
+  };
+
+  // 開けた後は「実行」にフォーカスを置く（3.4、4.3。不足・エラーの行へ置くのは A1）
+  useEffect(() => {
+    if (focusRun) runRef.current?.focus();
+  }, [focusRun]);
 
   const addNotice = useCallback((data: NoticeData) => {
     const e = entry(data.code);
@@ -71,6 +102,7 @@ export function App() {
         const health = await api.health();
         if (stopped) return;
         const before = instance.current;
+        void flushPrefs(); // つながっていない間に変えた好みを、設定ファイルへ
         if (before === null) {
           // 最初につながった: アプリ本体が持っている作業の状態を取り戻す（再読み込みで作業を失わせない。1.3）
           const session = await api.session();
@@ -82,8 +114,8 @@ export function App() {
         }
         instance.current = health.instance;
         if (!stopped) setConn("connected");
-      } catch {
-        if (!stopped) setConn("disconnected");
+      } catch (exc) {
+        if (!stopped) setConn(exc instanceof Unauthorized ? "unauthorized" : "disconnected");
       }
       if (!stopped) timer = window.setTimeout(check, HEALTH_INTERVAL_MS);
     };
@@ -122,6 +154,7 @@ export function App() {
         setDoc(result.doc);
         setOpenError(null);
         setNotices((list) => list.filter((n) => !n.code.startsWith("N-OPEN-") && n.code !== "N-CONN-RESTART"));
+        setFocusRun((n) => n + 1);
         return;
       }
       if (docRef.current) addNotice(result.notice);
@@ -262,6 +295,7 @@ export function App() {
           onSample={openSampleById}
           onSave={() => undefined}
           onRun={() => undefined}
+          runRef={runRef}
           onLang={changeLang}
           onTheme={changeTheme}
         />
@@ -269,14 +303,26 @@ export function App() {
           <main className="connecting" data-testid="connecting">
             {slowConnect && <p>{t("app.connecting")}</p>}
           </main>
+        ) : conn === "unauthorized" ? (
+          <main className="connecting" data-testid="unauthorized">
+            <p className="state-word state-error" role="alert">
+              <Icon name="error" />
+              {t("app.unauthorized")}
+            </p>
+          </main>
         ) : doc ? (
           <>
             <Frame doc={doc} connected={connected} onRun={() => undefined} />
             <NoticeBar
               notices={notices}
               open={noticesOpen}
-              onToggle={() => setNoticesOpen((v) => !v)}
-              onDismiss={(id) => setNotices((list) => list.filter((n) => n.id !== id))}
+              onToggle={toggleNotices}
+              onDismiss={(id) => {
+                // 最後の1件を閉じたら、同じ描画で帯をたたむ（0 件の帯を一瞬でも開いて見せない。9.3）
+                const remaining = notices.filter((n) => n.id !== id);
+                setNotices(remaining);
+                if (remaining.length === 0) setNoticesOpen(false);
+              }}
             />
           </>
         ) : (

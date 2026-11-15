@@ -20,6 +20,7 @@ export function NoticeBar({ notices, open, onToggle, onDismiss }: Props) {
   const { t } = useI18n();
   const sorted = sortNotices(notices);
   const rows = useRef<(HTMLDivElement | null)[]>([]);
+  const toggle = useRef<HTMLButtonElement>(null);
   const [details, setDetails] = useState<Set<number>>(new Set());
   const counts = Object.fromEntries(LEVELS.map((l) => [l, notices.filter((n) => entry(n.code).level === l).length]));
   const top = sorted[0];
@@ -29,10 +30,21 @@ export function NoticeBar({ notices, open, onToggle, onDismiss }: Props) {
     if (n) rows.current[Math.max(0, Math.min(n - 1, index))]?.focus();
   };
 
+  // 閉じた後のフォーカス: 次の行、無ければ前の行、1件も残らなければ帯の見出し（AC-1-5。body に落とさない）
+  const dismiss = (id: number, index: number) => {
+    const remaining = sorted.length - 1;
+    onDismiss(id);
+    requestAnimationFrame(() => {
+      if (remaining > 0) rows.current[Math.min(index, remaining - 1)]?.focus();
+      else toggle.current?.focus();
+    });
+  };
+
   return (
     <section className={`notices${open ? " is-open" : ""}`} aria-label={t("notice.title")} data-testid="notices">
       <div className="notices-head">
         <button
+          ref={toggle}
           type="button"
           className="notices-toggle"
           aria-expanded={open}
@@ -95,8 +107,7 @@ export function NoticeBar({ notices, open, onToggle, onDismiss }: Props) {
                     focusRow(index - 1);
                   } else if (ev.key === "Delete" && e.dismissible) {
                     ev.preventDefault();
-                    onDismiss(n.id);
-                    requestAnimationFrame(() => focusRow(index));
+                    dismiss(n.id, index);
                   }
                 }}
               >
@@ -154,7 +165,7 @@ export function NoticeBar({ notices, open, onToggle, onDismiss }: Props) {
                         type="button"
                         className="btn btn-tool btn-icon"
                         aria-label={t("notice.dismiss")}
-                        onClick={() => onDismiss(n.id)}
+                        onClick={() => dismiss(n.id, index)}
                         data-testid="notice-dismiss"
                       >
                         <Icon name="close" />

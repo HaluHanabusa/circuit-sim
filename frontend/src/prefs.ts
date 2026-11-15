@@ -1,9 +1,27 @@
-// 画面の好み（言語、テーマ、仕切りの位置、たたんだ状態）だけを、ブラウザに覚えさせる（app-design 6章）。
-// 名前は boot.js と同じ（最初の描画の前に、言語とテーマを当てるため）。
+// 画面の好み（言語、テーマ、仕切りの位置、たたんだ状態、お知らせの帯の開閉）を覚える（app-design 6章）。
+// ブラウザ（localStorage）と、アプリ本体の設定ファイル（/api/settings）の両方に書く。ブラウザの保存はポートごとに
+// 分かれるので、ポートが変わっても次の起動で戻るように、設定ファイルにも書く（D-050）。
+// 名前は boot.js と同じ。boot.js が、最初の描画の前に設定ファイルの値をブラウザの保存へ写す。
+import { api } from "./api";
 import type { Lang } from "./i18n";
 
 export type Theme = "light" | "dark";
 const PREFIX = "circuit-sim.";
+/** 設定ファイルにも書く名前（アプリ本体の config.py の PREFS と同じ） */
+export const SERVER_PREFS = new Set([
+  "lang",
+  "theme",
+  "layout.specWidth",
+  "layout.schemHeight",
+  "layout.specCollapsed",
+  "layout.schemCollapsed",
+  "layout.noticesOpen",
+]);
+/** 続けて変わる値（仕切りのドラッグ）をまとめて送るまでの時間 */
+export const SAVE_DELAY_MS = 300;
+
+const pending = new Map<string, string>();
+let timer: number | undefined;
 
 export function readPref(name: string): string | null {
   try {
@@ -14,10 +32,29 @@ export function readPref(name: string): string | null {
 }
 
 export function writePref(name: string, value: string): void {
+  let same = false;
   try {
+    same = window.localStorage.getItem(PREFIX + name) === value;
     window.localStorage.setItem(PREFIX + name, value);
   } catch {
-    // 保存できない設定のブラウザでは、覚えないだけ（画面は動く）
+    // 保存できない設定のブラウザでも、設定ファイルには書く（画面は動く）
+  }
+  if (SERVER_PREFS.has(name) && !same) {
+    pending.set(name, value);
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => void flushPrefs(), SAVE_DELAY_MS);
+  }
+}
+
+/** まだ設定ファイルに書けていない好みを送る。つながっていなければ、次の機会（再接続）まで持っておく。 */
+export async function flushPrefs(): Promise<void> {
+  if (pending.size === 0) return;
+  const batch = Object.fromEntries(pending);
+  pending.clear();
+  try {
+    await api.putSettings(batch);
+  } catch {
+    for (const [name, value] of Object.entries(batch)) if (!pending.has(name)) pending.set(name, value);
   }
 }
 

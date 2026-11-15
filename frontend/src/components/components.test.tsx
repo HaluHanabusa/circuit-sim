@@ -1,8 +1,10 @@
 // 部品の試験（数値の入力欄 AC-2-4・AC-2-7、切り替え 6.2、お知らせ 9章、辞書の引き方 10.3）。
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { I18nProvider, translate, type Lang } from "../i18n";
 import type { Notice } from "../notices";
+import { ELLIPSIS, fitMiddle } from "./Header";
 import { NumberField } from "./NumberField";
 import { NoticeBar } from "./NoticeBar";
 import { Toggle } from "./Toggle";
@@ -165,6 +167,76 @@ describe("お知らせ（9章）", () => {
       </I18nProvider>,
     );
     expect(screen.getAllByTestId("notice-row")[0].textContent).toContain("a.json isn't valid JSON (line 3, column 5).");
+  });
+});
+
+describe("お知らせを閉じた後のフォーカス（AC-1-5）", () => {
+  function Bar({ initial }: { initial: Notice[] }) {
+    const [list, setList] = useState(initial);
+    return (
+      <NoticeBar
+        notices={list}
+        open
+        onToggle={() => undefined}
+        onDismiss={(id) => setList((l) => l.filter((n) => n.id !== id))}
+      />
+    );
+  }
+  const three: Notice[] = [1, 2, 3].map((id) => ({
+    id,
+    code: "N-OPEN-SYNTAX",
+    params: { file: `${id}.json`, line: 1, col: 1 },
+    time: "10:00:00",
+  }));
+  const frame = () => act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+
+  it("次の行、無ければ前の行、1件も残らなければ帯の見出しに置く（body に落とさない）", async () => {
+    wrap(<Bar initial={three} />);
+    // 並びは新しい順: 3, 2, 1
+    let rows = screen.getAllByTestId("notice-row");
+    act(() => rows[0].focus());
+    fireEvent.keyDown(rows[0], { key: "Delete" });
+    await frame();
+    rows = screen.getAllByTestId("notice-row");
+    expect(document.activeElement).toBe(rows[0]);
+    expect(rows[0].textContent).toContain("2.json");
+    act(() => rows[1].focus());
+    fireEvent.keyDown(rows[1], { key: "Delete" });
+    await frame();
+    rows = screen.getAllByTestId("notice-row");
+    expect(document.activeElement).toBe(rows[0]);
+    fireEvent.click(screen.getByTestId("notice-dismiss"));
+    await frame();
+    expect(screen.queryAllByTestId("notice-row")).toHaveLength(0);
+    expect(document.activeElement).toBe(screen.getByTestId("notices-toggle"));
+  });
+});
+
+describe("ファイル名の中ほどの省略（AC-1-1、design-system 4.2）", () => {
+  // 1 文字 = 幅 1 として、幅 budget に収まるか
+  const within = (budget: number) => (text: string) => [...text].length <= budget;
+
+  it("収まるときは省略しない", () => {
+    expect(fitMiddle("rlc_series.json", within(40))).toBe("rlc_series.json");
+  });
+  it("収まらないときは中ほどを省略し、拡張子を必ず残す。前後を同じくらい残す", () => {
+    const name = "buck_converter_rev12_final.json";
+    const fitted = fitMiddle(name, within(20));
+    expect([...fitted].length).toBe(20);
+    expect(fitted.endsWith(".json")).toBe(true);
+    expect(fitted).toContain(ELLIPSIS);
+    expect(fitted.startsWith("buck_co")).toBe(true);
+    expect(fitted).toBe("buck_co" + ELLIPSIS + "2_final.json");
+  });
+  it("とても狭くても「…」と拡張子は残す。日本語の名前も文字の途中で切らない", () => {
+    expect(fitMiddle("buck_converter_rev12_final.json", within(3))).toBe(`${ELLIPSIS}.json`);
+    const jp = "降圧コンバータ_試作3回目_最終確認.json";
+    const fitted = fitMiddle(jp, within(12));
+    expect(fitted).toBe("降圧コ" + ELLIPSIS + "終確認.json");
+  });
+  it("拡張子の無い名前（長すぎる「拡張子」は拡張子とみなさない）", () => {
+    expect(fitMiddle("abcdefghijklmnopqrstuvwxyz", within(9))).toBe("abcd" + ELLIPSIS + "wxyz");
+    expect(fitMiddle("a.verylongsuffix", within(8))).toBe("a.ve" + ELLIPSIS + "fix");
   });
 });
 

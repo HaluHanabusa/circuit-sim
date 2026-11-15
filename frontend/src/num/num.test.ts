@@ -11,6 +11,7 @@ import {
   formatQuantity,
   formatRatio,
 } from "./format";
+import { bigChange, ratioLine } from "./interpret";
 import { parseQuantity, type FieldSpec } from "./parse";
 
 const H: FieldSpec = { unit: "H", positive: true };
@@ -178,3 +179,53 @@ describe("表示した値を貼り付けると同じ値に戻る（AC-2-3）", (
     }
   });
 });
+
+describe("倍率の注意（2.2、AC-2-7）: 比を丸めで判定しない", () => {
+  // E12 の値を 3 桁（1〜820）。ちょうど 10 のべきの 1、10、100 は除く（2 進でも誤差が出ないので）→ 33 個
+  const E12 = [1.0, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2];
+  const mantissas = [1, 10, 100]
+    .flatMap((decade) => E12.map((m) => String(Number((m * decade).toPrecision(3)))))
+    .filter((m) => !["1", "10", "100"].includes(m));
+  // 主な取り違え（開いたときの接頭辞 → 打った接頭辞）9 通り: µ↔m、n↔µ、p↔n、なし↔k と、ミリのつもりの M
+  const MIXUPS: [string, string][] = [
+    ["u", "m"], ["m", "u"], ["n", "u"], ["u", "n"], ["p", "n"], ["n", "p"], ["", "k"], ["k", ""], ["m", "M"],
+  ];
+  const cases = mantissas.flatMap((m) => MIXUPS.map(([from, to]) => [m, from, to] as const));
+
+  it("E12 の値と主な取り違えの 297 通りで、すべて注意が出る", () => {
+    expect(mantissas).toHaveLength(33);
+    expect(cases).toHaveLength(297);
+    const missed = cases.filter(([m, from, to]) => !ratioLine(value(`${m}${to}`), value(`${m}${from}`)));
+    expect(missed).toEqual([]);
+  });
+
+  it("上がったか下がったかと、倍率の値（ちょうどの倍率に ≈ は付かない）", () => {
+    for (const [m, from, to] of cases) {
+      const line = ratioLine(value(`${m}${to}`), value(`${m}${from}`))!;
+      const up = PREFIXES[to] > PREFIXES[from];
+      expect(line.key).toBe(up ? "num.interp.ratio.up" : "num.interp.ratio.down");
+      expect(line.params.ratio).toBe(Math.abs(PREFIXES[to] - PREFIXES[from]) === 9 ? "1,000,000,000" : "1,000");
+    }
+  });
+
+  it("999 倍と 1/999 には出ない。1000 倍ちょうどと 1/1000 ちょうどには出る", () => {
+    expect(ratioLine(999, 1)).toBeUndefined();
+    expect(ratioLine(1, 999)).toBeUndefined();
+    expect(ratioLine(999.9, 1)).toBeUndefined();
+    expect(ratioLine(1000, 1)?.params.ratio).toBe("1,000");
+    expect(ratioLine(1, 1000)?.params.ratio).toBe("1,000");
+    expect(bigChange(4.7e-3, 4.7e-6)?.dir).toBe("up");
+  });
+
+  it("丸めたときだけ ≈ を付ける（1234 倍は ≈1,230、ちょうど 1000 倍は 1,000）", () => {
+    expect(formatRatio(1234)).toBe("≈1,230");
+    expect(formatRatio(1000)).toBe("1,000");
+    expect(formatRatio(1e6)).toBe("1,000,000");
+    expect(formatRatio(1500)).toBe("1,500");
+    expect(formatRatio(999.9999999999999, 1e-9)).toBe("1,000");
+    expect(ratioLine(1234, 1)?.params.ratio).toBe("≈1,230");
+    expect(ratioLine(1, 1234)?.params.ratio).toBe("≈1,230");
+  });
+});
+
+const PREFIXES: Record<string, number> = { p: -12, n: -9, u: -6, m: -3, "": 0, k: 3, M: 6 };

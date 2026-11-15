@@ -9,12 +9,15 @@
   2. 付録Bのお知らせの表（「番号」「何が起きたか（日 / 英）」「どう直すか（日 / 英）」の列）。
      キーは notice.<番号>.what と notice.<番号>.fix。日と英は「 / 」で分ける。
 表の中の `…`（コードの書式）は、記号を外して文字だけにする。
+数値と単位の間の空白は、改行されない空白（U+00A0）にする（design-system 4.2、AC-2-6。表には見えない文字を
+書かせない）。
 画面仕様の付録Aの表示名など、表の外にある文言は EXTRA に持つ（出どころを書いておく）。
 標準ライブラリだけで動く。
 """
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -27,7 +30,24 @@ EXTRA = {
     # 付録A.2、A.3 の「表示名」（ヘッダーの②に出すテンプレートの表示名。1.2）
     "template.rc_lowpass.name": ("RCローパス", "RC low-pass"),
     "template.rlc_series.name": ("直列RLC", "Series RLC"),
+    # A0 の直し（D-051）: 合言葉のクッキーが無いページ（アプリ本体が 401 を返す）の案内。
+    # 画面仕様の 1.3 の表への追記は ux-designer に依頼した（入ったら、ここから外す）
+    "app.unauthorized": (
+        "このページからはアプリ本体を使えません。"
+        "circuit-sim を起動したターミナルに出ている URL から開き直してください。",
+        "This page can't use the app. Open it again from the URL shown in the terminal where circuit-sim "
+        "is running.",
+    ),
 }
+
+# 数値の後ろの空白で、その後ろが単位（接頭辞を含む）のもの。単位の後ろに英字が続くもの（8 signals）は除く
+UNIT_SPACE = re.compile(r"(?<=\d) (?=[fpnµμumkMG]?(?:Hz|V|A|H|F|s|Ω|B|W)(?![A-Za-z]))")
+NBSP = "\u00a0"
+
+
+def keep_with_unit(text: str) -> str:
+    """数値と単位の間の空白を、改行されない空白にする（47 µH、1.59 kHz、10 MB、0.12 s）。"""
+    return UNIT_SPACE.sub(NBSP, text)
 
 # 付録Bで、どう直すかが別の文言を指しているもの。
 #   N-INVALID: 2.3 の該当する文言（num.err.*）か spec.sim.err.order を、差し込む値で選ぶ（辞書には持たない）
@@ -85,7 +105,7 @@ def parse(markdown: str) -> dict[str, tuple[str, str]]:
         notices[f"notice.{code}.fix"] = notices[f"notice.{same}.fix"]
     for key, pair in {**notices, **EXTRA}.items():
         add(key, *pair)
-    return found
+    return {key: (keep_with_unit(ja), keep_with_unit(en)) for key, (ja, en) in found.items()}
 
 
 def dictionaries(markdown: str) -> tuple[dict[str, str], dict[str, str]]:

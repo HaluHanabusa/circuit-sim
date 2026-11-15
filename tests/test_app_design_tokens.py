@@ -88,15 +88,10 @@ def contrast(a: str, b: str) -> float:
     return ratio_of(linear(a), linear(b))
 
 
-def encode(c: float) -> float:
-    return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
-
-
 def simulate(rgb: tuple, matrix) -> tuple[float, float, float]:
-    """色覚の型の見え方。線形 RGB に行列を掛け、0〜1 に収め、8 ビットの sRGB の色に丸める（3.2 の表の値は、
-    変換した色を 8 ビットの色として扱った値。丸めないと、暗の「赤」の1型が 2.99 になる）。"""
-    mixed = (min(1.0, max(0.0, sum(m * c for m, c in zip(row, rgb, strict=True)))) for row in matrix)
-    return linear("#" + "".join(f"{round(encode(c) * 255):02x}" for c in mixed))
+    """色覚の型の見え方。線形 RGB に行列を掛け、0〜1 に収める。8 ビットの色には丸めない（3.2。丸めるかどうかで
+    合否が変わらないように。丸めると、前の暗の「赤」#f52311 の1型は 3.01、丸めないと 2.988 だった）。"""
+    return tuple(min(1.0, max(0.0, sum(m * c for m, c in zip(row, rgb, strict=True)))) for row in matrix)
 
 
 def oklab(rgb: tuple) -> tuple[float, float, float]:
@@ -173,8 +168,8 @@ def test_wave_colors_are_distinguishable(theme):
         worst_d = min(worst_d, distance(a, b))
     assert worst_c >= 8, f"c: {worst_c:.1f}"
     assert worst_d >= 15, f"d: {worst_d:.1f}"
-    # 3.2 の表の最小値（1〜8番、28組）とほぼ一致する（色覚の変換の細かな違いで、暗の c は 10.4 になる）
-    documented = {"light": (8.3, 16.4), "dark": (10.5, 18.5)}[theme]
+    # 3.2 の表の最小値（1〜8番、28組）と一致する（表は小数1桁）
+    documented = {"light": (8.3, 16.4), "dark": (10.5, 18.4)}[theme]
     assert abs(worst_c - documented[0]) <= 0.15 and abs(worst_d - documented[1]) <= 0.15, (worst_c, worst_d)
 
 

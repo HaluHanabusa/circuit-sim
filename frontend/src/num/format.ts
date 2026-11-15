@@ -149,10 +149,17 @@ export function formatElapsed(seconds: number): string {
   return `${body}${NBSP}s`;
 }
 
-/** 倍率（変更前の {ratio} 倍）。有効数字3桁に丸め、桁区切りを付ける。 */
-export function formatRatio(ratio: number): string {
+export const APPROX = "≈";
+
+/**
+ * 倍率（変更前の {ratio} 倍）。有効数字3桁に丸め、桁区切りを付ける。丸めたときだけ前に ≈ を付ける
+ * （1234 → ≈1,230、ちょうど 1000 → 1,000。画面仕様 2.2）。tolerance は、2 進の計算の誤差を「ちょうど」と
+ * みなす相対の幅（999.9999999999999 は 1,000 で、≈ を付けない）。
+ */
+export function formatRatio(ratio: number, tolerance = 0): string {
   if (!Number.isFinite(ratio)) return DASH;
   const d = decimalOf(ratio, 3);
-  if (d.exponent >= 2) return formatCount(Number(`${d.digits[0]}.${d.digits.slice(1)}e${d.exponent}`));
-  return placePoint(trimZeros(d.digits), d.exponent + 1);
+  const shown = Number(`${d.digits[0]}.${d.digits.slice(1)}e${d.exponent}`);
+  const body = d.exponent >= 2 ? formatCount(shown) : placePoint(trimZeros(d.digits), d.exponent + 1);
+  return Math.abs(shown - ratio) > tolerance * Math.abs(ratio) ? APPROX + body : body;
 }

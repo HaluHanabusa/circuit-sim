@@ -118,7 +118,7 @@ export function Frame({ doc, connected, onRun }: Props) {
         {!schemCollapsed && (
           <Splitter
             orientation="horizontal"
-            label={t("layout.resize")}
+            label={t("layout.resize.height")}
             value={height}
             min={SCHEMATIC_HEIGHT.min}
             max={schemMax}

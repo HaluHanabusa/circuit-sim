@@ -68,7 +68,8 @@ code,
   height: 16px;
 }
 
-/* 区切りの点（日本語は「・」、英語は「·」。辞書の文言の区切りと同じ） */
+/* 区切りの点（日本語は「・」、英語は「·」。辞書の文言の区切りと同じ）。前後の空きは両言語とも 4px
+   （お知らせの件数の区切りと同じ。「・」は字の幅の中に空きを持つが、日本語でも詰めない） */
 .sep::before {
   content: "\00b7";
   padding: 0 var(--space-1);
@@ -76,7 +77,6 @@ code,
 }
 :lang(ja) .sep::before {
   content: "\30fb";
-  padding: 0;
 }
 
 /* ------------------------------------------------------------ 全体の枠（1.2） */
@@ -242,10 +242,12 @@ code,
 
 /* ------------------------------------------------------------ ツールチップ（6.7） */
 
+/* ヘッダーの中に置いても折り返す（ヘッダーの nowrap を受け継ぐと、文字が地の外にはみ出す） */
 .tooltip {
   position: fixed;
   z-index: 50;
   max-width: 280px;
+  white-space: normal;
   padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-control);
   background: var(--bg-inverse);
@@ -320,17 +322,30 @@ code,
   min-width: 0;
   overflow: hidden;
 }
+/* 名前は幅で中ほどを省略する（Header.tsx の fitMiddle）。CSS では切らない（二重に省略しない。拡張子を残す） */
+.header-file-name-box {
+  flex: 0 1 auto;
+  display: inline-flex;
+  min-width: 0;
+}
 .header-file-name {
   font-family: var(--font-mono);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: pre;
+}
+/* 名前の幅を測るための、見えない部品（測り終えたら中を空にする） */
+.header-file-probe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 .header-file-none {
   color: var(--text-secondary);
 }
+/* テンプレートの表示名・サンプル名は省略しない */
 .header-file-template {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: none;
 }
 .header-group {
   flex: none;
@@ -412,16 +427,26 @@ code,
   font-weight: 600;
   margin-bottom: var(--space-1);
 }
+/* 名前の列は、いちばん長い名前の幅に合わせる（固定の幅にしない。説明が1行に収まるように。3.2） */
 .sample-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--space-4);
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-raised);
   overflow: hidden;
 }
+.sample-list [role="listitem"] {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+}
 .sample-row {
-  display: flex;
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
-  gap: var(--space-4);
   width: 100%;
   min-height: 44px;
   padding: 0 var(--space-4);
@@ -441,8 +466,6 @@ code,
   outline-offset: -2px;
 }
 .sample-name {
-  flex: none;
-  width: 160px;
   font-weight: 600;
 }
 .sample-desc {

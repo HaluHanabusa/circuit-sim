@@ -4,9 +4,11 @@ Python の playwright と Chromium 系のブラウザ（Chrome、Edge、playwrig
 無ければ、確かめなかったことをスキップの理由として結果に残す。ブラウザは CIRCUIT_SIM_CHROME で指定できる。
 CIRCUIT_SIM_SHOTS にフォルダを指定すると、確かめた画面の画像をそこに残す（作業ツリーの外に置く）。
 アプリ本体は別のプロセス（python -m circuit_sim.app）で起動し、止めたり起動し直したりする。
+設定の場所はモジュールごとの一時フォルダ。画面は、起動したときの URL（合言葉つき）から開く（D-051）。
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -16,6 +18,9 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+
+from circuit_sim.app.config import PREFS, load_token
+from circuit_sim.app.server import COOKIE
 
 ROOT = Path(__file__).resolve().parents[1]
 SHOTS = os.environ.get("CIRCUIT_SIM_SHOTS")
@@ -43,22 +48,27 @@ def free_port() -> int:
 
 
 class App:
-    """アプリ本体のプロセス。止めて、同じ番号で起動し直せる。"""
+    """アプリ本体のプロセス。止めて、同じポートで起動し直せる。設定の場所（合言葉、画面の好み）は config。"""
 
-    def __init__(self) -> None:
-        self.port = free_port()
+    def __init__(self, config: Path, port: int | None = None) -> None:
+        self.config = config
+        self.port = port or free_port()
         self.url = f"http://127.0.0.1:{self.port}/"
+        self.token = load_token(config)  # アプリ本体と同じ合言葉（同じ設定の場所から読む）
+        self.login_url = f"{self.url}?k={self.token}"
         self.proc: subprocess.Popen | None = None
 
     def start(self) -> None:
+        env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(self.config)}
+        env.pop("CIRCUIT_SIM_TEST_ONLY_NO_TOKEN", None)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
-            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         )
         deadline = time.monotonic() + 15
         while True:
             try:
-                urllib.request.urlopen(self.url + "api/health", timeout=1).close()
+                self.api("api/health")
                 return
             except OSError:
                 assert time.monotonic() < deadline, "アプリ本体が起動しない"
@@ -69,17 +79,22 @@ class App:
             self.proc.kill()
             self.proc.wait(timeout=10)
 
+    def api(self, path: str, body: dict | None = None, method: str = "GET") -> dict:
+        data = None if body is None else json.dumps(body).encode()
+        headers = {"Content-Type": "application/json", "Cookie": f"{COOKIE}={self.token}"}
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
     def reset(self) -> None:
-        req = urllib.request.Request(
-            self.url + "api/session", data=b'{"doc": null, "dirty": false}', method="PUT",
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=5).close()
+        """開いている仕様と、設定ファイルの画面の好みを消す（試験の間で持ち越さない）。"""
+        self.api("api/session", {"doc": None, "dirty": False}, "PUT")
+        self.api("api/settings", {"settings": dict.fromkeys(PREFS)}, "PUT")
 
 
 @pytest.fixture(scope="module")
-def app():
-    running = App()
+def app(tmp_path_factory):
+    running = App(tmp_path_factory.mktemp("app-config"))
     running.start()
     yield running
     running.stop()
@@ -128,8 +143,10 @@ class Page:
             self.external.append(request.url)
 
     def open(self, wait: str = "[data-testid=start]"):
-        self.page.goto(self.app.url)
+        """起動したときの URL（合言葉つき）から開く。画面は合言葉の無い URL へ移る。"""
+        self.page.goto(self.app.login_url)
         self.page.wait_for_selector(wait)
+        assert self.page.url == self.app.url, "合言葉の無い URL へ移っていない"
         return self.page
 
     def shot(self, name: str) -> None:
@@ -190,7 +207,7 @@ def test_start_screen_appears_within_one_second(browser, app):
     started = time.monotonic()
     page = p.open()
     assert time.monotonic() - started < 1.0
-    page.wait_for_function("document.activeElement?.dataset.testid === 'choose-file'")
+    wait_focus(page, "choose-file")
     assert page.inner_text("[data-testid=run-status]") == "仕様を開いてください"
     assert page.get_attribute("[data-testid=run-button]", "aria-disabled") == "true"
     assert page.get_attribute("[data-testid=header-save]", "aria-disabled") == "true"
@@ -257,7 +274,7 @@ def test_connecting_state(browser, app):
         route.continue_()
 
     page.route("**/api/health", slow)
-    page.goto(app.url)
+    page.goto(app.login_url)
     page.wait_for_selector("text=アプリ本体に接続しています…")
     p.shot("connecting-ja-light")
     page.wait_for_selector("[data-testid=start]")
@@ -341,7 +358,11 @@ def test_notices_keyboard_and_language_switch(browser, app, tmp_path):
     page.keyboard.press("Tab")
     assert page.evaluate("document.activeElement.dataset.testid") == "notice-row"
     page.keyboard.press("Delete")
-    page.wait_for_function("!document.querySelector('[data-testid=notice-row]')")
+    page.wait_for_function("() => !document.querySelector('[data-testid=notice-row]')")
+    # 最後の1件を閉じたら、フォーカスは帯の見出しへ（body に落とさない。AC-1-5）。0 件なので帯はたたむ（9.3）
+    wait_focus(page, "notices-toggle")
+    assert page.get_attribute("[data-testid=notices-toggle]", "aria-expanded") == "false"
+    assert page.query_selector("[data-testid=notices-list]") is None
 
     # 再読み込みしても、言語とテーマと開いている仕様が戻る（AC-10-5、1.3）
     page.reload()
@@ -417,7 +438,286 @@ def test_disconnect_banner_and_restart(browser, app):
     assert time.monotonic() - started < 5
     assert "rlc_series.json" in page.inner_text("[data-testid=header-file]")
     page.wait_for_selector("[data-testid=notices] >> text=注意 1")
-    session = urllib.request.urlopen(app.url + "api/session", timeout=5).read().decode()
+    session = json.dumps(app.api("api/session"))
     assert "rlc_series.json" in session, "起動し直したアプリ本体に、仕様が送り直されていない"
     p.shot("frame-reconnected-ja-light")
+    p.close()
+
+
+# ------------------------------------------------------------------ フォーカス（3.4、4.3、AC-1-5）
+
+
+def wait_focus(page, testid: str) -> None:
+    """フォーカスが testid の部品に来るまで待つ。
+
+    関数の形で渡す（文字列の式は、CSP の unsafe-eval に掛かる）。"""
+    page.wait_for_function("(id) => document.activeElement?.dataset?.testid === id", arg=testid)
+
+
+def test_focus_moves_to_run_after_opening_with_keyboard_or_menu(browser, app):
+    """サンプルを Enter で開いても、ヘッダーのメニューで開いても、開いた後のフォーカスは「実行」。
+
+    フォーカスの輪が見える。"""
+    p = Page(browser, app)
+    page = p.open()
+    page.focus("[data-testid=sample-rlc_series]")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("[data-testid=frame]")
+    wait_focus(page, "run-button")
+    assert page.evaluate("document.activeElement.matches(':focus-visible')")
+    # キーボードでフォーカスが来たので、実行のツールチップが出る。文字は地の中に収まる（折り返す）
+    page.wait_for_selector("[role=tooltip]:not([hidden])")
+    inside = page.evaluate("""() => { const tip = document.querySelector('[role=tooltip]:not([hidden])');
+        const box = tip.getBoundingClientRect(); const r = document.createRange(); r.selectNodeContents(tip);
+        return [...r.getClientRects()].every((x) => x.right <= box.right + 0.5 && x.left >= box.left - 0.5)
+          && box.right <= innerWidth; }""")
+    assert inside, "ツールチップの文字が地の外にはみ出す"
+    p.shot("kbd-after-open-sample-ja-light")
+    # メニュー: 開いていても、もう一度サンプルを選べる
+    page.focus("[data-testid=header-samples]")
+    page.keyboard.press("ArrowDown")
+    page.wait_for_selector("[role=menuitem]")
+    page.keyboard.press("Enter")
+    wait_focus(page, "run-button")
+    p.close()
+
+
+def test_focus_after_menu_on_start_screen(browser, app):
+    p = Page(browser, app, lang="en")
+    page = p.open("[data-testid=sample-rlc_series]")  # 一覧が届くまで、メニューは使えない
+    page.focus("[data-testid=header-samples]")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("[role=menuitem]")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("[data-testid=frame]")
+    wait_focus(page, "run-button")
+    p.close()
+
+
+def test_focus_after_dismissing_the_last_notice(browser, app, tmp_path):
+    """最後の1件を閉じたら、フォーカスは帯の見出し（body に落とさない）。
+
+    次の行・前の行へ移ることは、部品の試験で確かめる。"""
+    bad = tmp_path / "a.json"
+    bad.write_text("{", encoding="utf-8")
+    p = Page(browser, app)
+    page = p.open()
+    page.click("[data-testid=sample-rlc_series]")
+    page.wait_for_selector("[data-testid=frame]")
+    page.set_input_files("[data-testid=file-input]", str(bad))
+    page.wait_for_selector("[data-testid=notice-row]")
+    page.focus("[data-testid=notice-row]")
+    page.keyboard.press("Delete")
+    wait_focus(page, "notices-toggle")
+    p.close()
+
+
+# ------------------------------------------------------------------ 長いファイル名（AC-1-1）
+
+
+LONG_NAMES = {
+    "en": ["buck_converter_rev12_final.json", "2026-11-15_buck_converter_prototype_rev3_final_check.json"],
+    "ja": ["motor_drive_inverter_rev3_review.json",
+           "降圧コンバータ_試作3回目_最終確認_レビュー用_コピー.json"],
+}
+VIEWS_12 = [(w, h, lang, theme, 1) for (w, h, lang, theme) in COMBOS] + [
+    (1280, 720, lang, theme, 1.5) for lang in ("ja", "en") for theme in ("light", "dark")
+]
+SAMPLE_BYTES = (ROOT / "examples" / "rlc_series.json").read_bytes()
+TEMPLATE_NAME = {"ja": "直列RLC", "en": "Series RLC"}
+
+
+@pytest.mark.parametrize(("width", "height", "lang", "theme", "scale"), VIEWS_12, ids=lambda v: str(v))
+def test_long_file_names_keep_extension_and_template_in_12_views(
+    browser, app, width, height, lang, theme, scale
+):
+    """言語×テーマ×（1280×720、1920×1080、150%）の 12 通りで、長い名前でもヘッダーの②が欠けない。
+
+    名前は幅で中ほどを省略し、拡張子とテンプレート名を必ず残す。CSS では切らない（二重に省略しない）。"""
+    p = Page(browser, app, width, height, lang, theme, scale=scale)
+    page = p.open()
+    for name in LONG_NAMES[lang]:
+        page.set_input_files("[data-testid=file-input]", files=[{"name": name, "mimeType": "application/json",
+                                                                  "buffer": SAMPLE_BYTES}])
+        # ②のツールチップ（省略した全文）が、いま開いた名前になるまで待つ
+        page.wait_for_function(
+            "(name) => document.querySelector("
+            "'[data-testid=header-file-name] + [role=tooltip]')?.textContent === name", arg=name)
+        page.wait_for_timeout(100)
+        m = page.evaluate("""() => {
+            const box = document.querySelector('[data-testid=header-file]').getBoundingClientRect();
+            const nameEl = document.querySelector('[data-testid=header-file-name]');
+            const tmpl = document.querySelector('[data-testid=header-file-template]');
+            const n = nameEl.getBoundingClientRect(), t = tmpl.getBoundingClientRect();
+            return {box: box.width, boxRight: box.right, nameRight: n.right, tmplRight: t.right,
+                    shown: nameEl.textContent, template: tmpl.textContent,
+                    nameCut: nameEl.scrollWidth > nameEl.clientWidth + 0.5,
+                    tmplCut: tmpl.scrollWidth > tmpl.clientWidth + 0.5,
+                    overflowName: getComputedStyle(nameEl).textOverflow};
+        }""")
+        where = f"{name} {width}x{height} {lang} {theme} x{scale}"
+        assert m["shown"].endswith(".json"), f"{where}: 拡張子が残っていない {m['shown']!r}"
+        assert m["template"] == TEMPLATE_NAME[lang], f"{where}: テンプレート名が欠けた {m['template']!r}"
+        assert not m["nameCut"] and not m["tmplCut"], f"{where}: 文字が欠ける"
+        assert m["overflowName"] != "ellipsis", f"{where}: CSS でも省略している（二重の省略）"
+        assert m["box"] <= 320.5, f"{where}: ②が最大幅を超えた {m['box']}"
+        assert m["tmplRight"] <= m["boxRight"] + 0.5 and m["nameRight"] <= m["boxRight"] + 0.5, where
+        if m["shown"] != name:
+            assert "…" in m["shown"], where
+            head, tail = m["shown"].split("…")
+            assert name.startswith(head) and name.endswith(tail), where
+        check_layout(page, where)
+    p.shot(f"longname-{width}x{height}-{lang}-{theme}-x{scale}")
+    p.close()
+
+
+# ------------------------------------------------------------------ 画面の好みがポートをまたいで戻る（D-050）
+
+
+def test_settings_survive_a_port_change_in_the_same_browser_profile(browser, tmp_path):
+    """同じプロファイルのブラウザで、ポートを変えて起動し直しても、言語・テーマ・仕切り・たたみ・帯の開閉が戻る。
+
+    ブラウザの保存はポートごとに分かれるので、設定ファイル（同じ設定の場所）から戻ることを確かめる。"""
+    config = tmp_path / "config"
+    first = App(config)
+    first.start()
+    context = browser.new_context(viewport={"width": 1280, "height": 720}, locale="ja-JP",
+                                  color_scheme="light")
+    try:
+        page = context.new_page()
+        page.goto(first.login_url)
+        page.wait_for_selector("[data-testid=start]")
+        page.click("[data-testid=sample-rlc_series]")
+        page.wait_for_selector("[data-testid=frame]")
+        page.click("[data-testid=toggle-lang] [lang=en]")
+        page.click("[data-testid=toggle-theme] [role=radio] >> nth=1")
+        page.focus("[data-testid=splitter-spec]")
+        page.keyboard.press("ArrowRight")
+        page.keyboard.press("ArrowRight")
+        page.click("[data-testid=schematic] button")
+        page.click("[data-testid=notices-toggle]")   # 利用者が押して開いた（覚える）
+        page.wait_for_timeout(800)                   # 設定ファイルへの書き込み（まとめて送る）を待つ
+        saved = json.loads((config / "settings.json").read_text(encoding="utf-8"))
+        assert saved["lang"] == "en" and saved["theme"] == "dark", saved
+        assert saved["layout.specWidth"] == "392" and saved["layout.schemCollapsed"] == "1", saved
+        assert saved["layout.noticesOpen"] == "1", saved
+        first.stop()
+
+        second = App(config, port=free_port())
+        assert second.port != first.port and second.token == first.token
+        second.start()
+        try:
+            page.add_init_script("""new MutationObserver((list, obs) => {
+                 if (!document.body) return;
+                 window.__themeAtBody = document.documentElement.dataset.theme;
+                 obs.disconnect();
+               }).observe(document, {childList: true, subtree: true});""")
+            page.goto(second.login_url)
+            # 新しいプロセスなので、仕様は開いていない
+            page.wait_for_selector("[data-testid=sample-rlc_series]")
+            assert page.evaluate("window.__themeAtBody") == "dark", "最初の描画が明るいテーマだった"
+            assert page.evaluate("document.documentElement.lang") == "en"
+            assert page.evaluate("document.documentElement.dataset.theme") == "dark"
+            page.click("[data-testid=sample-rlc_series]")
+            page.wait_for_selector("[data-testid=frame]")
+            width = page.evaluate(
+                "document.querySelector('[data-testid=spec-panel]').getBoundingClientRect().width")
+            assert width == 392
+            assert page.get_attribute("[data-testid=schematic]", "data-collapsed") == "true"
+        finally:
+            second.stop()
+    finally:
+        context.close()
+        first.stop()
+
+
+def test_notice_bar_remembers_only_what_the_user_pressed(browser, app, tmp_path):
+    """エラーの出来事で自動で開いた帯は覚えない。0 件のときは、覚えた値によらず たたむ（9.3）。"""
+    bad = tmp_path / "broken.json"
+    bad.write_text("{", encoding="utf-8")
+    p = Page(browser, app)
+    page = p.open()
+    page.click("[data-testid=sample-rlc_series]")
+    page.wait_for_selector("[data-testid=frame]")
+    page.set_input_files("[data-testid=file-input]", str(bad))
+    page.wait_for_selector("[data-testid=notices-list]")          # 自動で開いた
+    page.wait_for_timeout(500)
+    assert "layout.noticesOpen" not in app.api("api/settings")["settings"]
+    assert page.evaluate("localStorage.getItem('circuit-sim.layout.noticesOpen')") is None
+    page.reload()
+    page.wait_for_selector("[data-testid=frame]")
+    assert page.get_attribute("[data-testid=notices-toggle]", "aria-expanded") == "false"
+    assert page.query_selector("[data-testid=notices-list]") is None
+    p.close()
+
+
+# ------------------------------------------------------------------ 合言葉の無いページ（D-051）
+
+
+def test_page_without_the_key_explains_how_to_reopen(browser, app):
+    """合言葉のクッキーが無いページ（URL だけを写した、別のブラウザ）は、API が 401。案内を日英で出す。
+
+    同じブラウザで起動したときの URL を開くと、案内を出していたページも自動でつながる。"""
+    app.reset()
+    context = browser.new_context(locale="ja-JP")
+    try:
+        page = context.new_page()
+        page.goto(app.url)
+        page.wait_for_selector("[data-testid=unauthorized]")
+        text = page.inner_text("[data-testid=unauthorized]")
+        assert "ターミナルに出ている URL から開き直してください" in text
+        assert page.get_attribute("[data-testid=header-open]", "aria-disabled") == "true"
+        page.evaluate("document.querySelector('[data-testid=toggle-lang] [lang=en]').click()")
+        page.wait_for_function("() => document.querySelector('[data-testid=unauthorized]').innerText"
+                               ".includes('Open it again from the URL shown in the terminal')")
+        if SHOTS:
+            Path(SHOTS).mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(Path(SHOTS) / "state-unauthorized-en-light.png"))
+        other = context.new_page()
+        other.goto(app.login_url)
+        other.wait_for_selector("[data-testid=start]")
+        page.wait_for_selector("[data-testid=start]", timeout=8000)
+    finally:
+        context.close()
+
+
+# ------------------------------------------------------------------ UX の細部
+
+
+def test_splitters_have_their_own_names(browser, app):
+    """縦の仕切りは「幅を変える」、横の仕切りは「高さを変える」（1.5）。"""
+    p = Page(browser, app)
+    page = p.open()
+    page.click("[data-testid=sample-rlc_series]")
+    page.wait_for_selector("[data-testid=frame]")
+    assert page.get_attribute("[data-testid=splitter-spec]", "aria-label").startswith("幅を変える")
+    assert page.get_attribute("[data-testid=splitter-schematic]", "aria-label").startswith("高さを変える")
+    p.close()
+
+
+@pytest.mark.parametrize("lang", ["ja", "en"])
+def test_separator_has_space_on_both_sides(browser, app, lang):
+    """ヘッダーの②とお知らせの件数の区切りは、両言語とも前後に 4px の空き。"""
+    p = Page(browser, app, lang=lang)
+    page = p.open()
+    page.click("[data-testid=sample-rlc_series]")
+    page.wait_for_selector("[data-testid=frame]")
+    pads = page.evaluate("""() => [...document.querySelectorAll('.sep')].map((e) => {
+        const s = getComputedStyle(e, '::before'); return [s.paddingLeft, s.paddingRight]; })""")
+    assert pads and all(pad == ["4px", "4px"] for pad in pads), pads
+    p.close()
+
+
+@pytest.mark.parametrize(("width", "height", "lang"),
+                         [(1280, 720, "en"), (1280, 720, "ja"), (1920, 1080, "en")])
+def test_sample_description_is_one_line(browser, app, width, height, lang):
+    """起動直後のサンプルの説明は1行（3.2）。名前の列は固定の幅にせず、数値と単位は同じ行（AC-2-6）。"""
+    p = Page(browser, app, width, height, lang)
+    page = p.open("[data-testid=sample-rlc_series]")
+    p.shot(f"start-sample-desc-{width}x{height}-{lang}")
+    lines = page.evaluate("""() => {
+        const d = document.querySelector('[data-testid=sample-rlc_series] .sample-desc');
+        const r = document.createRange(); r.selectNodeContents(d);
+        return new Set([...r.getClientRects()].map((x) => Math.round(x.top))).size; }""")
+    assert lines == 1
     p.close()

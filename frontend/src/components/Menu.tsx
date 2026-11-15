@@ -1,5 +1,5 @@
 // メニュー（design-system 6.8）。開いた元の部品の下に出す。上下の矢印キーで項目を移り、Enter で選ぶ。
-// Esc か外側のクリックで閉じ、フォーカスは元の部品に戻る。
+// Esc か外側のクリックで閉じ、フォーカスは元の部品に戻る。項目を選んだときも元の部品に戻し、選んだ処理が移す。
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Icon } from "./Icon";
 
@@ -78,7 +78,9 @@ export function MenuButton({ label, items, disabled, onSelect, testId }: Props) 
               className="menu-item"
               tabIndex={-1}
               onClick={() => {
-                close(false);
+                // 元の部品へ戻してから選ぶ（選んだ結果がフォーカスを動かさなければ、元の部品に残る。
+                // サンプルを開けたときは、開いた結果の「実行」へ移る。3.4）
+                close(true);
                 onSelect(item.id);
               }}
               onKeyDown={(e) => {

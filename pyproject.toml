@@ -8,8 +8,12 @@ license-files = ["LICENSE", "NOTICE"]
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
-    "pydantic>=2.6",
-    "fastapi>=0.115",
+    "pydantic>=2.7",
+    # 安全の前提（D-051）: FastAPI 0.132 から Content-Type の無い本文を JSON として読まない。Starlette 1.1 から
+    # StaticFiles が絶対パスを拒む。0.132.x は starlette<1.0 を求めるので、starlette>=1.1 と両立する最小は 0.133.0。
+    # どちらもサーバー（server.py）が自分でも確かめるので、版の既定の動きだけには頼らない
+    "fastapi>=0.133",
+    "starlette>=1.1",
     "uvicorn>=0.30",
 ]
 
