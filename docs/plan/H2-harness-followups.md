@@ -2,6 +2,7 @@
 id: H2
 owner: tooling-engineer
 needs_ux: false
+needs_windows: true
 ---
 
 # H2: 開発ハーネスの残課題

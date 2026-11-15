@@ -740,7 +740,7 @@ SPICE に慣れた人は `1M` をミリのつもりで打つ（SPICE の `M` は
 | 測定点の印 | スコープに出せる信号ごとに1つ。電圧は節点から引き出した枠、電流は配線の上の矢じりと枠。矢じりの向きが、その電流の正の向き |
 | 制御の部分（降圧コンバータ） | 比較（Σ）、PID、PWM を箱で描き、信号の流れを破線の矢印で示す。値（指令値、ゲイン、周波数、デューティの上下限）を箱のそばに出す。電力の部分とは、信号名の札（`v(out)`、`q1`、`q2`）でつなぐ。同じ名前どうしがつながっている、という回路図の慣習に従い、長い線で図を横切らない |
 | 段差（降圧コンバータ） | 負荷の段差は R1 の値の下に、指令の段差は指令値の下に、電源の段差と同じ書き方で出す（`→ 3 Ω`、`t = 5 ms`）。段差を作るためにエンジンが足す素子（R2、S3）は描かない（利用者が入れた値ではないため） |
-| モデルによる描き替え（降圧コンバータ） | モデルが「平均」のとき、レグ（S1・S2）を電源 Vleg（`duty × Vin`）に描き替え、平均モデルに無い信号の測定点を出さない（付録A.4）。図は仕様パネルのモデルの値に従う（次に計算する回路を見せる） |
+| モデルによる描き替え（降圧コンバータ） | モデルが「平均」のとき、レグ（S1・S2）を、電源 Vleg（`duty × Vin`）とオン抵抗 Rleg の直列に描き替え、平均モデルに無い信号の測定点を出さない（付録A.4）。Rleg はエンジンが足す素子だが、結果の値（`v(sw)`）を変えるので描く（段差の R2・S3 との違いは付録A.4）。図は仕様パネルのモデルの値に従う（次に計算する回路を見せる） |
 
 - 図は領域の中央に、縦横比を保って収める。既定の高さ（180）で、RCローパスと直列RLCの図は原寸（文字 12〜13px）で出る。領域は高さ 140 より小さくできない（仕切りの最小。このとき図は約 0.8 倍）。
 - 図の倍率は 0.75 倍（文字 9px）より小さくしない。降圧コンバータの図（幅 960）が領域の幅に収まらないときは 0.75 倍で描き、領域の中を横にスクロールできるようにする（スクロールの位置は、別の仕様を開くと左端に戻る）。RCローパスと直列RLCの図は、対応するウィンドウの大きさでスクロールにならない。
@@ -789,6 +789,7 @@ SPICE に慣れた人は `1M` をミリのつもりで打つ（SPICE の `M` は
 | `schem.ctrl.duty` | d {min}〜{max} | d {min} to {max} |
 | `schem.leg.average` | duty × Vin | duty × Vin |
 | `schem.average.tip` | 平均モデルでは計算に入りません。Vin は Vleg の値（duty × Vin）に使います。 | Not part of the averaged model. Vin is used for the value of Vleg (duty × Vin). |
+| `schem.leg.ron.tip` | {name}: オン抵抗 {r_on}。スイッチングモデルの S1・S2 と平均モデルの Rleg は同じ値で、仕様では変えられません。押すと仕様パネルのモデルの行へ | {name}: on-resistance {r_on}. S1 and S2 in the switching model and Rleg in the averaged model use the same value, which can't be changed in the spec. Click to go to the model row in the Spec panel |
 
 信号の説明は付録A。
 
@@ -803,8 +804,9 @@ SPICE に慣れた人は `1M` をミリのつもりで打つ（SPICE の `M` は
 | AC-6-5 | 値が不足の素子に「不足」の札が出る |
 | AC-6-6 | 既定の高さ（180）で、RCローパスと直列RLCの図の文字が原寸（12px 以上）で出る。領域の高さ 140、幅 560 まで縮めても、図の中の文字が互いに重ならず、画面上で 9px 以上ある。降圧コンバータの図は、既定の配置（1280×720、仕様パネルの幅 360、回路図の高さ 180）で 0.9 倍以上（文字 10.8px 以上）。幅が足りないときは 0.75 倍で止まり、横にスクロールして図の全部を見られる |
 | AC-6-7 | キーボードだけで、素子を選んで仕様パネルの編集に入れる。測定点の印の表示・非表示を切り替えられる |
-| AC-6-8 | 降圧コンバータでモデルを「平均」に替えると、100 ms 以内に図のレグが Vleg に替わり、V1・S1 が破線になり、`v(in)`・`i(V1)`・`gate(q1)`・`gate(q2)` の測定点が消えて `i(Vleg)` の測定点が出る。「スイッチング」に戻すと元に戻る。モデルの行にポインタを乗せると、レグ（S1・S2、または Vleg）が強調される |
+| AC-6-8 | 降圧コンバータでモデルを「平均」に替えると、100 ms 以内に図のレグが Rleg と Vleg の直列（上から sw ─ Rleg ─ Vleg ─ 0）に替わり、V1・S1 が破線になり、`v(in)`・`i(V1)`・`gate(q1)`・`gate(q2)` の測定点が消えて `i(Vleg)` の測定点が出る。「スイッチング」に戻すと元に戻る。モデルの行にポインタを乗せると、レグ（S1・S2、または Rleg と Vleg）が強調される |
 | AC-6-9 | 降圧コンバータで、R_load_step と t_load_step、Vref_step と t_ref_step を入れると、R1 と指令値の下に段差（`→ 値`、`t = 時刻`）が出る。空欄にすると消える。C_esr が空欄のとき R_esr は破線で「なし」、値を入れると実線でその値 |
+| AC-6-10 | 降圧コンバータの平均モデルの図で、Rleg の値がエンジンの計算に使ったオン抵抗と一致し（基準の回路で `1 mΩ`）、`text-secondary` で出る。S1・S2（スイッチング）と Rleg（平均）のツールチップに同じオン抵抗の値が出る。画面のコードにオン抵抗の値が書かれていない（エンジンの値を変えると、図とツールチップの値が変わる） |
 
 ## 7. 実行（S5）
 
@@ -1246,6 +1248,8 @@ SPICE に慣れた人は `1M` をミリのつもりで打つ（SPICE の `M` は
 | AC-8-22 | 降圧コンバータで、スイッチングモデルで `v(in)` を表示して実行し、モデルを「平均」にして再実行すると、`v(in)` の行が同じ位置に残って「この結果にはありません（平均モデル）」と `—` が出て、波形は描かれない。`v(out)`・`i(L1)` は同じ色・同じ段のまま。結果の説明に「平均モデル」と出る。スイッチングに戻して再実行すると、`v(in)` が同じ色で描かれる |
 | AC-8-23 | `cmd(duty)` と `gate(q1)` を表示すると同じ段に入り、縦軸の上端に「無次元」と出る。CSV の見出しは `cmd(duty) [1]` |
 | AC-8-24 | 1280×720 で比較を入れた状態でも、道具の列に実行の番号、モデル、時間刻みが省かれずに出る |
+| AC-8-25 | 降圧コンバータを平均モデルで（負荷の段差と C_esr を入れて）実行すると、スコープの信号の表と「ほかの信号」、CSV の「すべての信号」に、付録A.4 の内部の信号（`v(sw_avg)`、`i(Rleg)`、`v(cap)`、`v(ld)`、`gate(q_load)`、`cmd(load)`、`on(S3)`）が出ない。スイッチングでも `on(S1)`・`on(S2)` ほか内部の信号が出ない。出る信号は、付録A.4 の信号の表のそのモデルで「出る」ものと同じ |
+| AC-8-26 | 基準の回路を平均モデルで実行し、定常（t = 8 ms 以降）の同じ時刻のカーソルで読んだ `v(sw)`、`cmd(duty)`、`i(L1)` が、`v(sw)` = `cmd(duty)` × Vin − r_on × `i(L1)`（r_on は図の Rleg の値）を、有効数字6桁の読み取りの最後の桁の ±1 以内で満たす（`v(sw)` が `cmd(duty)` × Vin より約 2 mV 低い） |
 
 ## 9. お知らせ（S7）
 
@@ -1434,7 +1438,7 @@ API の形は ui-engineer が決める。ここには、画面がこの仕様ど
 
 - エラーと注意は、文面ではなく **番号と差し込む値** で受け取る（文面は画面の辞書が持つ。日英を切り替えられるようにするため）。番号の付いていないものは N-RUN-INTERNAL / N-RUN-NOTE-OTHER として、内部の文を「詳細」に入れる。
 - 画面は、表示する数値を自分で丸め直すが、Δ の計算や一致の判定には、受け取った値をそのまま使う。
-- 降圧コンバータでは、D2 にモデルの選択肢とモデルごとの信号の有無、D3 に Tf の自動の値、組で入れる値の片方の不足、f_sw と f_ctrl の比、指令値がデューティの上下限で届くか、段差の時刻が終了時刻より後か、負荷の段差の時刻の切り上げ、も含める（付録A.4）。
+- 降圧コンバータでは、D2 にモデルの選択肢とモデルごとの信号の有無、レグのオン抵抗 r_on の値（仕様の値によらない。図の Rleg の値と S1・S2・Rleg のツールチップに使う）、D4 の信号の一覧に表示する信号と内部の信号の区別（付録A.4。14章の未決17・18）、D3 に Tf の自動の値、組で入れる値の片方の不足、f_sw と f_ctrl の比、指令値がデューティの上下限で届くか、段差の時刻が終了時刻より後か、負荷の段差の時刻の切り上げ、も含める（付録A.4）。
 - **単位の換算、範囲の判定、ステップ数の上限、時間刻みの粗さの判定は、計算エンジンが行う。** 画面（とアプリのサーバー）が同じ判定を別に持たない。コマンドラインと画面で結果が食い違わないようにするため。エンジンの判定が計算を始めた後にしか出ない場合の受け皿も用意してある（ステップ数は N-RUN-STEPS、注意は N-RUN-NOTE-…）。
 
 ## 13. 後のリリースがどこに収まるか
@@ -1477,6 +1481,8 @@ v0.1 の枠は、次のものが場所を取り合わずに入るように決め
 | 14 | 平均モデルの信号 `i(Vleg)` は、この回路では −i(L1) と同じで、読む意味が薄い | 付録A.4 では既定で表示せず、説明にそう書く。平均モデルの入力電流（duty × i(L1)。スイッチングモデルの −i(V1) の周期平均に当たる）を信号にすることを提案する | control-engineer |
 | 15 | 降圧コンバータの、計算の前に分かる判定と自動の値（12章の最後の段落）をエンジンから受け取る | 見せ方は付録A.4 と付録Bで決めた。E1g の口（D2、D3）で、番号と差し込む値で受け取る。受け取れない間は、実行の失敗（N-RUN-…）として出る | control-engineer、solver-engineer（E1g） |
 | 16 | 付録A.2・A.3 の項目名・説明・信号の説明が、辞書のキーの表になっていない（A.4 はキーの表） | A.1 のキーの決まりで、A.2・A.3 もキーの表に直す | ux-designer（A1 の実装の前） |
+| 17 | 結果の名前に、画面に出さない内部の信号（`v(sw_avg)`、`v(cap)`、`v(ld)`、`on(S1)` など。付録A.4）が混ざっている。いまは、表示する信号の情報（`SignalInfo` の一覧）に無い名前を内部と読むしかない | **control-engineer への依頼**: 結果の名前の全部を、表示する信号と内部の信号に漏れなく分けて返す。形は、内部の信号にも信号の情報を作って「内部」の印（例 `internal=True`）を付け、一覧を1つにすることを勧める。試験で、どのモデル・どの省略できる項目の組み合わせでも、結果の名前の集合 ＝ 信号の情報の名前の集合で、印の無いものが付録A.4 の信号の表の「出る」と1対1で合うことを確かめる（`tests/test_e1b_signals.py` を、印の無いものだけと比べるように直す）。新しい信号を足して印を付け忘れると試験が落ちるようにするため（画面が黙って隠すことも、黙って足すことも無くす）。届くまでの画面の扱いは付録A.4（表示する信号の情報に無い名前は出さない） | control-engineer（E1g の口と合わせる） |
+| 18 | レグのオン抵抗 r_on の値を画面が知る手段が無い（仕様の項目でなく、層Bの素子の値にだけある。値が不足のときは層Bが作れない） | **control-engineer への依頼**: テンプレートの表示定義（D2）に、レグのオン抵抗の値（いまは 1 mΩ）を、仕様の値によらずに返す。r_on を仕様の省略できる項目（空欄なら既定値）にするかは control-engineer が決める。項目にするなら、仕様パネルの行（既定値の見え方）、図の Rleg の値、ツールチップを、その項目に対応させる（付録A.4 を直す） | control-engineer |
 
 ## 付録A テンプレートの表示定義
 
@@ -1632,8 +1638,11 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 
 | モデル | 計算する回路 | 時間刻みの自動の値 | 出ない信号 |
 |---|---|---|---|
-| スイッチング（既定） | S1・S2 を理想スイッチで計算する。リプルが出る | スイッチング周期の 1/200 | — |
-| 平均 | S1・S2 を、sw と 0 の間の電源 Vleg = duty × Vin に置き換え、スイッチング周期の平均を計算する。リプルは出ない。入力の電源は硬い（インピーダンスが無い）前提。ステップ数はスイッチングの約 1/20 | スイッチング周期の 1/10 | `v(in)`、`i(V1)`、`gate(q1)`、`gate(q2)` |
+| スイッチング（既定） | S1・S2 を、オン抵抗 r_on の理想スイッチで計算する。リプルが出る | スイッチング周期の 1/200 | — |
+| 平均 | S1・S2 を、sw と 0 の間の、電源 Vleg = duty × Vin とオン抵抗 Rleg の直列に置き換え、スイッチング周期の平均を計算する。リプルは出ない。入力の電源は硬い（インピーダンスが無い）前提。ステップ数はスイッチングの約 1/20 | スイッチング周期の 1/10 | `v(in)`、`i(V1)`、`gate(q1)`、`gate(q2)` |
+
+- **平均モデルのオン抵抗。** Rleg の値は、スイッチングモデルの S1・S2 のオン抵抗 r_on と同じ（E1b。`templates/legs.py`）。相補のゲート（デッドタイム 0）では S1・S2 のどちらかが必ず導通していて、どちらでも sw の経路にオン抵抗が1つ入るので、1つの Rleg で表す。このため平均モデルの `v(sw)` は duty × Vin − r_on × i(L1) で、duty × Vin より r_on × i(L1) だけ低い（基準の回路で約 2 mV）。スイッチングモデルの `v(sw)` の周期平均も同じ式になる。
+- r_on はテンプレートの決まった値で、仕様の項目には無い（v0.1 では変えられない）。画面は値をエンジンから受け取り（12章、14章の未決18）、図の Rleg の値と、S1・S2・Rleg のツールチップに出す。画面に値を書き込まない。
 
 **項目。** 並びはこの表の順（5.2 の決まりで並べ替えない）。名前と説明は下の文言の表。
 
@@ -1657,7 +1666,7 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 | 制御 | `control.Tf` | `Tf` | s | 省略できる。空欄なら制御周期の 1/4（自動） | 0 以上 | PID |
 | 制御 | `control.d_min` | `d_min` | なし（JSON は `1` か `%`） | 必須 | 0 以上 1 以下、d_max より小さい | PID |
 | 制御 | `control.d_max` | `d_max` | なし（同上） | 必須 | 0 以上 1 以下、d_min より大きい | PID |
-| 計算の設定 | `simulation.fidelity` | `fidelity` | — | 省略できる。空欄ならスイッチング（既定値） | スイッチング、平均 | レグ（S1・S2。平均では Vleg） |
+| 計算の設定 | `simulation.fidelity` | `fidelity` | — | 省略できる。空欄ならスイッチング（既定値） | スイッチング、平均 | レグ（S1・S2。平均では Vleg と Rleg） |
 | 計算の設定 | `simulation.t_end` | `t_end` | s | 自動あり | 0 より大きく、時間刻みより長い | — |
 | 計算の設定 | `simulation.h` | `h` | s | 自動あり | 0 より大きい | — |
 
@@ -1692,7 +1701,17 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 | 8 黄 | `i(Vleg)` | A | しない | — | 出る | Vleg の下、下向き（Vleg の中を ＋ → −） |
 
 - `i(V1)` と `i(Vleg)` は同じ結果に並ばないので、同じ 8番（黄）にする（9色目を作らない。`design-system.md` 3.3）。
-- エンジンが返す `on(S1)`、`on(S2)`（スイッチの状態。理想スイッチでは gate と同じ値）と、内部の信号（負荷の段差のスイッチなど）は、画面に出さない。CSV の「すべての信号」にも入れない。
+- 画面に出す信号は、この表にある信号だけ。エンジンの結果には、ほかに内部の信号が入る。どれも画面に出さず、スコープの「ほかの信号」にも、CSV の「すべての信号」にも入れない。
+
+  | 内部の信号 | モデル | 出さない理由 |
+  |---|---|---|
+  | `on(S1)`、`on(S2)` | スイッチング | スイッチの状態。理想スイッチでは `gate(q1)`、`gate(q2)` と同じ値 |
+  | `v(ld)`、`gate(q_load)`、`cmd(load)`、`on(S3)`（負荷の段差があるとき） | 両方 | 段差を作るためにエンジンが足す R2・S3 の信号。段差は R1 の値と時刻で示し、R2・S3 は図にも描かない（6.2） |
+  | `v(cap)`（C_esr を入れたとき） | 両方 | R_esr と C1 の間の節点の電圧。実物のコンデンサの内部で、測れない |
+  | `v(sw_avg)` | 平均 | Vleg と Rleg の間の節点の電圧。duty × Vin と同じ値で、`cmd(duty)` と Vin から読める。実物の回路に無い節点で、名前も計算の都合 |
+  | `i(Rleg)` | 平均 | Rleg の電流。`i(L1)` と同じ値（直列。`i(Vleg)` の符号を反転したもの）。E1b の時点では結果の名前に無いが、足されても出さない |
+
+  エンジンは、結果の名前のどれが表示する信号で、どれが内部の信号かを、名前の形で決めずに情報として返す（14章の未決17）。画面が名前の形（`_avg` で終わる、など）から推し量らない。区別が返らない名前は、内部の信号として扱う（この表に無い信号を黙って足さない）。
 - 単位の無い信号（`cmd(duty)`、`gate(q1)`、`gate(q2)`）は同じ段に入り、縦軸の上端に「無次元」（8.2 ③）。gate は 0（オフ）と 1（オン）。
 - 既定で表示する `v(out)` と `i(L1)` は、どちらのモデルにもある。モデルを替えて無くなった信号の見せ方は 8.2 ⑤。
 
@@ -1750,6 +1769,7 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 | PWM | 箱 (884, 60)、64 × 24 | 中に「PWM」。PID から破線の矢印 |
 | PWM の値 | (884, 88)、中央そろえ | `f_sw {f_sw}` |
 | 札 `q1`、`q2` | 矢印 (916, 54)→(934, 54) と `q1` (938, 54)、矢印 (916, 66)→(934, 66) と `q2` (938, 66) | 同じ名前の S1・S2 のゲートにつながる |
+| S1・S2 のツールチップ | — | `schem.leg.ron.tip`。オン抵抗の値はエンジンから受け取る（図には値を書かない。理想スイッチの記号のまま） |
 
 **図（平均）。** スイッチングの図から、次のところだけを描き替える。ほかの素子・値・測定点・座標は同じ。
 
@@ -1757,9 +1777,10 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
  （v(in) なし）（gate(q1) なし） [v(sw)]
     ┊  in                        │  sw      L1 …
     ┊┄┄┄┄┄┄┄o／ o┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄●───────⌒⌒⌒⌒ …
-    ┊       S1                   ◇＋  Vleg
-  ( V1 ) V1                      │   duty × Vin
-    ┊    直流 24 V               ◇−
+    ┊       S1                   ▭   Rleg
+    ┊                            │   1 mΩ
+  ( V1 ) V1                      ◇＋  Vleg
+    ┊    直流 24 V               ◇−  duty × Vin
     ┊                  [i(Vleg)] ▾
     └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄●───────────┬─── …
                                          PWM の出口:  ▸ duty
@@ -1768,10 +1789,15 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 | 要素 | 平均モデルでの描き方 |
 |---|---|
 | V1、S1、上の配線 x = 40〜220、下の配線 x = 40〜220 | 破線・`text-muted`（計算に入っていない素子。`design-system.md` 8章）。V1 の名前と値は残す（Vin は Vleg の値に使う）。ツールチップは `schem.average.tip` |
-| S2 の位置 | 制御電源 Vleg（ひし形、上が ＋）を (220, 105) に。名前 `Vleg` (234, 102)、値 `duty × Vin`（`schem.leg.average`）(234, 118)、左そろえ。S2 とそのゲートは描かない |
-| 測定点 | `v(in)`、`i(V1)`、`gate(q1)`、`gate(q2)` と S1 のゲートの破線を出さない。`i(Vleg)` を出す: 矢じり (220, 136) 下向き、枠 (178, 136)。Vleg の中を ＋ から − へ（下向き）が正 |
+| S2 の位置（sw と 0 の間の縦の枝、x = 220） | 上から sw ─ Rleg ─ Vleg ─ 0 の直列に描き替える（エンジンの回路と同じ並び）。オン抵抗 Rleg（縦の長方形）を (220, 80)、制御電源 Vleg（ひし形、上が ＋）を (220, 112) に。Rleg と Vleg の間の節点には点も名前も付けない（R_esr と C1 の間と同じ。内部の節点）。名前と値は枝の右に左そろえで、上から `Rleg` (234, 76)、Rleg の値 (234, 92)、`Vleg` (234, 108)、Vleg の値 `duty × Vin`（`schem.leg.average`）(234, 124)。S2 とそのゲートは描かない |
+| Rleg の値 | エンジンから受け取ったオン抵抗 r_on（基準の回路で `1 mΩ`）を、値の書き方（2.1）で、色は `text-secondary`（仕様の項目に無い決まった値。`design-system.md` 8章）。受け取れないときは値の位置に `—`（値を推し量って書かない） |
+| 測定点 | `v(in)`、`i(V1)`、`gate(q1)`、`gate(q2)` と S1 のゲートの破線を出さない。`i(Vleg)` を出す: 矢じり (220, 136) 下向き、枠 (178, 136)。Vleg の中を ＋ から − へ（下向き）が正。`v(sw)` はスイッチングと同じ節点 sw（Rleg の上端） |
 | PWM の出口の札 | `q1`・`q2` の代わりに、矢印 (916, 60)→(934, 60) と `duty` (938, 60) を1つ。Vleg の値の `duty` につながる |
-| 強調 | モデルの行 ↔ Vleg。Vin の行 ↔ V1 と Vleg |
+| ツールチップ | Rleg は `schem.leg.ron.tip`（スイッチングの図の S1・S2 と同じ文言） |
+| 強調 | モデルの行 ↔ Vleg と Rleg。Vin の行 ↔ V1 と Vleg |
+
+- 描く範囲は 960 × 186 のまま。Rleg と Vleg は、スイッチングの図で S2 が占めていた縦の枝（y = 60〜150）に収まる（スイッチングの図の R_esr と C1 の重ね方と同じ）。倍率の決まり（0.75 倍で止めて横にスクロール、既定の配置で 0.9 倍以上。AC-6-6）は変わらない。
+- Rleg を説明だけで済ませず図に描くのは、平均モデルの `v(sw)` が duty × Vin より低い理由を、図を見て分かるようにするため。図が「Vleg が sw に直接つながる」形のままだと、カーソルで読んだ `v(sw)` と `cmd(duty)` × Vin の差（基準の回路で約 2 mV）が、図に無いもののせいで説明できなくなる。エンジンが足す素子のうち R2・S3（6.2）は、利用者が入れた負荷の段差を作る手段なので描かないが、Rleg は結果の値を変える素子なので描く。
 
 **文言。** 項目と信号の文言（A.1 のキー）。記号と信号名は訳さない（10.4）。
 
@@ -1814,18 +1840,18 @@ E1b で決まったテンプレート（同期整流、電圧モードの PID �
 | `item.buck_voltage_mode.d_min.desc` | 0〜1。90% のように % でも入力できる | 0 to 1. You can also enter a percentage, such as 90% |
 | `item.buck_voltage_mode.d_max.name` | デューティの上限 | Maximum duty |
 | `item.buck_voltage_mode.d_max.desc` | 0〜1。90% のように % でも入力できる | 0 to 1. You can also enter a percentage, such as 90% |
-| `item.buck_voltage_mode.fidelity.desc` | スイッチング: S1・S2 を理想スイッチで計算する（リプルが出る）。平均: S1・S2 を duty × Vin の電源に置き換え、スイッチング周期の平均を計算する（リプルは出ない。ステップ数は約 1/20） | Switching: S1 and S2 are ideal switches (ripple is shown). Averaged: S1 and S2 are replaced by a duty × Vin source and the switching-period average is computed (no ripple, about 1/20 of the steps) |
+| `item.buck_voltage_mode.fidelity.desc` | スイッチング: S1・S2 を、オン抵抗 r_on の理想スイッチで計算する（リプルが出る）。平均: S1・S2 を、duty × Vin の電源 Vleg とオン抵抗 Rleg（r_on）の直列に置き換え、スイッチング周期の平均を計算する（リプルは出ない。ステップ数は約 1/20） | Switching: S1 and S2 are ideal switches with on-resistance r_on (ripple is shown). Averaged: S1 and S2 are replaced by a duty × Vin source Vleg in series with the on-resistance Rleg (r_on), and the switching-period average is computed (no ripple, about 1/20 of the steps) |
 | `item.buck_voltage_mode.t_end.desc` | 自動のときは、LC の共振周期の 20 倍（段差があれば最後の段差の時刻に足す）を、制御周期の整数倍に切り上げた値 | Auto: 20 × the LC resonance period (added to the last step time, if any), rounded up to a whole number of control periods |
 | `item.buck_voltage_mode.h.desc` | 自動のときは、スイッチング周期の 1/200（平均モデルは 1/10） | Auto: the switching period ÷ 200 (÷ 10 for the averaged model) |
 | `signal.buck_voltage_mode.v(out).desc` | 出力電圧（節点 out の電圧）。平均モデルでは、スイッチング周期の平均 | Output voltage at node out. Switching-period average in the averaged model |
 | `signal.buck_voltage_mode.i(L1).desc` | インダクタ電流。sw から out へ流れる向きが正。平均モデルでは、スイッチング周期の平均 | Inductor current, positive from sw to out. Switching-period average in the averaged model |
-| `signal.buck_voltage_mode.v(sw).desc` | スイッチの節点 sw の電圧。平均モデルでは duty × Vin | Voltage at the switch node sw. duty × Vin in the averaged model |
+| `signal.buck_voltage_mode.v(sw).desc` | スイッチの節点 sw の電圧。スイッチのオン抵抗 r_on による降下を含む。平均モデルでは、スイッチング周期の平均 duty × Vin − r_on × i(L1) | Voltage at the switch node sw, including the drop across the switch on-resistance r_on. In the averaged model, the switching-period average duty × Vin − r_on × i(L1) |
 | `signal.buck_voltage_mode.cmd(duty).desc` | デューティの指令（PID の出力。d_min〜d_max。制御周期ごとに変わる） | Duty command (PID output, d_min to d_max, updated every control period) |
 | `signal.buck_voltage_mode.gate(q1).desc` | S1 のゲート信号（1 = オン、0 = オフ） | Gate signal of S1 (1 = on, 0 = off) |
 | `signal.buck_voltage_mode.gate(q2).desc` | S2 のゲート信号。q1 の反転（デッドタイム 0） | Gate signal of S2, the complement of q1 (no dead time) |
 | `signal.buck_voltage_mode.v(in).desc` | 入力電圧（V1 の電圧） | Input voltage (across V1) |
 | `signal.buck_voltage_mode.i(V1).desc` | 電源 V1 の電流。V1 の中を ＋ から − へ流れる向きが正（電力を送り出しているときは負） | Current through V1, positive from + to − inside the source (negative while V1 delivers power) |
-| `signal.buck_voltage_mode.i(Vleg).desc` | 平均モデルの電源 Vleg（sw と 0 の間）の電流。Vleg の中を ＋ から − へ流れる向きが正。この回路では −i(L1) と同じ | Current through the averaged-model source Vleg (between sw and 0), positive from + to − inside it. Equal to −i(L1) in this circuit |
+| `signal.buck_voltage_mode.i(Vleg).desc` | 平均モデルの電源 Vleg の電流（Vleg は Rleg と直列に sw と 0 の間に入る）。Vleg の中を ＋ から − へ流れる向きが正。この回路では −i(L1) と同じ | Current through the averaged-model source Vleg (in series with Rleg between sw and 0), positive from + to − inside it. Equal to −i(L1) in this circuit |
 
 ### A.5 サンプル
 
@@ -1994,3 +2020,8 @@ N-OPEN-SCHEMA の下には、箇所を最大5件並べる（それ以上は「�
   回路図に、信号名の札、段差の書き込み、平均モデルの描き替え、0.75 倍で止めて横にスクロール、を足した（6.2）。
   ゲインと無次元の量の単位（接頭辞を付けない）、`%`、範囲の文言、倍率の `≈` を足した（2章）。お知らせ N-MISSING-PAIR、N-REF-RANGE、N-STEP-AFTER-END、N-STEP-SNAP、N-OPEN-LEGACY と直し方 `spec.err.*` を足した（付録B）。
   文言のキーの決まりを付録A.1 に書いた。A0 の UX 確認から `layout.resize.height` を足した（1.5）。14章の未決1・2を閉じ、14〜16を足した。
+- v0.1.2（2026-11-15、ux-designer、A4t）: E1b の修正（平均モデルのレグを電源 Vleg とオン抵抗 Rleg の直列にした）に付録A.4 を合わせた。
+  平均の図で、S2 の枝を上から sw ─ Rleg ─ Vleg ─ 0 の直列に描き、Rleg の値（エンジンから受け取るオン抵抗）を `text-secondary` で出す。図の大きさ 960 × 186 と倍率の決まりは変えない。
+  S1・S2・Rleg のツールチップ `schem.leg.ron.tip` を足した（6.5）。文言 `item.buck_voltage_mode.fidelity.desc`、`signal.buck_voltage_mode.v(sw).desc`、`signal.buck_voltage_mode.i(Vleg).desc` を直した。
+  内部の信号（`v(sw_avg)`、`i(Rleg)`、`v(cap)`、負荷の段差の信号）を画面に出さないことと理由を、付録A.4 の信号の表の下に書いた（信号の表そのものの形と行は変えていない）。
+  AC-6-8 を直し、AC-6-10、AC-8-25、AC-8-26 を足した。12章に D2・D4 で受け取るものを足し、14章に未決17・18（control-engineer への依頼）を足した。
