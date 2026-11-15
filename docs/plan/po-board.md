@@ -38,7 +38,7 @@ python scripts\doctor.py --headless
 - ハーネスの判定は error（合格にしない）で、正しく働いた。実物で分かった点: 失敗のときも `subtype` は `success` で、失敗は `is_error` と終了コードで分かる。
 - ログインし直した後（claude 2.1.325）: ヘッドレス実行は成功するが、`structured_output` が返らなかった。4通りを比べて原因を確定した。**使える道具を一覧で絞った役割（code-reviewer）だけが返さない**。構造化された結果は道具の呼び出しとして返る作りで、一覧で絞るとその道具ごと外れるため。
   - 役割なし、道具を絞らない役割（verifier）、「道具を使うな」と指示した場合は、いずれも `structured_output` が返った（終了コード 0、`is_error` が偽、`stop_reason` が `tool_use`）。成功のときの出力の形は、ハーネスの前提どおり。
-  - 対処: code-reviewer の定義を、一覧で絞る形から、編集の道具を禁じる形に変えた（D-030）。POのPCで再確認する。
+  - 対処: code-reviewer の定義を、一覧で絞る形から、編集の道具を禁じる形に変えた（D-030）。POのPCで確認済み: `doctor.py --headless` は「ハーネスの前提どおり」。code-reviewer に渡る道具は verifier より編集の3つ（Edit、Write、NotebookEdit）だけ少なく、Write でファイルを書かせても作られなかった。
 
 ## 次にやること
 
