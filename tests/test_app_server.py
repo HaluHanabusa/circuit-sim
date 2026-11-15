@@ -299,6 +299,49 @@ def test_launch_number_sets_cookie_and_moves_to_plain_url(srv):
     assert status == 303 and "set-cookie" not in headers
 
 
+@pytest.mark.parametrize(("headers", "hop"), [
+    ({"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}, True),   # 転送用の HTML から
+    ({"Sec-Fetch-Site": "same-site"}, True),
+    ({"Sec-Fetch-Site": "none", "Accept": "text/html"}, False),              # URL を打った、OS から開いた
+    ({"Sec-Fetch-Site": "same-origin"}, False),
+    ({"Accept": "text/html,application/xhtml+xml"}, True),  # Sec-Fetch-Site を送らないブラウザ
+    ({}, False),                                                              # ブラウザでない道具
+])
+def test_launch_from_another_page_moves_on_from_this_page(srv, headers, hop):
+    """ほかのページ（転送用の HTML）から来たときは、303 ではなく、このページ自身から / へ移る。
+
+    303 だと、続く / の要求も「別のサイトから」のままで SameSite=Strict のクッキーが付かず、入口のページに
+    好み（data-prefs）が出ない（暗いテーマで明るい画面が一瞬出る）。移るまでの地の色は、覚えたテーマ。"""
+    srv.json("/api/settings", {"settings": {"theme": "dark"}}, "PUT")
+    try:
+        number = srv.launches.issue()
+        status, got, body = srv.raw("GET", f"/?k={number}", headers=headers, cookie=False)
+        assert got["set-cookie"].startswith(f"{COOKIE}={TOKEN};")
+        if hop:
+            assert status == 200 and got["content-type"].startswith("text/html")
+            assert b'http-equiv="refresh" content="0;url=/"' in body and b'content="dark"' in body
+            assert "script-src 'self'" in got["content-security-policy"] and b"<script" not in body
+        else:
+            assert status == 303 and got["location"] == "/"
+    finally:
+        srv.json("/api/settings", {"settings": {"theme": None}}, "PUT")
+
+
+def test_spent_numbers_are_reported(tmp_path):
+    """番号が使われた・期限が切れた・古くて捨てたときに知らせる（転送用の HTML を消すため）。"""
+    now = [0.0]
+    spent: list[str] = []
+    launches = Launches(seconds=10, clock=lambda: now[0], on_spent=spent.append)
+    used, expires = launches.issue(), launches.issue()
+    assert launches.redeem(used) and spent == [used]
+    now[0] = 11
+    assert not launches.is_open(expires)
+    launches.sweep()
+    assert spent == [used, expires]
+    numbers = [launches.issue() for _ in range(LAUNCH_KEPT + 1)]
+    assert spent[-1] == numbers[0]
+
+
 def test_launch_number_works_only_once(srv):
     """起動の番号は1回だけ使える（ブラウザの起動の引数や履歴から読まれても、もう使えない）。"""
     number = srv.launches.issue()

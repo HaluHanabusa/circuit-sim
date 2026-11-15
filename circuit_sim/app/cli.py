@@ -6,10 +6,12 @@
   circuit-sim --port 8765     ポートを決めて起動する（使えなければ、理由を出して終わる）
   circuit-sim --no-browser    ブラウザを開かない（開く場所の URL を表示する）
 
-ブラウザに渡す URL（/?k=…）には、合言葉ではなく、一度だけ・5 分だけ使える起動の番号を載せる。アプリ本体は
-番号を合言葉のクッキーと交換し、番号の無い URL へ移す（D-051、D-053）。ブラウザの起動の引数
-（/proc/<pid>/cmdline）や履歴から番号が読まれても、使い終わっているか期限が切れている。
-端末に出す URL も同じ番号。
+起動の URL（/?k=…）には、合言葉ではなく、一度だけ・5 分だけ使える起動の番号を載せる。アプリ本体は
+番号を合言葉のクッキーと交換し、番号の無い URL へ移す（D-051、D-053）。
+ブラウザには URL を渡さず、その URL へ移るだけの転送用の HTML（設定の場所に、本人だけが読める権限で書く）の
+場所を渡す。ブラウザの起動の引数（/proc/<pid>/cmdline、ps）は同じ PC のほかの利用者にも見えるので、番号も
+載せない（載せると、ブラウザより先に使われて合言葉を取られうる）。HTML は、番号が使われた・期限が切れた・
+止めたときに消す。端末に出す URL（本人にしか見えない）は番号つき。
 新しい URL は、端末で Enter を押すと出る（端末やパイプから読めないときは、起動し直すと出る）。
 合言葉と画面の好みは、端末の中の設定の場所に置く（config.py）。
 
@@ -26,7 +28,10 @@ from __future__ import annotations
 
 import argparse
 import errno
+import html
+import json
 import os
+import secrets
 import signal
 import socket
 import stat
@@ -36,16 +41,19 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 
 import uvicorn
 
-from .config import Settings, config_dir, load_token
+from .config import Settings, config_dir, create_private, ensure_dir, load_token
 from .server import LAUNCH_SECONDS, TOKEN_PARAM, Launches, Workspace, create_app
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 28470
 FALLBACK_PORTS = tuple(range(28471, 28480))
 CONFIRM_SECONDS = 10.0
+BROWSER_CHECK_SECONDS = 15.0  # ブラウザを開いてから、画面が開かなかったと案内するまで
+LAUNCH_PAGE_PREFIX = "open-"
 WINDOWS = os.name == "nt"
 
 IN_USE = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048), 10048}
@@ -169,6 +177,10 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "Start circuit-sim again for a new URL.",
     ),
     "how_to_stop": ("止めるには、この画面で Ctrl+C を押してください。", "To stop it, press Ctrl+C here."),
+    "browser.check": (
+        "ブラウザで作業画面が開かないときは、ブラウザで次の場所を開いてください: {url}",
+        "If the workspace didn't open in your browser, open this address in it: {url}",
+    ),
     "browser.failed": (
         "ブラウザを開けませんでした。ブラウザで次の場所を開いてください: {url}",
         "Couldn't open a browser. Open this address in your browser: {url}",
@@ -300,8 +312,9 @@ class GuardedServer(uvicorn.Server):
     （待ち受けを閉じ、接続を閉じる）で止める（reset_idle_connections）。"""
 
     def __init__(self, config: uvicorn.Config, workspace: Workspace, say: Callable[[str], None],
-                 tr: Texts | None = None) -> None:
+                 tr: Texts | None = None, on_shutdown: Callable[[], None] | None = None) -> None:
         super().__init__(config)
+        self.on_shutdown = on_shutdown
         self.workspace = workspace
         self.say = say
         self.tr = tr or Texts(terminal_lang())
@@ -320,6 +333,10 @@ class GuardedServer(uvicorn.Server):
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
         reset_idle_connections(self.server_state.connections)
+        if self.on_shutdown is not None:
+            # SIGTERM・窓を閉じたときは、止めた後に uvicorn が合図を出し直してプロセスが終わり、main の後始末
+            # まで進まないので、ここでする（転送用の HTML を消す）
+            self.on_shutdown()
         await super().shutdown(sockets=sockets)
 
 
@@ -386,18 +403,103 @@ def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0) -> threa
     return thread
 
 
-def open_when_ready(server: uvicorn.Server, url: str, say: Callable[[str], None], tr: Texts) -> None:
-    """サーバーが受け付けを始めたら、既定のブラウザで url を開く。"""
+def launch_page(url: str, theme: str | None = None) -> bytes:
+    """転送用の HTML: 起動の URL へ移るだけ（履歴に残さない location.replace と、スクリプトが動かないときの
+    meta refresh、どちらも動かないときのリンク）。移るまでの一瞬の地の色は、覚えているテーマに合わせる。"""
+    href = html.escape(url, quote=True)
+    scheme = theme if theme in ("light", "dark") else "light dark"
+    return (
+        '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+        f'<meta name="color-scheme" content="{scheme}"><meta name="referrer" content="no-referrer">'
+        f'<meta http-equiv="refresh" content="0;url={href}"><title>circuit-sim</title>'
+        f"<script>location.replace({json.dumps(url)});</script>"
+        f'</head><body><a href="{href}">circuit-sim</a></body></html>\n'
+    ).encode()
+
+
+class LaunchPages:
+    """転送用の HTML（設定の場所に、本人だけが読める権限で書く）。番号ごとに1つ。
+
+    番号が使われた・期限が切れた（spent）、止めた（remove_all）ときに消す。落ちて残ったものは、次の起動で
+    消す（remove_stale。ほかに動いている circuit-sim のものを消さないよう、期限より古いものだけ）。"""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.files: dict[str, Path] = {}
+        self.lock = threading.Lock()
+
+    def write(self, number: str, url: str, theme: str | None = None) -> Path:
+        ensure_dir(self.directory)
+        path = self.directory / f"{LAUNCH_PAGE_PREFIX}{secrets.token_hex(8)}.html"
+        if not create_private(path, launch_page(url, theme)):
+            raise FileExistsError(errno.EEXIST, "already exists", str(path))
+        with self.lock:
+            self.files[number] = path
+        return path
+
+    def spent(self, number: str) -> None:
+        with self.lock:
+            path = self.files.pop(number, None)
+        _remove(path)
+
+    def remove_all(self) -> None:
+        with self.lock:
+            paths, self.files = list(self.files.values()), {}
+        for path in paths:
+            _remove(path)
+
+    @staticmethod
+    def remove_stale(directory: Path, older_than: float = LAUNCH_SECONDS) -> None:
+        now = time.time()
+        try:
+            found = list(directory.glob(f"{LAUNCH_PAGE_PREFIX}*.html"))
+        except OSError:
+            return
+        for path in found:
+            try:
+                if now - path.stat().st_mtime > older_than:
+                    path.unlink()
+            except OSError:
+                pass
+
+
+def _remove(path: Path | None) -> None:
+    if path is not None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass  # 消せなくても、中の番号は使い終わっているか期限が切れている
+
+
+def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable[[str], None], tr: Texts,
+                    used: Callable[[], bool] | None = None, wait: float = BROWSER_CHECK_SECONDS) -> None:
+    """サーバーが受け付けを始めたら、既定のブラウザで target（転送用の HTML の file:// の場所）を開く。
+
+    開けなければ、url（端末で開く起動の URL）を出す。開いたのに wait 秒たっても番号が使われなければ
+    （used() が偽。HTML がブラウザ以外で開いた、ブラウザがその場所を読めない、など）、
+    url を開くよう案内する。"""
     while not server.started and not server.should_exit:
         time.sleep(0.02)
     if server.should_exit:
         return
     try:
-        opened = webbrowser.open(url)
+        opened = webbrowser.open(target)
     except Exception:  # ブラウザを起動できない環境（画面の無いサーバーなど）でも、アプリ本体は動かし続ける
         opened = False
     if not opened:
         say(tr("browser.failed", url=url))
+        return
+    if used is None:
+        return
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and not server.should_exit:
+        if used():
+            return
+        time.sleep(0.1)
+    if not used() and not server.should_exit:
+        say(tr("browser.check", url=url))
 
 
 def say(text: str) -> None:
@@ -485,15 +587,18 @@ def main(argv: list[str] | None = None) -> int:
     source = enter_source()
     renew = "enter" if source else "restart"
     minutes = int(LAUNCH_SECONDS // 60)
-    launches = Launches(on_stale=lambda: say(tr(f"url.stale.{renew}")))
-    url = launch_url(base, launches.issue())
+    pages = LaunchPages(directory)
+    LaunchPages.remove_stale(directory)
+    launches = Launches(on_stale=lambda: say(tr(f"url.stale.{renew}")), on_spent=pages.spent)
+    number = launches.issue()
+    url = launch_url(base, number)
 
     workspace = Workspace()
     app = create_app(token=token, settings=settings, workspace=workspace, launches=launches)
     config = uvicorn.Config(
         app, log_level="warning", access_log=False, lifespan="off", timeout_graceful_shutdown=2
     )
-    server = GuardedServer(config, workspace, say, tr)
+    server = GuardedServer(config, workspace, say, tr, on_shutdown=pages.remove_all)
 
     if failures:
         say(tr("port.fallback", wanted=failures[0][0], port=port))
@@ -507,13 +612,27 @@ def main(argv: list[str] | None = None) -> int:
 
         watch_enter(renew_url, source)
     if not args.no_browser:
-        threading.Thread(target=open_when_ready, args=(server, url, say, tr), daemon=True).start()
+        try:
+            # ブラウザには、番号を書いた本人だけが読める HTML の場所を渡す（起動の引数に番号を載せない）
+            target = pages.write(number, url, settings.read().get("theme")).as_uri()
+        except OSError:
+            say(tr("browser.failed", url=url))
+        else:
+            def used() -> bool:
+                return not launches.is_open(number)
+
+            threading.Thread(target=open_when_ready, args=(server, target, url, say, tr, used),
+                             daemon=True).start()
+            sweeper = threading.Timer(LAUNCH_SECONDS + 1, launches.sweep)  # 期限で HTML を消す
+            sweeper.daemon = True
+            sweeper.start()
     try:
         server.run(sockets=[sock])
     except KeyboardInterrupt:
         pass
     finally:
         sock.close()
+        pages.remove_all()
     say(tr("stopped"))
     return 0
 

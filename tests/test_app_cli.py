@@ -13,10 +13,12 @@ import os
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -34,7 +36,7 @@ from circuit_sim.app.cli import (
     terminal_lang,
 )
 from circuit_sim.app.config import Settings
-from circuit_sim.app.server import create_app
+from circuit_sim.app.server import Launches, create_app
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
@@ -434,11 +436,12 @@ def test_there_is_no_switch_to_skip_the_key():
         create_app(token="", settings=Settings(ROOT / "unused"))
 
 
-def test_browser_gets_a_one_time_number_and_never_the_key(tmp_path):
-    """既定のブラウザ（BROWSER の指定で、偽のブラウザに差し替える）に渡すのは、端末に出したのと同じ、
+def test_browser_gets_only_the_location_of_a_private_page(tmp_path):
+    """既定のブラウザ（BROWSER の指定で、偽のブラウザに差し替える）に渡すのは、転送用の HTML の場所だけ。
 
-    一度だけ使える起動の番号の URL。合言葉そのものは、ブラウザの起動の引数にも、端末にも出ない
-    （/proc/<pid>/cmdline から読まれても、使い終われば役に立たない。レビュー2回目の中1）。"""
+    ブラウザの起動の引数（ほかの利用者にも /proc/<pid>/cmdline で見える）には、起動の番号も合言葉も出ない。
+    HTML は本人だけが読める（0600、場所は 0700）。中身は端末に出した URL へ移るだけ。
+    番号が使われたら消える。"""
     record = tmp_path / "opened.json"
     fake = tmp_path / "fake_browser.py"
     fake.write_text(
@@ -447,7 +450,8 @@ def test_browser_gets_a_one_time_number_and_never_the_key(tmp_path):
         encoding="utf-8",
     )
     if WINDOWS:
-        pytest.skip("Windows の BROWSER の指定は、空白を含む場所を扱えないため、ここでは確かめない")
+        pytest.skip("Windows の BROWSER の指定は、空白を含む場所を扱えないため、ここでは確かめない"
+                    "（下の open_when_ready の試験と、手での確かめで見る）")
     config = tmp_path / "config"
     proc = launch(config=config, env={"BROWSER": f"{sys.executable} {fake} %s"})
     try:
@@ -456,22 +460,121 @@ def test_browser_gets_a_one_time_number_and_never_the_key(tmp_path):
         while not record.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         argv = json.loads(record.read_text(encoding="utf-8"))
-        token = token_of(config)
-        assert argv[-1] == url and "?k=" in url
-        assert not any(token in arg for arg in argv), argv
+        token, number = token_of(config), url.split("?k=")[1]
+        assert argv[-1].startswith("file:///") and argv[-1].endswith(".html"), argv
+        assert not any(token in arg or number in arg for arg in argv), argv
+        page = Path(urllib.request.url2pathname(urllib.parse.urlparse(argv[-1]).path))
+        assert page.parent == config
+        assert stat.S_IMODE(page.stat().st_mode) == 0o600 and stat.S_IMODE(config.stat().st_mode) == 0o700
+        assert url in page.read_text(encoding="utf-8")
         wait_up(url.split("?")[0], START_LIMIT_S)
         lines += [proc.stdout.readline() for _ in range(3)]
         assert not any(token in line for line in lines), lines
-        # 偽のブラウザは開かないので、ここで1回使う。2回目は使えない
+        # ブラウザが HTML から移ったのと同じに、番号を1回使う。HTML は消える。2回目は使えない
         first, second = Client(url), Client(url)
         first.login()
         assert first.json("api/health")["instance"]
+        deadline = time.monotonic() + 2
+        while page.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not page.exists(), "番号を使った後も、転送用の HTML が残っている"
         second.login()
         with pytest.raises(urllib.error.HTTPError) as info:
             second.json("api/health")
         assert info.value.code == 401
     finally:
         stop(proc)
+    assert not list(config.glob("open-*.html"))
+
+
+class FakeServer:
+    started = True
+    should_exit = False
+
+
+def test_open_when_ready_passes_a_file_location_and_tells_when_nothing_opened(tmp_path, monkeypatch):
+    """ブラウザに渡すのは file:/// の形の場所（Windows では file:///C:/…）。番号も合言葉も含まない。
+
+    開いたのに番号が使われないまま（HTML がブラウザ以外で開いた、ブラウザがその場所を読めない）なら、
+    端末で URL を開くよう案内する。番号が使われたら HTML は消える。Windows でも流れる。"""
+    opened: list[str] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda target: opened.append(target) or True)
+    pages = cli.LaunchPages(tmp_path / "config")
+    launches = Launches(on_spent=pages.spent)
+    number = launches.issue()
+    url = cli.launch_url("http://127.0.0.1:28470/", number)
+    page = pages.write(number, url, "dark")
+    said: list[str] = []
+    cli.open_when_ready(FakeServer(), page.as_uri(), url, said.append, Texts("ja"),
+                        lambda: not launches.is_open(number), wait=0.3)
+    assert opened == [page.as_uri()]
+    assert opened[0].startswith("file:///") and number not in opened[0]
+    if WINDOWS:
+        assert re.match(r"file:///[A-Za-z]:/", opened[0]), opened
+    else:
+        assert stat.S_IMODE(page.stat().st_mode) == 0o600
+    text = page.read_text(encoding="utf-8")
+    assert f"location.replace({json.dumps(url)})" in text and 'content="dark"' in text
+    assert said == [f"ブラウザで作業画面が開かないときは、ブラウザで次の場所を開いてください: {url}"]
+    assert launches.redeem(number)
+    assert not page.exists()
+
+
+def test_open_when_ready_is_quiet_once_the_number_is_used(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.webbrowser, "open", lambda target: True)
+    said: list[str] = []
+    cli.open_when_ready(FakeServer(), "file:///x.html", "http://u", said.append, Texts("en"), lambda: True,
+                        wait=0.3)
+    assert said == []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda target: False)
+    cli.open_when_ready(FakeServer(), "file:///x.html", "http://u", said.append, Texts("en"), lambda: False,
+                        wait=0.3)
+    assert said == ["Couldn't open a browser. Open this address in your browser: http://u"]
+
+
+@pytest.mark.skipif(WINDOWS, reason="POSIX の SIGTERM（Windows は手で窓を閉じて確かめる）")
+def test_unused_launch_page_is_removed_when_stopped_by_sigterm(tmp_path):
+    """ブラウザが番号を使わないまま（偽のブラウザは開かない）、SIGTERM で止められても、
+
+    転送用の HTML は消える。"""
+    fake = tmp_path / "fake_browser.py"
+    fake.write_text("import sys\n", encoding="utf-8")
+    config = tmp_path / "config"
+    proc = launch(config=config, env={"BROWSER": f"{sys.executable} {fake} %s"})
+    try:
+        url, _ = read_lines_until_url(proc)
+        wait_up(url.split("?")[0], START_LIMIT_S)
+        deadline = time.monotonic() + START_LIMIT_S
+        while not list(config.glob("open-*.html")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert list(config.glob("open-*.html"))
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        assert not list(config.glob("open-*.html"))
+    finally:
+        stop(proc)
+
+
+def test_launch_pages_are_removed_on_expiry_shutdown_and_next_start(tmp_path):
+    """期限が切れた番号の HTML は消える。止めたときも消える。落ちて残ったものは、次の起動で消える
+
+    （ほかに動いている circuit-sim の新しいものは消さない）。"""
+    pages = cli.LaunchPages(tmp_path)
+    launches = Launches(seconds=0.1, on_spent=pages.spent)
+    expired = pages.write(launches.issue(), "http://a")
+    kept = pages.write(launches.issue(), "http://b")
+    time.sleep(0.15)
+    launches.sweep()
+    assert not expired.exists() and not kept.exists()
+    left = pages.write("n", "http://c")
+    pages.remove_all()
+    assert not left.exists()
+    old, fresh = tmp_path / "open-old.html", tmp_path / "open-fresh.html"
+    old.write_text("x", encoding="utf-8")
+    fresh.write_text("x", encoding="utf-8")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    cli.LaunchPages.remove_stale(tmp_path)
+    assert not old.exists() and fresh.exists()
 
 
 @pytest.mark.parametrize(("lang", "note", "renew", "new", "stale"), [

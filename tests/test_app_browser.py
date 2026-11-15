@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from circuit_sim.app import cli
 from circuit_sim.app.config import PREFS, load_token
 from circuit_sim.app.server import COOKIE
 
@@ -724,6 +725,44 @@ def test_launch_url_works_once_and_another_browser_gets_the_guidance(browser, ap
     finally:
         first.close()
         second.close()
+
+
+def test_launch_page_opens_the_workspace_with_saved_preferences_and_no_flash(browser, app, tmp_path):
+    """起動コマンドがブラウザに渡す転送用の HTML（file://）から開く。番号をクッキーと交換して作業画面が開き、
+
+    入口のページに好み（data-prefs）が付く（file:// から来ると、303 では続く / にクッキーが付かない）。
+    暗いテーマを覚えていれば、明るい画面は一瞬も出ない。番号の URL は履歴に残らない。"""
+    app.reset()
+    app.api("api/settings", {"settings": {"theme": "dark", "lang": "en"}}, "PUT")
+    url = app.login_url
+    launch = tmp_path / "open-test.html"
+    launch.write_bytes(cli.launch_page(url, "dark"))
+    context = browser.new_context(viewport={"width": 1280, "height": 720}, locale="ja-JP",
+                                  color_scheme="light")
+    try:
+        context.add_init_script("""new MutationObserver((list, obs) => {
+             if (!document.body || !document.getElementById('root')) return;
+             window.__themeAtBody = document.documentElement.dataset.theme;
+             obs.disconnect();
+           }).observe(document, {childList: true, subtree: true});""")
+        page = context.new_page()
+        requests: list[str] = []
+        page.on("request", lambda r: requests.append(r.url))
+        page.goto(launch.as_uri())
+        page.wait_for_selector("[data-testid=start]")
+        assert page.url == app.url
+        assert page.evaluate("document.documentElement.hasAttribute('data-prefs')"), \
+            "入口のページにクッキーが付かなかった（好みが出ない）"
+        assert page.evaluate("window.__themeAtBody") == "dark", "最初の描画が明るいテーマだった"
+        assert page.evaluate("document.documentElement.lang") == "en"
+        assert [r for r in requests if "?k=" in r] == [url], requests
+        assert not page.evaluate("JSON.stringify(performance.getEntriesByType('navigation'))").count("?k=")
+        if SHOTS:
+            Path(SHOTS).mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(Path(SHOTS) / "launch-page-en-dark.png"))
+    finally:
+        context.close()
+        app.reset()
 
 
 def test_page_from_another_site_reads_settings_before_writing(browser, app):

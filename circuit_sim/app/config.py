@@ -272,8 +272,10 @@ def _write_private(path: Path, data: bytes) -> None:
         raise
 
 
-def _create_exclusive(path: Path, data: bytes) -> bool:
-    """path が無ければ作って data を書く（O_EXCL）。先を越されて、もうあれば False。"""
+def create_private(path: Path, data: bytes) -> bool:
+    """path が無ければ、本人だけが読める権限で作って data を書く（O_EXCL）。
+
+    先を越されて、もうあれば False。"""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -323,7 +325,7 @@ def load_token(directory: Path) -> str:
         return token
     new = secrets.token_urlsafe(32)  # 43 文字
     data = (new + "\n").encode("ascii")
-    if _create_exclusive(path, data):
+    if create_private(path, data):
         return new
     # もうある。同時に起動したほかの circuit-sim が、作ったところで書いている途中（空で新しい）なら、
     # 書き終えるのを待って読み直す

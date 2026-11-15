@@ -179,13 +179,17 @@ class Launches:
 
     番号はクッキー（合言葉）と交換したら捨てる。LAUNCH_SECONDS たったものも使えない。
     使い終わった・期限が切れた・知らない番号で、クッキーも持たないページが開かれたら on_stale を呼ぶ
-    （端末に、新しい URL の出し方を出す。間隔は STALE_REPORT_SECONDS 以上）。"""
+    （端末に、新しい URL の出し方を出す。間隔は STALE_REPORT_SECONDS 以上）。
+    番号が使われた・期限が切れた・古くて捨てたときは on_spent(番号) を呼ぶ（起動コマンドが、番号を書いた
+    転送用の HTML を消す）。期限切れは、次に番号を扱ったときか sweep() で見つける。"""
 
     def __init__(self, seconds: float = LAUNCH_SECONDS, clock: Callable[[], float] = time.monotonic,
-                 on_stale: Callable[[], None] | None = None) -> None:
+                 on_stale: Callable[[], None] | None = None,
+                 on_spent: Callable[[str], None] | None = None) -> None:
         self.seconds = seconds
         self.clock = clock
         self.on_stale = on_stale
+        self.on_spent = on_spent
         self.lock = threading.Lock()
         self.open: dict[str, float] = {}  # 番号 → 使えなくなる時刻
         self.reported_at: float | None = None
@@ -193,25 +197,46 @@ class Launches:
     def issue(self) -> str:
         number = secrets.token_urlsafe(24)
         with self.lock:
-            self._forget_expired()
+            gone = self._forget_expired()
             while len(self.open) >= LAUNCH_KEPT:
-                del self.open[next(iter(self.open))]  # いちばん古いもの
+                oldest = next(iter(self.open))
+                del self.open[oldest]
+                gone.append(oldest)
             self.open[number] = self.clock() + self.seconds
+        self._spent(gone)
         return number
 
     def redeem(self, number: str) -> bool:
         """番号が使えるなら捨てて True。比べるのにかかる時間は、どこまで合っているかによらない。"""
         given = number.encode("utf-8", "replace")
         with self.lock:
-            self._forget_expired()
+            gone = self._forget_expired()
             hit = None
             for known in self.open:
                 if hmac.compare_digest(given, known.encode("ascii")):
                     hit = known
-            if hit is None:
-                return False
-            del self.open[hit]
-            return True
+            if hit is not None:
+                del self.open[hit]
+                gone.append(hit)
+        self._spent(gone)
+        return hit is not None
+
+    def is_open(self, number: str) -> bool:
+        """まだ使われておらず、期限も切れていない。"""
+        with self.lock:
+            until = self.open.get(number)
+            return until is not None and until > self.clock()
+
+    def sweep(self) -> None:
+        """期限の切れた番号を捨てる（on_spent を呼ぶ）。"""
+        with self.lock:
+            gone = self._forget_expired()
+        self._spent(gone)
+
+    def _spent(self, numbers: list[str]) -> None:
+        if self.on_spent is not None:
+            for number in numbers:
+                self.on_spent(number)
 
     def stale(self) -> None:
         if self.on_stale is None:
@@ -223,10 +248,36 @@ class Launches:
             self.reported_at = now
         self.on_stale()
 
-    def _forget_expired(self) -> None:
+    def _forget_expired(self) -> list[str]:
         now = self.clock()
-        for number in [n for n, until in self.open.items() if until <= now]:
+        gone = [n for n, until in self.open.items() if until <= now]
+        for number in gone:
             del self.open[number]
+        return gone
+
+
+def from_another_page(headers: Mapping[str, str]) -> bool:
+    """ほかのページ（転送用の HTML の file://、別のサイトのリンク）から移ってきたナビゲーションか。
+
+    そのとき SameSite=Strict のクッキーは、続く / への移動（303）にも付かない（入口のページに data-prefs が
+    出ず、暗いテーマで明るい画面が一瞬出る）。Sec-Fetch-Site が無いブラウザは、HTML を求めているかで決める。
+    headers の名前は小文字。"""
+    site = headers.get("sec-fetch-site")
+    if site is not None:
+        return site.lower() in ("cross-site", "same-site")
+    return "text/html" in headers.get("accept", "").lower()
+
+
+def hop_page(theme: str | None) -> Response:
+    """このページ自身から / へ移る、中身の無いページ（同じ場所からの移動なので、クッキーが付く）。
+
+    移るまでの一瞬の地の色は、覚えているテーマ（無ければ OS の設定）に合わせる。"""
+    scheme = theme if theme in ("light", "dark") else "light dark"
+    page = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+            f'<meta name="color-scheme" content="{scheme}">'
+            '<meta http-equiv="refresh" content="0;url=/"><title>circuit-sim</title>'
+            '</head><body></body></html>')
+    return Response(page, media_type=MEDIA_TYPES[".html"])
 
 
 # ------------------------------------------------------------------ 要求の確かめ
@@ -508,8 +559,14 @@ def create_app(
 
     def index(request: Request) -> Response:
         if TOKEN_PARAM in request.query_params:
-            # 起動したときにブラウザへ渡した URL: 起動の番号を合言葉のクッキーと交換し、番号の無い URL へ移す
-            response = RedirectResponse("/", status_code=303)
+            # 起動したときにブラウザへ渡した URL: 起動の番号を合言葉のクッキーと交換し、番号の無い URL へ
+            # 移す。ほかのページ（転送用の HTML）から来たときは、このページ自身から移る（303 だとクッキーが
+            # 付かない）
+            headers = {k.lower(): v for k, v in request.headers.items()}
+            if from_another_page(headers):
+                response = hop_page(settings.read().get("theme"))
+            else:
+                response = RedirectResponse("/", status_code=303)
             if launches.redeem(request.query_params[TOKEN_PARAM]):
                 response.set_cookie(COOKIE, token, max_age=COOKIE_MAX_AGE, path="/", httponly=True,
                                     samesite="strict")

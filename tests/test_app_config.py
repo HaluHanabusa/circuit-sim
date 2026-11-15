@@ -255,6 +255,22 @@ def test_token_file_and_folder_get_an_explicit_private_acl_on_windows(tmp_path):
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")
+def test_launch_page_is_private_on_windows(tmp_path):
+    """ブラウザに渡す転送用の HTML（中に起動の番号がある）も、本人と SYSTEM だけが読める（D:P）。"""
+    from circuit_sim.app.cli import LaunchPages
+
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    subprocess.run(["icacls", str(parent), "/grant", "*S-1-1-0:(OI)(CI)R"], capture_output=True, check=True)
+    folder = parent / "circuit-sim"
+    load_token(folder)
+    page = LaunchPages(folder).write("n", "http://127.0.0.1:28470/?k=n")
+    sddl = saved_sddl(page, tmp_path)
+    assert "D:P" in sddl, sddl
+    assert sddl_trustees(sddl[sddl.index("D:"):].strip()) == {windows_user_sid(), "SY"}, sddl
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")
 def test_token_readable_by_everyone_is_replaced_on_windows(tmp_path):
     """Everyone が読めた合言葉は、漏れたものとみなして作り直し、権限も直す。"""
     first = load_token(tmp_path / "c")
