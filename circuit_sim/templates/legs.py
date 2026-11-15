@@ -103,9 +103,3 @@ class HalfBridgeLeg:
                           value=self.r_on),
             ], []
         raise ValueError(f"未対応のモデルの精度 '{fidelity}'（switching か average）")
-
-    def signals(self, fidelity: Fidelity) -> list[str]:
-        """このレグが結果に足す信号の名前。"""
-        if fidelity == "switching":
-            return [f"gate({self.gate})", f"gate({self.gate_low})", f"on({self.high})", f"on({self.low})"]
-        return [f"i({self.average_id})", f"v({self.average_node})"]

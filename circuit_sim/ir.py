@@ -82,14 +82,15 @@ class Spec(BaseModel):
         inferred = "schema_version" not in data
         if inferred:
             control = data.get("control")
-            bare = isinstance(control, dict) and any(not isinstance(v, dict) for v in control.values())
+            bare = isinstance(control, dict) and any(
+                not isinstance(v, dict | Quantity) for v in control.values())
             data = {**data, "schema_version": "0.1" if bare else SCHEMA_VERSION}
         if data.get("schema_version") == "0.1" and isinstance(data.get("control"), dict):
             converted = {}
             for name, value in data["control"].items():
                 if value is None or (isinstance(value, int | float) and not isinstance(value, bool)):
                     converted[name] = {"value": value, "unit": "", "source": LEGACY_SOURCE}
-                elif isinstance(value, dict):
+                elif isinstance(value, dict | Quantity):
                     converted[name] = value
                 else:
                     raise ValueError(

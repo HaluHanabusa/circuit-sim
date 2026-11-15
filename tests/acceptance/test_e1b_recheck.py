@@ -366,10 +366,6 @@ def test_initial_gains_each_failure_reason_is_true(args, opts, reason):
     assert _check_design(args, opts) == reason
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合（軽微。既定の探索範囲では起きない）: f_cross_max を f_ctrl/2 以上にすると、最良の候補を"
-    "探索の上端（0.9999·ナイキスト）に置き、その交差周波数が確かめの範囲の端にあって見つからないので、"
-    "位相余裕を inf と報告し「目標の 55° は満たす」と書く。その候補の閉ループの極の半径は 18.6（不安定）"))
 def test_initial_gains_best_candidate_is_never_reported_as_meeting_the_target_when_unstable():
     with pytest.raises(GainDesignError) as info:
         buck_voltage_mode_pid(VIN, 47e-6, 10e-6, 1000.0, 20e3, f_cross_max=1e9)

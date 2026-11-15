@@ -7,13 +7,16 @@
 import json
 import math
 import time
+import typing
 from pathlib import Path
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 from scipy.signal import cont2discrete
 
-from circuit_sim import Spec, expand
+import circuit_sim
+from circuit_sim import Quantity, Spec, expand
 from circuit_sim.__main__ import main
 from circuit_sim.control import Pid
 from circuit_sim.templates import MissingValueError
@@ -376,6 +379,54 @@ def test_file_without_version_is_read_by_its_contents():
     assert not spec.version_inferred
     assert not any("schema_version" in n for n in expand(spec).notes)
     assert any("版 0.1 の形" in n for n in expand(spec).notes)
+
+
+def test_spec_built_from_quantity_objects_without_version_is_version_02():
+    """Python で Quantity のオブジェクトから版の欄なしで作った仕様は、版 0.2（0.1 と推定して落ちない）。"""
+    d = spec_dict()
+    plant = {k: Quantity(**q) for k, q in d["plant"].items()}
+    control = {k: Quantity(**q) for k, q in d["control"].items()}
+    spec = Spec(template="buck_voltage_mode", plant=plant, control=control, simulation=d["simulation"])
+    assert (spec.schema_version, spec.version_inferred) == ("0.2", True)
+    ex = expand(spec)
+    assert not any("版 0.1" in n for n in ex.notes)
+    assert ex.controllers[0].pid.kp == 0.0117
+    legacy = Spec(schema_version="0.1", template="buck_voltage_mode", plant=plant,   # 版 0.1 に混ぜても読める
+                  control={**control, "Kp": 0.0117})
+    assert legacy.control["Kp"].source == "記載なし" and legacy.control["Ki"] == control["Ki"]
+
+
+def test_supported_schema_versions_are_exactly_the_readable_ones():
+    """公開の一覧 SUPPORTED_SCHEMA_VERSIONS が、実際に読める版と一致する。
+
+    書き出す版 SCHEMA_VERSION はその最新。
+
+    一覧の版はすべて読め、一覧に無い版（前後の番号、書き方の揺れ）はすべて断られる。
+    """
+    supported = circuit_sim.SUPPORTED_SCHEMA_VERSIONS
+    assert circuit_sim.SCHEMA_VERSION == supported[-1] == "0.2"
+    assert set(typing.get_args(Spec.model_fields["schema_version"].annotation)) == set(supported)
+    rc = {"template": "rc_lowpass",
+          "plant": {"Vin": {"value": 5, "unit": "V"}, "R": {"value": 1, "unit": "kohm"},
+                    "C": {"value": 1, "unit": "uF"}}}
+    candidates = [f"{major}.{minor}" for major in range(3) for minor in range(10)]
+    candidates += ["0.10", "0.2.0", " 0.2", ""]
+    for version in candidates:
+        try:
+            spec = Spec.model_validate({**rc, "schema_version": version})
+        except ValidationError:
+            assert version not in supported, version
+        else:
+            assert version in supported, version
+            assert spec.schema_version == version and expand(spec).netlist.component("R1").value == 1000.0
+    for version in supported:                                    # 降圧コンバータの例も、どの版でも読める
+        d = spec_dict(t_end=1e-4)
+        d["schema_version"] = version
+        if version == "0.1":
+            d["control"] = {k: q["value"] for k, q in d["control"].items()}
+            d["control"].update(f_sw=100e3, f_ctrl=100e3, Tf=2.5e-6)
+        assert expand(Spec.model_validate(d)).controllers[0].pid.kp == 0.0117
+    assert Spec.model_validate(rc).model_dump()["schema_version"] == circuit_sim.SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("template,plant", [
