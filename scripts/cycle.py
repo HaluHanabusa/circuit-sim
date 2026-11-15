@@ -945,8 +945,8 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
     worktree = Path(state["worktree"])
     source = Path(args.result)
     try:
-        text = source.read_text(encoding="utf-8")
-        result = json.loads(text)
+        data = source.read_bytes()
+        result = json.loads(data.decode("utf-8"))
     except (OSError, ValueError) as exc:        # 読めない、UTF-8 でない、JSON でない
         raise CycleError(f"結果のファイル {source} を読めない: {exc}") from exc
     refused = f"結果のファイル {source.name} は取り込めない: "
@@ -971,7 +971,7 @@ def cmd_record_ci(args: argparse.Namespace) -> int:
             f"一致しない（違うファイル: {', '.join(differing[:5])}）"
         )
     copy = runs_dir(root) / f"{args.id}-{WINDOWS_GATE}-{stamp()}.json"
-    copy.write_text(text, encoding="utf-8", newline="\n")
+    copy.write_bytes(data)                      # 取り込んだ結果の写し（中身は変えない）
     extra = {"os": system, "commit": result["commit"]}
     add_record(
         root, args.id, WINDOWS_GATE, result["verdict"], tree, LOCAL_CI_SCRIPT, "ci",

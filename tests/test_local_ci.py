@@ -79,7 +79,7 @@ runs = json.loads(notes.read_text(encoding="utf-8")) if notes.exists() else []
 notes.write_text(json.dumps(runs + [note]), encoding="utf-8")
 print("check output " + os.environ.get("SOME_VARIABLE", ""))
 if plan.get("junit") is not None and junit:      # ハーネスの check からは、書く先を渡されない
-    pathlib.Path(junit[0]).write_text(plan["junit"], encoding="utf-8")
+    pathlib.Path(junit[-1]).write_text(plan["junit"], encoding="utf-8")     # pytest と同じく、後のほう
 for name, text in plan.get("write", {}).items():
     pathlib.Path(name).write_text(text, encoding="utf-8")
 time.sleep(plan.get("sleep", 0))
@@ -126,9 +126,15 @@ def work_dir(root: Path) -> Path:
 
 
 def ci_env(root: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """local_ci.py を動かすときの環境変数。
+
+    この試験の全体が、外側の local_ci.py の下で走っていることがある（POのPCでの確認が、その形）。
+    外側が pytest に渡したオプション（試験ごとの結果を書く先）は、引き継がない。
+    """
     work = str(work_dir(root))
+    base = {key: value for key, value in TEST_ENV.items() if key != "PYTEST_ADDOPTS"}
     return {
-        **TEST_ENV, "CYCLE_ROOT": str(root), "TMPDIR": work, "TEMP": work, "TMP": work,
+        **base, "CYCLE_ROOT": str(root), "TMPDIR": work, "TEMP": work, "TMP": work,
         "NOTES": str(root.parent / "notes.json"), **(extra or {}),
     }
 
@@ -236,6 +242,11 @@ def test_checks_the_commit_in_a_clean_place_whatever_the_working_folder_holds(re
 
 def test_check_gets_the_report_file_outside_the_checked_content_and_no_input(repo):
     """試験ごとの結果を書かせる先は、確かめる内容の外。呼び出し元の入力は渡さない。試験の入れ子の印は消さない。"""
+    if not WINDOWS:
+        # 作業用の場所への道に、リンクを挟む（Windows の一時フォルダの、短い名前の代わり）。
+        # 場所は、たどった先で扱う。git に渡す場所と、pytest に渡す場所が、同じ書き方になる
+        (repo.parent / "実際の場所").mkdir()
+        (repo.parent / "作業 用").symlink_to(repo.parent / "実際の場所", target_is_directory=True)
     env = {"PYTEST_ADDOPTS": "-p no:cacheprovider", "CIRCUIT_SIM_PYTEST_RUNNING": "1", "READ_STDIN": "1"}
     proc = start_local_ci(repo, "--no-fetch", "--ref", "main", env=env, stdin=subprocess.PIPE)
     out, err = proc.communicate("input of the caller\n", timeout=120)
@@ -894,7 +905,8 @@ def test_result_of_the_unit_branch_can_be_recorded_as_the_windows_gate(tmp_path)
     set_header(root, "needs_windows: true\n")
     wt = implement(root)
     commit(wt)
-    env = {"NOTES": str(tmp_path / "notes.json")}           # 試験用の確認スクリプトが控えを書く先
+    # 試験用の確認スクリプトが控えを書く先。外側の pytest のオプションは、引き継がない
+    env = {"NOTES": str(tmp_path / "notes.json"), "PYTEST_ADDOPTS": ""}
     tree = cycle(root, "snapshot", "U1").stdout.strip()
     assert tree == sh(wt, "git", "rev-parse", "HEAD^{tree}")
     for gate, by in (("review", "rev-1"), ("verify", "ver-1")):

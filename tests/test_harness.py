@@ -1930,10 +1930,14 @@ def failed_result(tree: str) -> dict:
 
 
 def record_ci(root: Path, result: object) -> subprocess.CompletedProcess:
-    """結果をファイルに書いて、record-ci で取り込む。result が文字列かバイト列なら、そのまま書く。"""
+    """結果をファイルに書いて、record-ci で取り込む。result が文字列かバイト列なら、そのまま書く。
+
+    書き方は、scripts/local_ci.py と同じ（字下げつき、最後に改行）。
+    """
     path = root.parent / "result.json"
-    data = result if isinstance(result, str | bytes) else json.dumps(result, ensure_ascii=False)
-    path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+    if not isinstance(result, str | bytes):
+        result = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+    path.write_bytes(result if isinstance(result, bytes) else result.encode("utf-8"))
     return cycle(root, "record-ci", "U1", "--result", str(path))
 
 
@@ -1966,8 +1970,7 @@ def test_needs_windows_requires_a_windows_result_for_the_content(repo):
     assert main_log(repo) == ["仕様の見出し", "init"]
 
     result = ci_result(tree)
-    with write_text_like_windows():
-        recorded = record_ci(repo, result)
+    recorded = record_ci(repo, result)
     assert recorded.returncode == 0, recorded.stderr
     assert f"U1 windows: pass を記録（対象 {tree[:10]}、Windows）" in recorded.stdout
     entry = state(repo)["gates"]["windows"]
@@ -1975,10 +1978,10 @@ def test_needs_windows_requires_a_windows_result_for_the_content(repo):
         "pass", tree, "scripts/local_ci.py", "ci",
     )
     assert (entry["os"], entry["commit"]) == ("Windows", "c" * 40)
-    # 取り込んだ結果の写しが、記録として残る（改行は LF、区切りは /）
+    # 取り込んだ結果の写しが、中身を変えずに、記録として残る（記録するパスの区切りは /）
     assert entry["report"].startswith(".cycle/runs/U1-windows-") and entry["report"].endswith(".json")
+    assert (repo / entry["report"]).read_bytes() == (repo.parent / "result.json").read_bytes()
     assert json.loads((repo / entry["report"]).read_text(encoding="utf-8")) == result
-    assert b"\r" not in (repo / entry["report"]).read_bytes()
     assert state(repo)["history"][-1]["gate"] == "windows"
     assert "windows    pass  scripts/local_ci.py" in cycle(repo, "status", "U1").stdout
 
