@@ -11,13 +11,14 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 import pytest
@@ -248,6 +249,15 @@ def test_check_gets_the_report_file_outside_the_checked_content_and_no_input(rep
     assert note["guard"] == "1"
     assert "check output" in out                                         # 確認の出力は、そのまま画面に流れる
     assert_cleaned_up(repo)
+
+
+def test_report_file_option_survives_the_way_pytest_splits_it_on_windows():
+    """pytest は、環境変数のオプションを、どのOSでもシェルの決まりで分ける。Windows のパスが崩れないこと。"""
+    junit_file = PureWindowsPath(r"C:\Users\名前 x\AppData\Local\Temp\circuit-sim-ci-1\junit.xml")
+    assert shlex.split(LOCAL_CI.junit_options(junit_file)) == [
+        "--junitxml=C:/Users/名前 x/AppData/Local/Temp/circuit-sim-ci-1/junit.xml",
+        "-o", "junit_family=xunit1",
+    ]
 
 
 @pytest.fixture
@@ -524,6 +534,14 @@ def test_run_with_a_failure_a_gap_or_a_contradiction_is_not_a_pass(repo, case):
     assert_cleaned_up(repo)
 
 
+def test_names_of_changed_files_are_limited_in_the_result(repo):
+    set_plan(repo, junit=PASSING, write={f"left-{number:02}.txt": "x\n" for number in range(25)})
+    assert local_ci(repo, "--no-fetch", "--ref", "main").returncode == 1
+    [written] = results(repo)
+    assert written["reason"] == "content_changed"
+    assert written["changed"] == [f"left-{number:02}.txt" for number in range(20)]
+
+
 def test_failed_tests_are_counted_and_named_from_the_report(repo):
     cases = (("test_a", "passed"), ("test_b", "failure"), ("test_c", "error"), ("test_d", "skipped"))
     set_plan(repo, exit=1, junit=junit(*cases))
@@ -590,6 +608,13 @@ def test_result_that_cannot_be_written_is_not_a_pass(repo):
     assert "結果を" in result.stderr and "に書けない" in result.stderr
     assert result_files(repo) == []
     assert_cleaned_up(repo)
+
+
+def test_git_that_cannot_be_started_is_an_error_not_a_crash(repo):
+    with mock.patch.object(HARNESS, "run_git", side_effect=FileNotFoundError("git")):
+        result = local_ci(repo, "--no-fetch", "--ref", "main")
+    assert result.returncode == 2 and result.stderr.startswith("エラー: ")
+    assert results(repo) == [] and notes(repo) == []
 
 
 def test_result_write_waits_while_another_process_has_the_file_open(repo):

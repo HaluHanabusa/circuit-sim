@@ -619,9 +619,7 @@ def content_info(root: Path) -> dict:
         top = run_git(root, "rev-parse", "--show-toplevel")
         if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root.resolve():
             return unknown
-        commit = run_git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").stdout.strip()
-        if not is_tree_id(commit):
-            return unknown
+        commit = git(root, "rev-parse", "--verify", "HEAD^{commit}")     # コミットがまだ無ければ、失敗する
         tree = tree_id(root)
         dirty = tree != git(root, "rev-parse", f"{commit}^{{tree}}")
     except (OSError, CycleError):

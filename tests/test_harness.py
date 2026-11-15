@@ -1861,6 +1861,14 @@ def test_unreadable_merge_record_blocks_merge(repo):
     assert main_log(repo) == ["init"]
 
 
+def test_captured_command_gets_the_environment_it_is_given(tmp_path):
+    code = "import os; print(os.environ.get('GIVEN'), os.environ.get('NOT_GIVEN'))"
+    env = {**TEST_ENV, "GIVEN": "yes"}
+    with mock.patch.dict(os.environ, {"NOT_GIVEN": "leaked"}):
+        proc = CYCLE_MODULE.run_captured([sys.executable, "-c", code], tmp_path, 60, env)
+    assert proc.stdout.split() == ["yes", "None"]
+
+
 # ------------------------------------------------------------ ツリーIDは、どのOSでも同じ
 
 def test_tree_id_matches_the_commit_where_the_executable_mark_cannot_be_shown(repo):
@@ -1958,7 +1966,8 @@ def test_needs_windows_requires_a_windows_result_for_the_content(repo):
     assert main_log(repo) == ["仕様の見出し", "init"]
 
     result = ci_result(tree)
-    recorded = record_ci(repo, result)
+    with write_text_like_windows():
+        recorded = record_ci(repo, result)
     assert recorded.returncode == 0, recorded.stderr
     assert f"U1 windows: pass を記録（対象 {tree[:10]}、Windows）" in recorded.stdout
     entry = state(repo)["gates"]["windows"]

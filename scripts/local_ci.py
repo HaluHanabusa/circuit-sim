@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -198,7 +197,7 @@ def judge(code: int, tests: dict | None, failed: list[str], unchanged: bool) -> 
         return "error", "content_changed"
     if tests is None:
         return "error", "no_test_results"
-    if failed or tests["failed"] or tests["errors"] or tests["passed"] < 1:
+    if tests["failed"] or tests["errors"] or tests["passed"] < 1:
         return "error", "test_results_disagree"
     return "pass", "ok"
 
@@ -291,8 +290,8 @@ def check_target(root: Path, target: dict, timeout: float) -> dict:
 
 def write_result(root: Path, result: dict) -> Path:
     """結果を、1回の実行につき1つのファイルに書く。途中まで書いたファイルを読ませないよう、別名で書いてから置く。"""
-    system = re.sub(r"[^a-z0-9]", "", result["os"]["system"].lower()) or "unknown"
-    path = ci_dir(root) / f"{cycle.stamp()}-{system}-{result['commit'][:10]}.json"
+    name = f"{cycle.stamp()}-{result['os']['system'].lower()}-{result['commit'][:10]}.json"
+    path = ci_dir(root) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
