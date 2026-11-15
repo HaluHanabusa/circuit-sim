@@ -8,9 +8,17 @@
     スイッチング: 搬送波の周期 T の中央にオンの区間（三角波）、または頭にオンの区間（のこぎり波）。
                   デューティは連続値（量子化しない）。
     平均: v_sw = d·Vin を制御周期のあいだ一定。
+    オン抵抗 r_sw: 状態の式の −r_sw·iL。相補のゲート（デッドタイム0）では、どちらのスイッチが導通していても
+                  出力の経路にオン抵抗が1つ入るので、スイッチングでも平均でも同じ項になる（周期平均を取ると
+                  L·d⟨iL⟩/dt = d·Vin − r_sw·⟨iL⟩ − ⟨v_out⟩。オフ抵抗の漏れは入れない）。
     制御: t_k = k·Tc に v_out を測り、このファイルのPIDで u_k を作り、[t_{k+1}, t_{k+2}) で使う。
     周期平均は、区分ごとの ∫x を拡大行列で厳密に求めて足す。
 製品側の不具合で落ちる試験は xfail(strict=True) にしてある。直ったら XPASS で落ちるので、印を外す。
+
+2026-11-15 の再検証（c96ad81。記録は docs/verification/E1b-verifier-2.md）で書き換えた:
+  エンジンの平均モデルのレグにオン抵抗（1 mΩ）が直列に入った（v(sw) = d·Vin − r_on·iL）ので、平均モデルと
+  比べる参照にも r_sw = R_ON を入れた。基準6の平均モデルの v(sw) の照合を、この式に合わせた。
+  ゲインの初期値の式の試験の xfail(strict) の印は、c96ad81 で（直ったので）外されていた。
 """
 from __future__ import annotations
 
@@ -38,7 +46,8 @@ EXAMPLE = ROOT / "examples" / "buck_voltage_mode.json"
 VIN, L, C, R, VREF = 24.0, 47e-6, 100e-6, 6.0, 12.0
 KP, KI, KD, TF = 0.0117, 147.0, 2.74e-6, 2.5e-6
 T = 1e-5                  # 搬送波の周期（100 kHz）
-R_ON = 1e-3               # エンジンのスイッチのオン抵抗の既定（ir.DEFAULT_R_ON。参照モデルの r_sw に使う）
+R_ON = 1e-3               # エンジンのスイッチのオン抵抗の既定（ir.DEFAULT_R_ON。参照モデルの r_sw に使う。
+#                           c96ad81 から平均モデルのレグにも直列に入る）
 
 # 許容差（測る前に決めた根拠）
 # 平均モデルと厳密な平均の参照: エンジンは刻み T/10 の台形則。LC の共振は 430 刻みで、台形則の周波数の
@@ -258,7 +267,7 @@ def test_c2_anti_windup_on_the_buck_load_step():
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_c4_average_model_matches_exact_average_reference(closed, scenario):
     _, res = closed[scenario, "average"]
-    ref, _, _ = reference(mode="average", **SCENARIOS[scenario][2])
+    ref, _, _ = reference(mode="average", r_sw=R_ON, **SCENARIOS[scenario][2])
     assert max_diff(period_avg(res), ref) <= TOL_AVG_EXACT
 
 
@@ -293,13 +302,13 @@ def test_c3_steady_state_is_vref_minus_half_ripple(closed):
 def test_open_loop_switching_matches_exact_solution_for_both_carriers():
     """固定デューティ 0.5 の起動（Q = 8.75 で大きく振れる）: エンジンのスイッチングモデルは、
     どちらの搬送波でも厳密解（オン抵抗 1 mΩ を入れた参照）と 0.05% 以内。
-    平均モデルは厳密な平均と 0.1% 以内。"""
+    平均モデルは厳密な平均（オン抵抗 1 mΩ を入れた参照）と 0.1% 以内。"""
     for carrier in ("triangle", "sawtooth"):
         res = build("switching", 3e-3, control=OPEN, carrier=carrier).run()
         ref, _, _ = reference(mode="switching", t_end=3e-3, fixed=0.5, carrier=carrier, r_sw=R_ON)
         assert max_diff(period_avg(res), ref) <= TOL_SW_EXACT_OPEN, carrier
     res = build("average", 3e-3, control=OPEN).run()
-    ref, _, _ = reference(mode="average", t_end=3e-3, fixed=0.5)
+    ref, _, _ = reference(mode="average", t_end=3e-3, fixed=0.5, r_sw=R_ON)
     assert max_diff(period_avg(res), ref) <= TOL_AVG_EXACT
 
 
@@ -319,7 +328,8 @@ def test_open_loop_sawtooth_would_break_criterion_4():
 @pytest.mark.parametrize("f_ctrl_khz", [100, 50])
 def test_c6_command_equals_own_pid_on_samples_one_period_later(fidelity, f_ctrl_khz):
     """エンジンが記録した v(out) を t_k で取り、このファイルのPIDに通すと、その出力は cmd(duty) の
-    [t_{k+1}, t_{k+2}) の値と 1e-12 以内で一致する。0周期・2周期ずらすと合わない。"""
+    [t_{k+1}, t_{k+2}) の値と 1e-12 以内で一致する。0周期・2周期ずらすと合わない。
+    平均モデルでは、レグの電圧源の端 v(sw_avg) が Vin·指令、オン抵抗の先 v(sw) が Vin·指令 − r_on·i(L1)。"""
     tc = 1.0 / (f_ctrl_khz * 1e3)
     ex = build(fidelity, 3e-3, control={"f_ctrl": (f_ctrl_khz, "kHz"), "Vref_step": (10, "V"),
                                         "t_ref_step": (2, "ms")})
@@ -337,7 +347,9 @@ def test_c6_command_equals_own_pid_on_samples_one_period_later(fidelity, f_ctrl_
     assert np.max(np.abs(used[2:] - mine[:-2])) > 1e-3 and np.max(np.abs(used - mine)) > 1e-3
     if fidelity == "average":
         mid = n // 2
-        assert np.max(np.abs(res["v(sw)"][mid::n][:k_max] - VIN * used)) <= 1e-9
+        i_l = res["i(L1)"][mid::n][:k_max]
+        assert np.max(np.abs(res["v(sw_avg)"][mid::n][:k_max] - VIN * used)) <= 1e-9
+        assert np.max(np.abs(res["v(sw)"][mid::n][:k_max] - (VIN * used - R_ON * i_l))) <= 1e-9
 
 
 @pytest.mark.parametrize("duty", [0.25, 0.8])
@@ -377,7 +389,7 @@ def test_control_period_twice_the_carrier_period():
     control = {"f_ctrl": (50, "kHz")}
     pa = period_avg(build("average", control=control).run())
     ps = period_avg(build("switching", control=control).run())
-    ra, _, _ = reference(mode="average", f_ctrl=50e3)
+    ra, _, _ = reference(mode="average", f_ctrl=50e3, r_sw=R_ON)
     rs, _, _ = reference(mode="switching", f_ctrl=50e3, r_sw=R_ON)
     assert max_diff(pa, ra) <= TOL_AVG_EXACT
     assert max_diff(ps, rs) <= TOL_SW_EXACT_CLOSED
@@ -389,7 +401,7 @@ def test_light_load_negative_inductor_current_still_matches_average():
     plant = {"R_load": (1000, "ohm")}
     sw = build("switching", plant=plant).run()
     pa = period_avg(build("average", plant=plant).run())
-    ra, _, _ = reference(mode="average", r_load=1000.0)
+    ra, _, _ = reference(mode="average", r_load=1000.0, r_sw=R_ON)
     assert sw["i(L1)"].min() < -0.3
     assert max_diff(period_avg(sw), pa) <= TOL_MODELS
     assert max_diff(pa, ra) <= TOL_AVG_EXACT
@@ -397,7 +409,7 @@ def test_light_load_negative_inductor_current_still_matches_average():
 
 def test_esr_average_model_matches_exact_reference():
     pa = period_avg(build("average", plant={"C_esr": (100, "mohm")}).run())
-    ra, _, _ = reference(mode="average", resr=0.1)
+    ra, _, _ = reference(mode="average", resr=0.1, r_sw=R_ON)
     assert max_diff(pa, ra) <= TOL_AVG_EXACT
 
 
