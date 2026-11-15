@@ -89,16 +89,12 @@ def _solve_or_raise(M: np.ndarray, rhs: list[np.ndarray], h: float) -> list[np.n
     return out
 
 
-def prepare(
-    E: np.ndarray, G: np.ndarray, B: np.ndarray, h: float, backward_euler: bool = False
-) -> Operators:
-    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。
+def consistent_maps(E: np.ndarray, G: np.ndarray, B: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """整合の取れた値を作る行列 Rex, Ru:  x = Rex (E x) + Ru u。
 
     解けない回路では CircuitError。undetermined 属性に、決まらない未知数の番号が入る。
     """
-    n, n_u = B.shape
-
-    # --- 整合の取れた初期値・不連続点の処理 -----------------------------------
+    n = B.shape[0]
     # 状態（コンデンサ電圧・インダクタ電流）は E x で決まる。残りの変数は、
     # 方程式のうち微分を含まない部分  W^T G x = W^T B u  （W は E の左零空間）で決まる。
     W = _left_null_space(E)
@@ -120,6 +116,20 @@ def prepare(
     S_pinv = np.linalg.pinv(S)
     Rex = S_pinv[:, :n] * dE[None, :]
     Ru = (S_pinv[:, n:] * dA[None, :]) @ B_alg
+    return Rex, Ru
+
+
+def prepare(
+    E: np.ndarray, G: np.ndarray, B: np.ndarray, h: float, backward_euler: bool = False
+) -> Operators:
+    """1つの回路状態の行列を用意する。backward_euler=True なら後退オイラーの分も作る。
+
+    解けない回路では CircuitError。undetermined 属性に、決まらない未知数の番号が入る。
+    """
+    n, n_u = B.shape
+
+    # --- 整合の取れた初期値・不連続点の処理 -----------------------------------
+    Rex, Ru = consistent_maps(E, G, B)
     Rx = Rex @ E
 
     # --- 台形則 ---------------------------------------------------------------
@@ -205,6 +215,24 @@ def run(
 
 
 # ---------------------------------------------------------------- スイッチング
+
+def diode_band(x: np.ndarray, n_nodes: int, v_floor: float, v_rel: float) -> float:
+    """ダイオードの状態が落ち着かないときに、丸め誤差とみなす電圧の幅 [V]。
+
+    幅は max(v_floor, v_rel × 節点電圧の最大の絶対値)。ダイオードの電圧は、大きさが節点電圧と同程度の
+    2つの値の差なので、丸め誤差も節点電圧に比例する。電流がちょうど 0 の点（計算の先頭で
+    インダクタ電流がすべて 0 のときなど）では、オンでもオフでも電圧が丸め誤差だけになり、
+    その符号で2つの状態を往復する。通常の判定（オンは電圧 < 0、オフは電圧 > v_on で反転）には使わない。
+    """
+    scale = 0.0
+    for i in range(n_nodes):
+        a = abs(x[i])
+        if a > scale:
+            scale = a
+    band = v_rel * scale
+    return band if band > v_floor else v_floor
+
+
 # run_switched() の戻り値
 DONE = 0           # k_stop まで進んだ
 NEED_STATE = 1     # 行列を用意していない回路状態に出会った（符号は ctl[CTL_CODE]）
@@ -247,6 +275,8 @@ def run_switched(
     n_simul: int,
     max_flips: int,
     v_on: float,
+    v_rel: float,
+    n_nodes: int,
     out: np.ndarray,
     code_out: np.ndarray,
 ) -> int:
@@ -258,6 +288,9 @@ def run_switched(
       2. 候補の状態で1ステップ試す。ステップの終わりで、オンのダイオードの電圧（= 電流 × r_on）が
          負、またはオフのダイオードの電圧が v_on を超えていたら、反転してやり直す。
          最初の n_simul 回は違反したものを同時に反転し、その後は番号の小さい1つだけを反転する。
+         max_flips 回で落ち着かないときは、試した状態のうち違反（電圧の絶対値の最大）が最も小さいものを、
+         その違反が判定の幅 diode_band() 以内なら採る（電流がちょうど 0 で、丸め誤差の符号だけで
+         2つの状態を往復している場合）。幅を超えるなら NOT_SETTLED を返す。
       3. 状態が直前の区間と変わったステップ（やり直したステップを含む）は、後退オイラーで進める。
          後退オイラーでの判定は「このステップの終わりまでダイオードが導通し続けるか」と同じになり、
          状態が1つに決まる。続く n_damp ステップは減衰ステップ（刻みより速い成分を消す。
@@ -278,6 +311,8 @@ def run_switched(
       event[k]   : t[k] で電源が不連続に変わるなら True
       sw_code[k] : 区間 [t[k], t[k+1]) のスイッチのビット
       d_pos, d_neg : ダイオードのアノード・カソードの未知数の番号（基準節点は -1）
+      v_on, v_rel, n_nodes : 判定の閾値と、落ち着かないときの幅（diode_band()。
+                             節点電圧は x の先頭 n_nodes 個）
     進行状態（書き換える）
       x   : t[ctl[CTL_K]] の値
       ctl : 上の CTL_* の並び
@@ -347,6 +382,11 @@ def run_switched(
         left = n_damp if disc else damp         # このステップを含めた、減衰ステップの残り
         flips = 0
         s = s_prev
+        best_violation = np.inf      # 試した状態のうち、違反が最も小さいもの
+        best_cand = cand
+        best_s = s
+        best_be = be
+        best_xn = xc
         while True:
             if cand == code_prev:
                 s = s_prev
@@ -369,6 +409,7 @@ def run_switched(
 
             flip_all = 0
             flip_first = 0
+            violation = 0.0
             for j in range(n_d):
                 a = d_pos[j]
                 c = d_neg[j]
@@ -382,10 +423,25 @@ def run_switched(
                     flip_all |= bit
                     if flip_first == 0:
                         flip_first = bit
+                    if abs(vd) > violation:
+                        violation = abs(vd)
             if flip_all == 0:
                 break
+            if violation < best_violation:
+                best_violation = violation
+                best_cand = cand
+                best_s = s
+                best_be = be
+                best_xn = xn.copy()
             flips += 1
             if flips > max_flips:
+                if best_violation <= diode_band(best_xn, n_nodes, v_on, v_rel):
+                    cand = best_cand        # 丸め誤差の幅の中での往復: 違反の最も小さい状態を採る
+                    s = best_s
+                    be = best_be
+                    xn = best_xn
+                    flips -= 1
+                    break
                 ctl[CTL_CODE] = cand
                 status = NOT_SETTLED
                 break

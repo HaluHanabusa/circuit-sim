@@ -59,11 +59,14 @@ def _stamp_two_terminal(M: np.ndarray, a: int, b: int, g: float) -> None:
         M[b, a] -= g
 
 
-def state_conductance(system: System, code: int) -> np.ndarray:
-    """回路状態 code のときの G（スイッチとダイオードを抵抗として足したもの）。"""
+def state_conductance(system: System, code: int, off_scale: float = 1.0) -> np.ndarray:
+    """回路状態 code のときの G（スイッチとダイオードを抵抗として足したもの）。
+
+    off_scale: オフの素子のコンダクタンスに掛ける数（オフ抵抗が作る成分を見分けるときに使う）。
+    """
     G = system.G.copy()
     for j in range(len(system.devices)):
-        g = system.dev_g_on[j] if (code >> j) & 1 else system.dev_g_off[j]
+        g = system.dev_g_on[j] if (code >> j) & 1 else system.dev_g_off[j] * off_scale
         _stamp_two_terminal(G, int(system.dev_pos[j]), int(system.dev_neg[j]), float(g))
     return G
 

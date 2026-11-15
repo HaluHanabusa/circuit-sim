@@ -17,6 +17,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from . import MissingValueError, Spec, expand, simulate
+from .simulate import StepLimitError
 
 # 端末の文字コードで表せない文字の置き換え。単位の文字は、同じ意味の英数字にする（表に無い文字は ?）。
 # µ は U+00B5 と U+03BC、Ω は U+03A9 と U+2126 の2通りがある（units.py が受け付ける書き方と同じ）
@@ -69,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
         res = simulate(ex.netlist, ex.t_end, ex.h)
     except MissingValueError as exc:
         return _fail(f"計算できません。{exc}")
+    except StepLimitError as exc:
+        # 上限はコマンドや仕様JSONからは変えられないので、simulate() の引数を勧める部分は出さない
+        return _fail(
+            f"計算できません。{exc.without_api_hint}"
+            "（仕様JSONの simulation.h と simulation.t_end で指定する）"
+        )
     except ValueError as exc:
         # 読めない単位、非正の値、未対応のテンプレート、解けない回路、大きすぎる計算
         return _fail(f"計算できません。{exc}")
