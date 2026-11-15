@@ -89,10 +89,12 @@ GIT_LOCATION_VARS = (
 # リポジトリの中の .gitattributes、.gitignore、.git/info/ の指定だけ。
 #   core.autocrlf: 改行の変換（Git for Windows は、システムの設定で true にする）
 #   core.safecrlf: 改行の変換の警告で、内容を読むのを止める
+#   attr.tree: 属性を、作業ツリーの .gitattributes ではなく、指定したツリーから読む（git 2.43 から。
+#     空の値は、どのツリーも指さないので、git は読み方を変えない。それより前の git は、この名前を読まない）
 #   ほかに、リポジトリの外の属性（core.attributesFile、システムの属性 GIT_ATTR_NOSYSTEM、GIT_ATTR_SOURCE）、
 #   利用者の無視の指定（core.excludesFile）、フック（core.hooksPath）は、pinned_git_options が空に向ける。
 # 署名、認証、safe.directory、長いパスの扱いなど、内容の読み方を変えない設定は、利用者のものを使う。
-PINNED_GIT_SETTINGS = (("core.autocrlf", "false"), ("core.safecrlf", "false"))
+PINNED_GIT_SETTINGS = (("core.autocrlf", "false"), ("core.safecrlf", "false"), ("attr.tree", ""))
 PINNED_GIT_DROP = ("GIT_ATTR_SOURCE",)
 
 # 確認（pytest）の、試験の選び方を変えうる環境変数の名前の始まり（check_env）
@@ -342,8 +344,11 @@ def run_captured(
     止めた後は、出力の終わりを待たない。起動したプロセスが残した子プロセスが出力の口を持ったままだと、
     その子が終わるまで戻れなくなる（打ち切りは、人が見ていない実行の最後の歯止め）。
     打ち切った実行の出力は使わないので、読み残してよい。
+
+    終了の合図（SIGTERM、SIGHUP。端末を閉じたときなど）も例外に変えて、同じく止める。起動したプロセスは
+    別のまとまりにいるので、合図は届かない。こちらだけが終わると、起動したプロセスが動き続ける。
     """
-    with subprocess.Popen(
+    with termination_as_exception(), subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", env=env, **group_options(),
     ) as proc:
@@ -1124,15 +1129,53 @@ def gate_problems(root: Path, state: dict, worktree: Path, current: str) -> list
     return problems
 
 
-def unit_problems(root: Path, state: dict) -> tuple[list[str], str]:
-    """統合を妨げる理由（作業ツリーとゲート）と、作業ツリーのいまの内容のツリーID。"""
+def uncommitted_problem(worktree: Path, committed: str, current: str) -> str:
+    """作業ツリーの内容（current）が、HEAD のコミットのツリー（committed）と違うときの、理由の文。
+
+    違うファイルの名前を示す。利用者の git の設定（core.excludesFile など）だけで無視しているファイルは、
+    git status には出ないが、ツリーIDは利用者の無視の指定を読まないので、内容に数える（決まり9）。
+    それらは、リポジトリの無視の指定に足すよう案内する。
+    """
+    names = git_paths(worktree, "diff", "--no-renames", "--name-only", "-z", committed, current)
+    # 利用者の設定のままの git で、無視の対象と出るもの（追跡しているファイルは出ない）
+    proc = run_git(worktree, "check-ignore", "-z", "--stdin", stdin="".join(f"{name}\0" for name in names))
+    ignored = [name for name in proc.stdout.split("\0") if name in names]
+    others = [name for name in names if name not in ignored]
+
+    def listed(items: list[str]) -> str:
+        more = f" ほか {len(items) - 5} 件" if len(items) > 5 else ""
+        return f"（{', '.join(items[:5])}{more}）" if items else ""
+
+    parts = []
+    if others or not ignored:
+        parts.append(f"作業ツリーに未コミットの変更がある{listed(others)}。コミットしてから統合する")
+    if ignored:
+        parts.append(
+            f"作業ツリーに、利用者の git の設定（core.excludesFile など）だけで無視しているファイルがある"
+            f"{listed(ignored)}。ハーネスは利用者の無視の指定を読まないので、内容に数える。"
+            "リポジトリの .gitignore か .git/info/exclude に足す（または消す）"
+        )
+    return "。".join(parts)
+
+
+def unit_problems(root: Path, state: dict) -> tuple[list[str], str, str]:
+    """統合を妨げる理由（作業ツリーとゲート）、作業ツリーのいまの内容のツリーID、HEAD のコミット。
+
+    status と merge は、同じこの判定を使う（status が「できる」と言うのに、merge が拒む、をなくす）。
+    """
     worktree = Path(state["worktree"])
     try:
         worktree_branch(worktree)
         current = tree_id(worktree)
+        head = git(worktree, "rev-parse", "HEAD")
+        committed = git(worktree, "rev-parse", f"{head}^{{tree}}")
     except CycleError as exc:
-        return [str(exc)], ""
-    return gate_problems(root, state, worktree, current), current
+        return [str(exc)], "", ""
+    problems = gate_problems(root, state, worktree, current)
+    # 取り込むのは HEAD のコミット。そのツリーが、いまの内容（＝ゲートを判定した内容）と同じであること
+    if committed != current:
+        problems.append(uncommitted_problem(worktree, committed, current))
+    return problems, current, head
 
 
 def reset_count(state: dict) -> int:
@@ -1155,7 +1198,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if reset_count(state):
             print(f"  ゲートの記録を消した回数: {reset_count(state)}")
         if not state.get("merged_at"):
-            problems, _ = unit_problems(root, state)
+            problems, _, _ = unit_problems(root, state)
             print("  統合: " + ("できる" if not problems else "まだできない"))
             for p in problems:
                 print(f"    - {p}")
@@ -1222,15 +1265,9 @@ def merge_unit(root: Path, uid: str) -> int:
     if state.get("merged_at"):
         print(f"{uid}: 既に統合済み（{str(state.get('merged_commit', ''))[:10]}）")
         return 1
-    worktree = Path(state["worktree"])
-    # 取り込むのは、作業ツリーの HEAD のコミット。そのツリーが、いまの内容（＝ゲートを判定した内容）と
-    # 同じであることを確かめる。状態に控えたブランチ名は使わない。
-    problems, current = unit_problems(root, state)
-    head = ""
-    if current:
-        head = git(worktree, "rev-parse", "HEAD")
-        if git(worktree, "rev-parse", f"{head}^{{tree}}") != current:
-            problems.append("作業ツリーに未コミットの変更がある。コミットしてから統合する")
+    # 取り込むのは、作業ツリーの HEAD のコミット（unit_problems が、そのツリーと、いまの内容＝ゲートを判定した
+    # 内容が同じであることを確かめる）。状態に控えたブランチ名は使わない。
+    problems, current, head = unit_problems(root, state)
     if not on_main(root):
         problems.append("本体のチェックアウトが main ではない")
     elif git(root, "status", "--porcelain") or tree_id(root) != git(root, "rev-parse", "HEAD^{tree}"):

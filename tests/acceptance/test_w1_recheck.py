@@ -199,7 +199,7 @@ BREAKS = {
 
 def run_harness_tests(copy: Path, plugins: Path, kind: str, names: list[str]) -> subprocess.CompletedProcess:
     """写した先で、名前を選んでハーネスの試験を実行する。"""
-    env = base_env(PYTHONPATH=str(plugins), W1_RECHECK_BREAK=kind)
+    env = base_env(PYTHONPATH=str(plugins), W1_RECHECK_BREAK=kind, PATH=os.environ["CIRCUIT_SIM_SAFE_PATH"])
     return subprocess.run(
         [sys.executable, "-m", "pytest", "tests/test_harness.py", "-q", "-p", "no:cacheprovider",
          "-p", "w1_recheck_break", "-k", " or ".join(names), f"--rootdir={copy}",

@@ -124,7 +124,9 @@ def check_info(root: Path, skip: bool) -> dict:
     print(f"{cycle.CHECK_SCRIPT} を実行します（ruff と pytest。数分かかることがあります）", flush=True)
     started = time.monotonic()
     try:
-        code = subprocess.run([sys.executable, cycle.CHECK_SCRIPT], cwd=root).returncode
+        # 呼び出し元の pytest の環境変数（PYTEST_ADDOPTS など）は渡さない（一部の試験だけの合格にしない）
+        env = cycle.check_env(dict(os.environ))
+        code = subprocess.run([sys.executable, cycle.CHECK_SCRIPT], cwd=root, env=env).returncode
     except OSError:
         return {"ran": False, "reason": "cannot_start"}
     seconds = round(time.monotonic() - started, 1)

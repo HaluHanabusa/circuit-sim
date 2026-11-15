@@ -268,6 +268,21 @@ def test_missing_check_script_is_a_problem(root, tmp_path):
     assert result["check"] == {"ran": False, "reason": "missing"} and result["problems"] == ["check"]
 
 
+def test_check_run_by_doctor_does_not_get_the_callers_pytest_settings(root, tmp_path):
+    """呼び出し元の PYTEST_ で始まる変数（試験を選び直せる）は、確認に渡さない（cycle.py の check と同じ）"""
+    seen = tmp_path / "seen.json"
+    script = (
+        "import json, os, pathlib\n"
+        "names = sorted(name for name in os.environ if name.startswith('PYTEST_'))\n"
+        f"pathlib.Path({str(seen)!r}).write_text(json.dumps(names), encoding='utf-8')\n"
+    )
+    (root / "scripts" / "check.py").write_text(script, encoding="utf-8")
+    env = {**fake_claude(tmp_path, good_output()), "PYTEST_ADDOPTS": "-k nothing", "PYTEST_PLUGINS": "x"}
+    code, result, screen = doctor(root, env=env)
+    assert code == 0 and result["check"]["passed"] is True, screen
+    assert json.loads(seen.read_text(encoding="utf-8")) == []
+
+
 def in_process(root: Path, *args: str, find=None) -> tuple[int, dict]:
     """doctor.py を試験のプロセスの中で実行する（コマンドの見つけ方などを差し替える試験用）。"""
     patches = [mock.patch.dict(os.environ, {**TEST_ENV, "CYCLE_ROOT": str(root)}, clear=True)]
