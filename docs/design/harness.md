@@ -156,6 +156,11 @@ python scripts/cycle.py record-ci E1a --result <結果のファイル>
   - 試験の前提の誤り（2件）: 記録を使い回さない試験が、「違う既定の文字コード」を `cp932` と決め打ちしていた（POのPCの値と同じなので、違いにならない）。記録された値と必ず違う値にした。日本語の場所が化けた試験（`test_python_started_elsewhere_reads_the_checked_content_first`）は、試験用の確認スクリプトが、起動した Python の出力（試験の環境の `PYTHONIOENCODING=utf-8`）を、既定の文字コード（cp932）で読んでいた。ハーネスは、取り出した場所の版を読んでいた（化けた場所を cp932 で戻すと、取り出した場所の `product.py` になる）。場所を JSON の ASCII で受け渡す形にし、Linux でも、出力を cp932 にして同じ食い違いを逆向きに作る場合を足した。
   - 終了の合図が続けて2回届くと、`claude` が止まらない（3回目のレビュー）: 7章の「どのOSでも共通にしていること」。
   - 壊す確認: 足した分岐を手で 39 通り壊して、近い試験から流した。38 通りで試験が落ちた。生き残った 1 通り（試験用の確認スクリプトで、ASCII の JSON を読む文字コードの指定を外す）は、ASCII ならどの文字コードでも同じに読めるので、動作が変わらない（指定は、読み方を明示するために残した）。
+- H2: 1か所ずつ壊す確認を、繰り返せる形にした（9章。`scripts/mutants.py`、一覧は `scripts/mutants.toml`）。
+  - 機械的に作る壊し方は、3つのスクリプトで約780通り（表示だけの場所は作らない）。W1 の時点の 1165 通りとは、作り方が違う（W1 の一覧は残っていない）。
+  - 流したのは見本（等間隔に選んだもの）: `cycle.py` を中心に 160 通りで、生き残りは 14。うち 6 は試験を足すか、余分な処理を消して片付けた（実装の記録をツリーと比べない、費用の表示、役割の定義の見出しだけを読む、指示を渡せないときに実行しない、`save_state` と `start` の余分なフォルダ作り）。残る 8 は同値か、Linux では通らない Windows の分岐で、理由を一覧に書いた。`doctor.py` と `local_ci.py` だけから選んだ見本 60 通りでは、生き残りは 6（`local_ci.py` は 0）。5 は試験を足して落とし（記録する数の項目、版を聞けない git、起動できない確認、見出しの無い役割の定義、APIキーの表示）、1 は同値として一覧に書いた。
+  - H1 からの生き残り3種（ロックを共有に変える、`git_paths` が git の失敗を無視する、`GIT_DIR` などを除く一覧から外す）は、試験を足して落ちるようにした（`GIT_COMMON_DIR` と `GIT_NAMESPACE` は同値として一覧に書いた）。
+  - 全件（約780通り）は、Linux の2コアで2時間前後かかるので、道具を変えたときに手で流す（`python scripts/mutants.py run`）。試験の中では代表だけを流す（`tests/test_mutants.py`）。全件で「生き残りが無い」とは、まだ言えない。
 - 未確認（W2）:
   - OSのエラー画面を出さない設定が、Windows の実機で、壊れた `claude.exe` の画面を止めること（`tests/test_error_dialogs.py` の Windows の試験。POのPCで `python scripts\local_ci.py` を実行すると確かめられる。止まらずに、時間切れか合格で終わる）。書き込み中の `claude.exe` を起動できないこと（`test_cli_that_cannot_be_started_is_reported_without_changing_records`）も同じ。
   - Windows の実機での `scripts/local_ci.py`。POのPCで1回実行して確かめる（8章）。Windows の動作は、試験の中で模擬している（改行、置き換えと削除の待ち、実行できる印を信用しない設定、`\` 区切りのパス、空白と日本語を含む一時フォルダ）。
@@ -176,10 +181,9 @@ python scripts/cycle.py record-ci E1a --result <結果のファイル>
   - 試験の遮断（7章）は、pytest がこのリポジトリの `tests/conftest.py` を読むときだけ効く。`--noconftest` を付けた起動や、試験のファイルを別の場所に写して流す場合は効かない（写して流す受け入れ試験は、遮断した PATH を渡す）。見張り役の `.exe` は標準ライブラリでは作れないので、Windows で PATHEXT から `.CMD` と `.BAT` の両方が外れた場合は、見張り役に当たらない（取り除く層は効く）。
   - 呼び出し元の `PYTHONPATH` に置いた `sitecustomize.py`（Python が起動のたびに読む）は、確認の子プロセスの中で `PYTEST_ADDOPTS` を足して、試験を選び直せる。消せるのは、渡す環境変数（決まり4）だけ。`PYTHONPATH` は、手元の確認では取り出した先を先頭に足して引き継ぐ（8章）。呼び出し元の環境は、利用者が整える。
   - 打ち切り（`--timeout`）と中断で止めるのは、起動したプロセスと、その先のプロセス（7章）。Linux / macOS では、自分で別のプロセスのまとまり（セッション）に移った子プロセスは止められず、動き続ける（`run` は待たずに戻り、`error` を記録する）。
-- 未確認（Windows で、実行した場所のファイルが先に動く経路。W1 で塞いだのは `claude` の見つけ方だけ）:
-  - npm 版の `claude.cmd` は、中で `node` を名前だけで呼ぶ。cmd.exe は、実行した場所（`run` では作業ツリー）を PATH より先に探すので、作業ツリーの直下に `node.cmd` や `node.exe` があれば、そちらが動くはず。
-  - `cycle.py` は git を名前だけで起動する。Windows は、実行した場所の `git.exe` を PATH より先に探すはず。
-  - どちらも、Windows では試していない。塞ぐなら、起動するプロセスの環境変数に `NoDefaultCurrentDirectoryInExePath` を足す、git を `claude` と同じ探し方で絶対パスにする、などを H2 で検討する。
+- Windows で、実行した場所のファイルが先に動く経路（H2 で塞いだ。Windows の実機では、まだ確かめていない）:
+  - npm 版の `claude.cmd` は、中で `node` を名前だけで呼ぶ。cmd.exe は、実行した場所（`run` では作業ツリー）を PATH より先に探す。`cycle.py`、`local_ci.py`、`doctor.py` は、環境変数 `NoDefaultCurrentDirectoryInExePath` を置いて、探させない（7章の表）。穴があることと、塞げていることを、組の試験にした（`tests/test_harness_os.py`。Windows でだけ走る。POのPCで `python scripts\local_ci.py` を実行すると確かめられる）。
+  - git は、`claude` と同じ探し方の絶対パスで、`taskkill` は `System32` の場所で起動する。
 
 ## 6. 記録の場所
 

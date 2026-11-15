@@ -43,3 +43,11 @@ reason = "控えのファイルは、直前で読めている（無ければ、�
 [[equivalent]]
 id = "cycle:merge_unit:const:2"
 reason = "取り込んだ後の確認が通らなかった場合の、控えの片付け。控えは直前に書いてあり、ほかの誰も消さない（統合のロックを持っている）。missing_ok を外しても、消す動作は変わらない"
+
+[[equivalent]]
+id = "cycle:gate_problems:del:6"
+reason = "不合格のゲートの理由を挙げた後の continue。消すと、続けて古さも調べるが、そのゲートは既に統合を止める理由に挙がっていて、統合の可否は変わらない（理由の行が増えることがあるだけ）"
+
+[[equivalent]]
+id = "doctor:main:const:4"
+reason = "結果のファイルを ensure_ascii=True で書いても、読んだ中身は同じ（JSON として同じ値）。記録に入る値は、形、真偽、版、git のIDで、ほとんど英数字"

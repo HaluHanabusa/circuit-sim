@@ -349,6 +349,36 @@ def test_missing_claude_is_reported_but_is_not_a_problem(root, capsys):
     assert result["problems"] == ["headless"]
 
 
+def test_git_that_cannot_tell_its_version_is_a_problem(root):
+    """git が見つかっても、--version を実行できなければ、動くとは記録しない。"""
+    with mock.patch.object(DOCTOR.cycle, "run_captured", side_effect=OSError(8, "起動できない")):
+        code, result = in_process(root, "--no-check", find=without("claude"))
+    assert result["git"]["found"] is True and result["git"]["runs"] is False
+    assert code == 1 and result["problems"] == ["git"]
+
+
+def test_check_that_cannot_be_started_is_a_problem(root):
+    real = subprocess.run
+
+    def refuse(cmd, *args, **kwargs):
+        if list(cmd[1:]) == [DOCTOR.cycle.CHECK_SCRIPT]:
+            raise OSError(8, "起動できない")
+        return real(cmd, *args, **kwargs)
+
+    with mock.patch.object(DOCTOR.subprocess, "run", refuse):
+        code, result = in_process(root, find=without("claude"))
+    assert result["check"] == {"ran": False, "reason": "cannot_start"}
+    assert code == 1 and result["problems"] == ["check"]
+
+
+@pytest.mark.parametrize("variable", ["ANTHROPIC_API_KEY", ""])
+def test_api_key_in_the_environment_is_pointed_out(root, tmp_path, variable):
+    env = {**fake_claude(tmp_path, good_output()), **({variable: SECRET} if variable else {})}
+    code, result, screen = doctor(root, "--no-check", env=env)
+    assert ("APIキーの環境変数が設定されている" in screen) is bool(variable)
+    assert SECRET not in screen
+
+
 def test_missing_git_is_a_problem(root, capsys):
     code, result = in_process(root, "--no-check", find=without("claude", "git"))
     assert code == 1
@@ -454,6 +484,8 @@ def test_headless_probe_runs_once_with_the_same_command_as_the_harness(root, tmp
     assert head["fields"]["session_id"] == {"present": True, "kind": "string", "empty": False}
     assert head["fields"]["result"] == {"present": True, "kind": "string"}
     assert head["fields"]["total_cost_usd"] == {"present": True, "kind": "number", "value": 0.0125}
+    assert head["fields"]["num_turns"] == {"present": True, "kind": "number", "value": 1}
+    assert head["fields"]["duration_ms"] == {"present": True, "kind": "number", "value": 900}
     assert head["fields"]["structured_output"] == {
         "present": True, "kind": "object", "keys": ["criteria", "issues", "summary", "verdict"],
         "other_keys": 0, "problem": "", "verdict": "pass", "criteria": 1, "issues": 0,
@@ -811,6 +843,8 @@ def test_only_the_heading_of_a_role_definition_is_read_for_the_tool_list(root):
     define_roles(root, "verifier", restricted="verifier")
     assert DOCTOR.restricts_tools(root, "verifier") is True
     assert DOCTOR.restricts_tools(root, "no-such-role") is False
+    (root / ".claude" / "agents" / "plain.md").write_text("tools: Read\n本文だけ\n", encoding="utf-8")
+    assert DOCTOR.restricts_tools(root, "plain") is False               # 見出し（---）の無い定義
 
 
 def test_probe_is_not_run_when_the_instruction_cannot_pass_through_the_launcher(root, tmp_path):
