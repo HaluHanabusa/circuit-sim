@@ -25,10 +25,6 @@
 
 4. アプリの設定の場所（合言葉と画面の好み。D-050、D-051）を、試験のセッションの一時フォルダに向ける
    （CIRCUIT_SIM_CONFIG_DIR）。試験から起動するアプリ本体が、利用者の本物の設定に触れないように。
-
-5. 合言葉（D-051）を入れる前に書かれた、合言葉を知らずにアプリ本体を突く受け入れ試験（TOKENLESS_MODULES）の
-   間だけ、アプリ本体を合言葉なしで起動させる（CIRCUIT_SIM_TEST_ONLY_NO_TOKEN。試験の実行中の印と両方そろった
-   ときだけ効く。circuit_sim/app/cli.py）。受け入れ試験が合言葉を使う形になったら、一覧から外す。
 """
 from __future__ import annotations
 
@@ -60,9 +56,6 @@ CLAUDE_SUFFIXES = ("", ".exe", ".cmd", ".bat", ".com", ".ps1")
 KEPT_TOOLS = ("git",)
 # アプリの設定の場所（circuit_sim/app/config.py の CONFIG_ENV）
 CONFIG_VAR = "CIRCUIT_SIM_CONFIG_DIR"
-# 合言葉を知らずにアプリ本体を突く試験（5）と、そのときに設定する環境変数（circuit_sim/app/cli.py）
-TOKENLESS_MODULES = frozenset({"test_a0_server_safety.py", "test_a0_browser_checks.py"})
-TOKENLESS_VAR = "CIRCUIT_SIM_TEST_ONLY_NO_TOKEN"
 
 
 # Windows の SetErrorMode の印（scripts/cycle.py の QUIET_ERROR_MODE と同じ）。起動できない実行ファイルや
@@ -248,25 +241,6 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     os.environ[SENTINEL_VAR] = str(place / "sentinel")
     os.environ[RUNNING] = "1"
     os.environ[CONFIG_VAR] = str(place / "app-config")
-
-
-@pytest.fixture(scope="module", autouse=True)
-def tokenless_app_for_old_acceptance_tests(request: pytest.FixtureRequest):
-    """5: TOKENLESS_MODULES の試験の間だけ、アプリ本体を合言葉なしで起動させる。
-
-    モジュールの単位で、自動で使う（モジュールの中のアプリ本体の起動より先に効く）。"""
-    if request.path.name not in TOKENLESS_MODULES:
-        yield
-        return
-    before = os.environ.get(TOKENLESS_VAR)
-    os.environ[TOKENLESS_VAR] = "1"
-    try:
-        yield
-    finally:
-        if before is None:
-            os.environ.pop(TOKENLESS_VAR, None)
-        else:
-            os.environ[TOKENLESS_VAR] = before
 
 
 @pytest.hookimpl(hookwrapper=True)

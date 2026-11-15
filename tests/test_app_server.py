@@ -43,7 +43,7 @@ WINDOWS = os.name == "nt"
 
 
 class Running:
-    def __init__(self, config: Path, token: str | None = TOKEN) -> None:
+    def __init__(self, config: Path, token: str = TOKEN) -> None:
         self.workspace = Workspace()
         self.settings = Settings(config)
         app = create_app(token=token, settings=self.settings, workspace=self.workspace)
@@ -301,7 +301,7 @@ def test_key_is_compared_in_constant_time(monkeypatch):
     monkeypatch.setattr(server_module.hmac, "compare_digest", record)
     assert token_ok(TOKEN, TOKEN) and not token_ok("x" * 43, TOKEN)
     assert len(calls) == 2
-    assert token_ok(None, None) and not token_ok(None, TOKEN)
+    assert not token_ok(None, TOKEN)
 
 
 # ------------------------------------------------------------------ 別のサイトのページ（CSRF。D-051）
@@ -497,21 +497,6 @@ def test_broken_settings_file_is_ignored(tmp_path):
     assert settings.read() == {"lang": "en"}
 
 
-def test_no_token_mode_serves_without_cookie(tmp_path):
-    """試験用（token=None）: 合言葉を確かめない。Origin と Content-Type は確かめる。"""
-    running = Running(tmp_path, token=None).start()
-    try:
-        assert running.raw("GET", "/api/health", cookie=False)[0] == 200
-        status, _, _ = running.raw("POST", "/api/open", EVIL_BODY,
-                                   {"Origin": "http://evil.example", "Content-Type": "application/json"},
-                                   cookie=False)
-        assert status == 403
-        plain = running.raw("POST", "/api/open", EVIL_BODY, {"Content-Type": "text/plain"}, cookie=False)
-        assert plain[0] == 415
-    finally:
-        running.stop()
-
-
 def test_urllib_without_cookie_gets_401(srv):
     """ふつうの道具（クッキーを持たない）からは読めない。"""
     with pytest.raises(urllib.error.HTTPError) as info:
@@ -538,3 +523,26 @@ def test_unc_like_requests_never_reach_realpath(srv, monkeypatch):
     assert calls == [], f"拒む前に realpath を呼んだ: {calls}"
     srv.raw("GET", "/boot.js", cookie=False)
     assert calls, "対照: 認める道では realpath を呼ぶはず"
+
+
+# ------------------------------------------------------------------ 仕様の版（E1b の読める版の一覧に備える）
+
+
+def test_version_is_checked_in_one_place():
+    """版を確かめるのは version_problem だけ（SCHEMA_VERSION との完全一致で断る所がほかに無い）。"""
+    source = Path(server_module.__file__).read_text(encoding="utf-8")
+    assert "!= SCHEMA_VERSION" not in source and "== SCHEMA_VERSION" not in source
+    assert source.count('"N-OPEN-VERSION"') == 1
+    assert server_module.supported_versions() == ("0.1",) or hasattr(server_module.circuit_sim,
+                                                                       "SUPPORTED_SCHEMA_VERSIONS")
+
+
+def test_list_of_supported_versions_is_used_when_published(monkeypatch):
+    """E1b が circuit_sim.SUPPORTED_SCHEMA_VERSIONS を公開したら、その一覧の版は断らない。"""
+    monkeypatch.setattr(server_module.circuit_sim, "SUPPORTED_SCHEMA_VERSIONS", ("0.1", "0.2"), raising=False)
+    assert server_module.version_problem("a.json", {"schema_version": "0.1"}) is None
+    assert server_module.version_problem("a.json", {"schema_version": "0.2"}) is None
+    problem = server_module.version_problem("a.json", {"schema_version": "9"})
+    assert problem["code"] == "N-OPEN-VERSION" and problem["params"]["supported"] == "0.1, 0.2"
+    _, notice = check_spec("a.json", '{"schema_version": "0.2", "template": "rlc_series", "plant": {}}')
+    assert notice is None or notice["code"] != "N-OPEN-VERSION"

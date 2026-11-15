@@ -31,6 +31,8 @@ from circuit_sim.app.cli import (
     port_problem,
     terminal_lang,
 )
+from circuit_sim.app.config import Settings
+from circuit_sim.app.server import create_app
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
@@ -41,7 +43,6 @@ URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/(\?k=[A-Za-z0-9_-]+)?")
 def launch(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None = None) -> subprocess.Popen:
     full_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config),
                 "LC_ALL": lang, **(env or {})}
-    full_env.pop("CIRCUIT_SIM_TEST_ONLY_NO_TOKEN", None)
     return subprocess.Popen(
         [sys.executable, "-m", "circuit_sim.app", *args],
         cwd=ROOT,
@@ -355,11 +356,13 @@ def test_terminal_texts_exist_in_both_languages():
         assert "番号" not in ja, f"{key}: 「番号」ではなく「ポート」と書く（--port と同じ言葉）"
 
 
-def test_tokenless_switch_needs_both_marks():
-    assert not cli.tokenless_for_tests({})
-    assert not cli.tokenless_for_tests({cli.TEST_NO_TOKEN: "1"})
-    assert not cli.tokenless_for_tests({cli.PYTEST_RUNNING: "1"})
-    assert cli.tokenless_for_tests({cli.TEST_NO_TOKEN: "1", cli.PYTEST_RUNNING: "1"})
+def test_there_is_no_switch_to_skip_the_key():
+    """製品に、合言葉を確かめない抜け道（環境変数など）が無い。"""
+    source = Path(cli.__file__).read_text(encoding="utf-8") + Path(cli.__file__).with_name(
+        "server.py").read_text(encoding="utf-8")
+    assert "NO_TOKEN" not in source and "PYTEST" not in source
+    with pytest.raises(ValueError):
+        create_app(token="", settings=Settings(ROOT / "unused"))
 
 
 def test_opens_default_browser_with_the_key_url(tmp_path):
@@ -447,7 +450,6 @@ def test_ctrl_break_on_windows_warns_first_then_stops(tmp_path):
     Ctrl+C の2回押しと、窓を閉じたときは、手で確かめる（報告の手順）。"""
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
            "LC_ALL": "ja_JP.UTF-8"}
-    env.pop("CIRCUIT_SIM_TEST_ONLY_NO_TOKEN", None)
     proc = subprocess.Popen(
         [sys.executable, "-m", "circuit_sim.app", "--no-browser"], cwd=ROOT, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, encoding="utf-8",

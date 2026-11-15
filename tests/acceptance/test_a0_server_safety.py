@@ -16,6 +16,7 @@ fetch(url, {method: "POST", mode: "no-cors", body: new Blob([...])}) は Content
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -44,6 +45,8 @@ EVIL_BODY = json.dumps({"file": "evil.json", "text": EVIL_SPEC}).encode("utf-8")
 # それより前の版は読むので、上の no-cors の POST が通る
 # （0.115.0 で実際のブラウザから再現した。A0-verifier.md）
 FASTAPI_STRICT_SINCE = (0, 132, 0)
+# アプリ本体の合言葉（D-051）。起動したときに端末へ出る URL（/?k=…）から読み、クッキーとして送る
+AUTH: dict[str, str] = {}
 
 
 def free_port() -> int:
@@ -53,17 +56,26 @@ def free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def server():
+def server(tmp_path_factory):
     port = free_port()
+    env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path_factory.mktemp("a0-safety-config"))}
     proc = subprocess.Popen(
         [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(port)],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 20
+    while "cookie" not in AUTH:
+        line = proc.stdout.readline().decode("utf-8", "replace")
+        m = re.search(r"http://127\.0\.0\.1:\d+/\?k=([A-Za-z0-9_-]+)", line)
+        if m:
+            AUTH["cookie"] = f"circuit_sim_key={m.group(1)}"
+        assert line or proc.poll() is None, "アプリ本体が起動しない"
+        assert time.monotonic() < deadline, "起動したときの URL（合言葉つき）が出ない"
     while True:
         try:
-            urllib.request.urlopen(base + "/api/health", timeout=1).close()
+            req = urllib.request.Request(base + "/api/health", headers={"Cookie": AUTH["cookie"]})
+            urllib.request.urlopen(req, timeout=1).close()
             break
         except OSError:
             assert proc.poll() is None, "アプリ本体が起動しない"
@@ -72,11 +84,13 @@ def server():
     yield base, port
     proc.kill()
     proc.wait(timeout=10)
+    AUTH.clear()
 
 
 def call(base: str, path: str, *, method: str = "GET", body: bytes | None = None,
          headers: dict[str, str] | None = None) -> tuple[int, bytes]:
     req = urllib.request.Request(base + path, data=body, method=method)
+    req.add_header("Cookie", AUTH["cookie"])
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
@@ -101,7 +115,7 @@ def raw_request(port: int, head: str, body: bytes = b"") -> tuple[int, bytes]:
 
 
 def get(path: str, host: str) -> str:
-    return f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    return f"GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {AUTH['cookie']}\r\nConnection: close\r\n\r\n"
 
 
 def open_sample(base: str) -> None:
@@ -121,6 +135,7 @@ def post_cross_site(port: int, content_type: str | None, origin: str = EVIL) -> 
     lines = [
         "POST /api/open HTTP/1.1", f"Host: 127.0.0.1:{port}", f"Origin: {origin}",
         "Sec-Fetch-Site: cross-site", "Sec-Fetch-Mode: no-cors", f"Content-Length: {len(EVIL_BODY)}",
+        f"Cookie: {AUTH['cookie']}",  # 最も厳しい場合（同じ PC の別のポートのページには、クッキーも付く）
         "Connection: close",
     ]
     if content_type is not None:

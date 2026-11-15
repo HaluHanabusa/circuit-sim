@@ -44,6 +44,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from pydantic import BaseModel, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+import circuit_sim
+
 from .. import SCHEMA_VERSION, Spec
 from ..templates import TEMPLATES
 from .config import PREFS, Settings, valid_pref
@@ -166,17 +168,15 @@ def sample_text(sample: Sample) -> str:
 # ------------------------------------------------------------------ 要求の確かめ
 
 
-def token_ok(cookie: str | None, token: str | None) -> bool:
+def token_ok(cookie: str | None, token: str) -> bool:
     """合言葉のクッキーが合っているか。比べるのにかかる時間は、どこまで合っているかによらない。"""
-    if token is None:
-        return True
     if cookie is None:
         return False
     return hmac.compare_digest(cookie.encode("utf-8", "replace"), token.encode("utf-8"))
 
 
 def request_problem(
-    method: str, path: str, headers: Mapping[str, str], cookie: str | None, token: str | None
+    method: str, path: str, headers: Mapping[str, str], cookie: str | None, token: str
 ) -> tuple[int, str] | None:
     """要求を受け付けない理由（状態の番号、内部の説明）。受け付けるなら None。headers の名前は小文字。"""
     writing = method.upper() not in SAFE_METHODS
@@ -202,7 +202,7 @@ def request_problem(
 class Guard:
     """要求の確かめ（request_problem）を、すべての要求に掛ける。"""
 
-    def __init__(self, app, token: str | None) -> None:
+    def __init__(self, app, token: str) -> None:
         self.app = app
         self.token = token
 
@@ -244,6 +244,26 @@ def schema_problem(err: dict) -> str:
     return SCHEMA_PROBLEMS.get(err["type"], "schema.other")
 
 
+def supported_versions() -> tuple[str, ...]:
+    """このアプリが読める仕様の版。
+
+    E1b が公開する circuit_sim.SUPPORTED_SCHEMA_VERSIONS（読める版の一覧）があればそれを、無ければ
+    SCHEMA_VERSION だけ。呼ぶたびに読む（E1b の統合の後、ここを変えずに一覧が効く）。"""
+    return tuple(getattr(circuit_sim, "SUPPORTED_SCHEMA_VERSIONS", (SCHEMA_VERSION,)))
+
+
+def version_problem(file: str, data: object) -> dict | None:
+    """版を確かめる、ただ1つの場所（4.2 の 6）。読めない版なら N-OPEN-VERSION、読めるか版が無ければ None。
+
+    版が文字列でないもの（数値の 0.1 など）は、ここでは断らない
+    （仕様の形の誤りとして、文字列が要ると案内する）。"""
+    found = data.get("schema_version") if isinstance(data, dict) else None
+    versions = supported_versions()
+    if isinstance(found, str) and found not in versions:
+        return notice("N-OPEN-VERSION", file=file, found=found, supported=", ".join(versions))
+    return None
+
+
 def check_spec(file: str, text: str) -> tuple[dict | None, dict | None]:
     """仕様JSONの文字列を確かめる（4.2 の 5〜8）。（開いた仕様の要約、開けない理由）の片方を返す。"""
     try:
@@ -253,9 +273,9 @@ def check_spec(file: str, text: str) -> tuple[dict | None, dict | None]:
     except RecursionError:
         # 入れ子が深すぎる（[ が何万も続くなど）。仕様JSONの形ではないので、形の誤りとして案内する
         return None, schema_notice(file, [{"path": "$", "problem": "schema.other"}], "nesting too deep")
-    found = data.get("schema_version") if isinstance(data, dict) else None
-    if isinstance(found, str) and found != SCHEMA_VERSION:
-        return None, notice("N-OPEN-VERSION", file=file, found=found, supported=SCHEMA_VERSION)
+    problem = version_problem(file, data)
+    if problem is not None:
+        return None, problem
     try:
         spec = Spec.model_validate(data)
     except ValidationError as exc:
@@ -321,13 +341,17 @@ def page_with_prefs(page: str, prefs: Mapping[str, str]) -> str:
 
 def create_app(
     *,
-    token: str | None,
+    token: str,
     settings: Settings,
     static_dir: Path = STATIC_DIR,
     workspace: Workspace | None = None,
     allowed_hosts: list[str] | None = None,
 ) -> FastAPI:
-    """token が None のときは合言葉を確かめない（試験用。cli.py の決まりでだけ使う）。"""
+    """token は合言葉（config.load_token）。
+
+    合言葉を確かめない形は持たない（試験のための抜け道を作らない）。"""
+    if not token:
+        raise ValueError("合言葉が要る")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.instance = secrets.token_hex(8)
     app.state.workspace = workspace or Workspace()
@@ -412,7 +436,7 @@ def create_app(
         return JSONResponse({"detail": "not found"}, status_code=404)
 
     def index(request: Request) -> Response:
-        if token is not None and TOKEN_PARAM in request.query_params:
+        if TOKEN_PARAM in request.query_params:
             # 起動したときにブラウザへ渡した URL: 合言葉をクッキーにして、合言葉の無い URL へ移す
             response = RedirectResponse("/", status_code=303)
             if token_ok(request.query_params[TOKEN_PARAM], token):

@@ -42,11 +42,6 @@ FALLBACK_PORTS = tuple(range(28471, 28480))
 CONFIRM_SECONDS = 10.0
 WINDOWS = os.name == "nt"
 
-# 試験の中でだけ、合言葉を確かめずに起動する（tests/conftest.py が、合言葉を知らずにアプリ本体を突く
-# 試験の間だけ設定する）。試験の実行中の印（CIRCUIT_SIM_PYTEST_RUNNING）と両方そろったときだけ効く
-TEST_NO_TOKEN = "CIRCUIT_SIM_TEST_ONLY_NO_TOKEN"
-PYTEST_RUNNING = "CIRCUIT_SIM_PYTEST_RUNNING"
-
 IN_USE = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048), 10048}
 DENIED = {errno.EACCES, getattr(errno, "WSAEACCES", 10013), 10013}
 
@@ -122,10 +117,6 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "To stop without saving, press Ctrl+C again within {seconds} seconds.",
     ),
     "stopped": ("circuit-sim を止めました。", "circuit-sim has stopped."),
-    "test_mode": (
-        "注意: 試験用の設定（{var}）があるので、合言葉を確かめずに起動します。",
-        "Note: the test setting {var} is present, so the key isn't checked.",
-    ),
 }
 
 
@@ -253,11 +244,6 @@ def say(text: str) -> None:
     print(text, flush=True)
 
 
-def tokenless_for_tests(env: Mapping[str, str] | None = None) -> bool:
-    env = os.environ if env is None else env
-    return env.get(TEST_NO_TOKEN) == "1" and bool(env.get(PYTEST_RUNNING))
-
-
 class Parser(argparse.ArgumentParser):
     def __init__(self, tr: Texts) -> None:
         class Formatter(argparse.HelpFormatter):
@@ -295,9 +281,8 @@ def main(argv: list[str] | None = None) -> int:
     args = Parser(tr).parse_args(argv)
 
     directory = config_dir()
-    no_token = tokenless_for_tests()
     try:
-        token = None if no_token else load_token(directory)
+        token = load_token(directory)
         settings = Settings(directory)
     except OSError as exc:
         print(tr("config.failed", path=directory, reason=exc.strerror or exc), file=sys.stderr)
@@ -309,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     port = sock.getsockname()[1]
     base = f"http://{HOST}:{port}/"
-    url = base if token is None else f"{base}?{TOKEN_PARAM}={token}"
+    url = f"{base}?{TOKEN_PARAM}={token}"
 
     workspace = Workspace()
     app = create_app(token=token, settings=settings, workspace=workspace)
@@ -320,11 +305,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         say(tr("port.fallback", wanted=failures[0][0], port=port))
-    if no_token:
-        print(tr("test_mode", var=TEST_NO_TOKEN), file=sys.stderr, flush=True)
     say(tr("started", url=url))
-    if token is not None:
-        say(tr("url.note"))
+    say(tr("url.note"))
     say(tr("how_to_stop"))
     if not args.no_browser:
         threading.Thread(target=open_when_ready, args=(server, url, say, tr), daemon=True).start()

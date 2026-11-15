@@ -23,6 +23,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -65,16 +66,30 @@ class App:
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}/"
         self.proc: subprocess.Popen | None = None
+        # 合言葉（D-051）: 設定の場所はこのアプリ本体だけのもの。起動したときに端末へ出る URL（/?k=…）を
+        # login_url に持ち、ページはそこから開く（クッキーが付いて / へ移る）。API はクッキーを付けて呼ぶ
+        self.config = tempfile.mkdtemp(prefix="a0-verify-config-")
+        self.login_url = ""
+        self.cookie = ""
 
     def start(self) -> None:
+        env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": self.config}
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
-            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         )
         deadline = time.monotonic() + 20
+        while not self.login_url:
+            line = self.proc.stdout.readline().decode("utf-8", "replace")
+            m = re.search(r"http://127\.0\.0\.1:\d+/\?k=([A-Za-z0-9_-]+)", line)
+            if m:
+                self.login_url, self.cookie = m.group(0), f"circuit_sim_key={m.group(1)}"
+            assert line or self.proc.poll() is None, "アプリ本体が起動しない"
+            assert time.monotonic() < deadline, "起動したときの URL（合言葉つき）が出ない"
         while True:
             try:
-                urllib.request.urlopen(self.url + "api/health", timeout=1).close()
+                req = urllib.request.Request(self.url + "api/health", headers={"Cookie": self.cookie})
+                urllib.request.urlopen(req, timeout=1).close()
                 return
             except OSError:
                 assert time.monotonic() < deadline, "アプリ本体が起動しない"
@@ -89,7 +104,8 @@ class App:
 
     def reset(self) -> None:
         req = urllib.request.Request(self.url + "api/session", data=b'{"doc": null, "dirty": false}',
-                                     method="PUT", headers={"Content-Type": "application/json"})
+                                     method="PUT", headers={"Content-Type": "application/json",
+                                                            "Cookie": self.cookie})
         urllib.request.urlopen(req, timeout=5).close()
 
 
@@ -129,7 +145,7 @@ def page_of(browser, app):
                                   color_scheme="dark" if theme == "dark" else "light")
         contexts.append(ctx)
         page = ctx.new_page()
-        page.goto(app.url)
+        page.goto(app.login_url)
         page.get_by_test_id("sample-rlc_series").wait_for()
         page.wait_for_timeout(300)  # 色の変化（80 ms）が収まってから測る
         return page
@@ -354,7 +370,7 @@ def test_hung_app_is_noticed_within_five_seconds(browser):
     ctx = browser.new_context(locale="ja-JP")
     try:
         page = ctx.new_page()
-        page.goto(app.url)
+        page.goto(app.login_url)
         page.get_by_test_id("sample-rlc_series").wait_for()
         worst = 0.0
         for delay in (2000, 2700, 3400):

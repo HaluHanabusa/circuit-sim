@@ -60,7 +60,6 @@ class App:
 
     def start(self) -> None:
         env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(self.config)}
-        env.pop("CIRCUIT_SIM_TEST_ONLY_NO_TOKEN", None)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
             cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
