@@ -1,7 +1,6 @@
 name: CI
 on:
-  push:            # main に加えて、作業ブランチへの push でも走る
-  pull_request:
+  workflow_dispatch:   # 手で起動したときだけ走る（無料枠を使い切らないため。D-031）
 permissions:       # 読むだけ。この自動テストは、リポジトリに何も書き込まない
   contents: read
 concurrency:       # 作業ブランチに続けて push したら、古いほうの実行は止める（main は、どのコミットも最後まで走らせる）
@@ -10,7 +9,7 @@ concurrency:       # 作業ブランチに続けて push したら、古いほ�
 jobs:
   test:
     # 同じリポジトリのブランチは push の側で走るので、プルリクエストでは重ねて走らせない（外からのものだけ）
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
