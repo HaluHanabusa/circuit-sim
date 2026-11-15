@@ -593,7 +593,9 @@ def test_enter_in_the_terminal_gives_a_new_url(tmp_path, lang, note, renew, new,
         lines += [proc.stdout.readline() for _ in range(3)]
         assert any(note in ln for ln in lines) and any(renew in ln for ln in lines), lines
         wait_ready(Client(url), START_LIMIT_S)
-        Client(url).login()  # 使い終わった URL
+        # 使い終わった URL を、ブラウザでページとして開く（Sec-Fetch-Mode: navigate）
+        req = urllib.request.Request(url, headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none"})
+        urllib.request.urlopen(req, timeout=5).close()
         line = proc.stdout.readline()
         assert stale in line, line
         proc.stdin.write("\n")

@@ -178,8 +178,9 @@ class Launches:
     """ブラウザに渡す URL（/?k=…）に載せる、一度だけ使える起動の番号（メモリにだけ持つ）。
 
     番号はクッキー（合言葉）と交換したら捨てる。LAUNCH_SECONDS たったものも使えない。
-    使い終わった・期限が切れた・知らない番号で、クッキーも持たないページが開かれたら on_stale を呼ぶ
-    （端末に、新しい URL の出し方を出す。間隔は STALE_REPORT_SECONDS 以上）。
+    使い終わった・期限が切れた・知らない番号で、クッキーも持たないページがブラウザで開かれたら
+    （Sec-Fetch-Mode: navigate）on_stale を呼ぶ（端末に、新しい URL の出し方を出す。間隔は
+    STALE_REPORT_SECONDS 以上）。
     番号が使われた・期限が切れた・古くて捨てたときは on_spent(番号) を呼ぶ（起動コマンドが、番号を書いた
     転送用の HTML を消す）。期限切れは、次に番号を扱ったときか sweep() で見つける。"""
 
@@ -570,8 +571,11 @@ def create_app(
             if launches.redeem(request.query_params[TOKEN_PARAM]):
                 response.set_cookie(COOKIE, token, max_age=COOKIE_MAX_AGE, path="/", httponly=True,
                                     samesite="strict")
-            elif not token_ok(request.cookies.get(COOKIE), token):
-                launches.stale()  # このページは使えない: 端末に、新しい URL の出し方を出す
+            elif (headers.get("sec-fetch-mode", "").lower() == "navigate"
+                  and not token_ok(request.cookies.get(COOKIE), token)):
+                # ブラウザで開いたページが使えない: 端末に、新しい URL の出し方を出す。ブラウザが開いた
+                # ページだけ（ほかの利用者の道具や、別のサイトの画像の要求などからは出させない）
+                launches.stale()
             return response
         page = (static_dir / "index.html").read_text(encoding="utf-8")
         if token_ok(request.cookies.get(COOKIE), token):

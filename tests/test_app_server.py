@@ -387,15 +387,35 @@ def test_stale_launch_number_without_cookie_is_reported_to_the_terminal(tmp_path
     クッキーを持っているページ（履歴から開き直した、など）では知らせない。"""
     reports = []
     running = Running(tmp_path, launches=Launches(on_stale=lambda: reports.append(1))).start()
+    navigate = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none"}
     try:
         number = running.launches.issue()
-        running.raw("GET", f"/?k={number}", cookie=False)
+        running.raw("GET", f"/?k={number}", headers=navigate, cookie=False)
         assert reports == []
-        running.raw("GET", f"/?k={number}")  # クッキーあり
+        running.raw("GET", f"/?k={number}", headers=navigate)  # クッキーあり
         assert reports == []
-        running.raw("GET", f"/?k={number}", cookie=False)
-        running.raw("GET", "/?k=unknown", cookie=False)
+        running.raw("GET", f"/?k={number}", headers=navigate, cookie=False)
+        running.raw("GET", "/?k=unknown", headers=navigate, cookie=False)
         assert reports == [1]  # 続けて来たものは1回にまとめる
+    finally:
+        running.stop()
+
+
+@pytest.mark.parametrize("headers", [
+    {},                                                          # ブラウザでない道具（ほかの利用者を含む）
+    {"Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image"},    # 別のサイトの <img src=…/?k=x>
+    {"Sec-Fetch-Mode": "cors"},
+    {"Accept": "text/html"},
+])
+def test_stale_report_only_comes_from_a_page_opened_in_the_browser(tmp_path, headers):
+    """端末への案内は、ブラウザがページとして開いた要求（Sec-Fetch-Mode: navigate）からだけ出す。
+
+    ほかの利用者の道具や、別のサイトの画像の要求から、端末に案内を出させない（レビュー3回目の軽）。"""
+    reports = []
+    running = Running(tmp_path, launches=Launches(on_stale=lambda: reports.append(1))).start()
+    try:
+        running.raw("GET", "/?k=unknown", headers=headers, cookie=False)
+        assert reports == []
     finally:
         running.stop()
 
@@ -676,22 +696,89 @@ def idle_connection(port: int) -> socket.socket:
     return conn
 
 
-def test_idle_connections_are_reset_when_stopping(tmp_path):
-    """止めるとき、待っている接続（keep-alive）は RST で閉じる（FIN で閉じて相手を待つと、Windows の
+def test_idle_connections_are_closed_by_os_rule_when_stopping(tmp_path):
+    """止めるとき、待っている接続（keep-alive）は、Windows では RST で閉じる（FIN で閉じて相手を待つと、
 
-    SO_EXCLUSIVEADDRUSE のソケットは、その間、同じポートに結べない）。"""
+    SO_EXCLUSIVEADDRUSE のソケットは、その間、同じポートに結べない）。POSIX ではふつうに FIN で閉じる。"""
     running = Running(tmp_path).start()
     conns = [idle_connection(running.port) for _ in range(3)]
     try:
         running.stop()
         for conn in conns:
             conn.settimeout(5)
-            with pytest.raises(ConnectionResetError):
-                while conn.recv(4096):
-                    pass
+            if WINDOWS:
+                with pytest.raises(ConnectionResetError):
+                    while conn.recv(4096):
+                        pass
+            else:
+                assert conn.recv(4096) == b""
     finally:
         for conn in conns:
             conn.close()
+
+
+class FakeTransport:
+    def __init__(self, waiting: int) -> None:
+        self.waiting = waiting
+        self.options: list[tuple] = []
+
+    def get_write_buffer_size(self) -> int:
+        return self.waiting
+
+    def get_extra_info(self, name: str):
+        return self if name == "socket" else None
+
+    def setsockopt(self, *args) -> None:
+        self.options.append(args)
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_reset_mark_only_on_windows_and_only_when_nothing_waits_to_be_sent(windows):
+    """RST の印は Windows だけ。応答を渡し終えていても（response_complete）、送りの待ちが残る接続には付けない
+
+    （RST は送りの待ちを捨てる。uvicorn は transport に渡した時点で response_complete を立てる。
+    レビュー3回目）。"""
+    from circuit_sim.app.cli import reset_idle_connections
+
+    def conn(complete: bool | None, waiting: int) -> SimpleNamespace:
+        cycle = None if complete is None else SimpleNamespace(response_complete=complete)
+        return SimpleNamespace(cycle=cycle, transport=FakeTransport(waiting))
+
+    idle, fresh, sending, flushing = conn(True, 0), conn(None, 0), conn(False, 0), conn(True, 307924)
+    marked = reset_idle_connections([idle, fresh, sending, flushing], windows=windows)
+    assert marked == (2 if windows else 0)
+    assert bool(idle.transport.options) == windows and bool(fresh.transport.options) == windows
+    assert sending.transport.options == [] and flushing.transport.options == []
+
+
+def test_slow_reader_gets_the_whole_response_when_stopping(tmp_path):
+    """読むのが遅い相手（受け取りの量 4096）が大きな画面のファイルを求め、読み終える前に止めても、
+
+    応答は最後まで届く（RST で送りの待ちを捨てない。レビュー3回目の rst_check.py と同じ形。
+    Windows でも流れる）。"""
+    asset = next((STATIC_DIR / "assets").glob("*.js"))
+    size = asset.stat().st_size
+    assert size > 100_000
+    running = Running(tmp_path).start()
+    conn = socket.socket()
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    conn.connect(("127.0.0.1", running.port))
+    try:
+        conn.sendall(f"GET /assets/{asset.name} HTTP/1.1\r\nHost: 127.0.0.1:{running.port}\r\n\r\n".encode())
+        time.sleep(1.0)  # 読まない。アプリ本体は最後まで transport に渡し終え、残りは送りの待ち
+        stopper = threading.Thread(target=running.stop)
+        stopper.start()
+        time.sleep(1.0)
+        data = b""
+        conn.settimeout(10)
+        while chunk := conn.recv(65536):  # 途中で RST なら ConnectionResetError
+            data += chunk
+        stopper.join(timeout=15)
+        head, _, body = data.partition(b"\r\n\r\n")
+        assert len(body) == size, (len(body), size)
+        assert body == asset.read_bytes()
+    finally:
+        conn.close()
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows の SO_EXCLUSIVEADDRUSE（POのPCの local_ci で流れる）")

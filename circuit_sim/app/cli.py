@@ -58,8 +58,8 @@ WINDOWS = os.name == "nt"
 
 IN_USE = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048), 10048}
 DENIED = {errno.EACCES, getattr(errno, "WSAEACCES", 10013), 10013}
-# 止めるときに、待っている接続を RST で閉じる（SO_LINGER をオン・0 秒）。struct linger は Windows では
-# u_short 2つ、ほかは int 2つ
+# Windows で止めるときに、待っている接続を RST で閉じる（SO_LINGER をオン・0 秒）。struct linger は
+# Windows では u_short 2つ、ほかは int 2つ
 LINGER_RESET = struct.pack("HH" if WINDOWS else "ii", 1, 0)
 
 # 端末の文言（画面の辞書とは別。画面の外に出るものだけ）。「ポート」は --port と同じ言葉
@@ -230,7 +230,7 @@ def bind(port: int) -> socket.socket:
         if WINDOWS:
             # ほかのプログラム（ほかの利用者を含む）に、同じポートを横取りさせない（Microsoft の勧め）。
             # この設定のソケットは、受け付けた接続が残っていると、閉じた後も同じポートに結べない。
-            # 止めるときに待っている接続を RST で閉じて（GuardedServer.shutdown）、起動し直したときに
+            # 止めるときに待っている接続を RST で閉じて（reset_idle_connections）、起動し直したときに
             # 同じポートで結べるようにする
             exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
             if exclusive is not None:
@@ -281,26 +281,37 @@ def bind_failure_text(tr: Texts, wanted: int | None, failures: list[tuple[int, O
     return tr(f"port.{port_problem(exc)}", port=port, reason=reason)
 
 
-def reset_idle_connections(connections: Iterable[object]) -> int:
-    """応答の途中でない接続に、閉じたら RST を送る印（SO_LINGER 0 秒）を付ける。付けた数を返す。
+def reset_idle_connections(connections: Iterable[object], windows: bool = WINDOWS) -> int:
+    """Windows だけ: 待っている接続（応答を渡し終え、送りの待ちも空のもの）に、閉じたら RST を送る印
+    （SO_LINGER 0 秒）を付ける。付けた数を返す。
 
-    FIN で閉じると、ブラウザが自分の側を閉じるまで接続が残り（FIN_WAIT_2、その後の TIME_WAIT）、
-    Windows の SO_EXCLUSIVEADDRUSE のソケットは、その間、同じポートに結べない（起動し直すと別のポートへ
-    移り、開いている画面が戻れない）。待っている接続（keep-alive）には送りかけのデータが無いので、
-    RST で失うものは無い。応答の途中のものは、uvicorn が応答を終えてから閉じる。"""
+    Windows の SO_EXCLUSIVEADDRUSE のソケットは、受け付けた接続が残っている間、同じポートに結べない。FIN で
+    閉じると、ブラウザが自分の側を閉じるまで接続が残り（FIN_WAIT_2）、起動し直すと別のポートへ移って、開いて
+    いる画面が戻れない。POSIX は SO_REUSEADDR で結べるので、印を付けない（ふつうに FIN で閉じる）。
+    RST は、OS の送りの待ちにあるデータを捨てる。uvicorn は、応答のデータを transport に渡した時点で
+    response_complete を立てるので、それだけでは足りず、transport の送りの待ち（get_write_buffer_size）が
+    空のものに限る。それでも、OS が送ったが相手の受け取りの確かめがまだのデータ（止める直前に書き終えた
+    応答の終わり）は、ごくまれに捨てうる。止める間際の応答に限られ、画面は「つながっていない」になって
+    つなぎ直すので、受け入れる。"""
+    if not windows:
+        return 0
     count = 0
     for connection in list(connections):
         cycle = getattr(connection, "cycle", None)
         if cycle is not None and not getattr(cycle, "response_complete", True):
-            continue
+            continue  # 応答の途中: uvicorn が応答を終えてから閉じる
         transport = getattr(connection, "transport", None)
-        sock = transport.get_extra_info("socket") if transport is not None else None
-        if sock is None:
+        if transport is None:
             continue
         try:
+            if transport.get_write_buffer_size() != 0:
+                continue  # 送りの待ちが残っている: FIN で閉じ、届き切らせる
+            sock = transport.get_extra_info("socket")
+            if sock is None:
+                continue
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER_RESET)
             count += 1
-        except OSError:
+        except (OSError, AttributeError, RuntimeError):
             pass
     return count
 
@@ -308,7 +319,7 @@ def reset_idle_connections(connections: Iterable[object]) -> int:
 class GuardedServer(uvicorn.Server):
     """保存していない変更があるとき、1回目の Ctrl+C では止めずに知らせる uvicorn のサーバー。
 
-    止めるときは、待っている接続に「閉じたら RST」の印を付けてから、uvicorn の手順
+    止めるときは、Windows では待っている接続に「閉じたら RST」の印を付けてから、uvicorn の手順
     （待ち受けを閉じ、接続を閉じる）で止める（reset_idle_connections）。"""
 
     def __init__(self, config: uvicorn.Config, workspace: Workspace, say: Callable[[str], None],

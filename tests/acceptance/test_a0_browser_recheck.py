@@ -505,15 +505,6 @@ def test_long_file_names_keep_extension_in_every_size(browser, app, size, lang):
 # ------------------------------------------------------------------ 10.4: 読み上げ用の領域の言語
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "製品の不具合(軽微、10.4・AC-10-3): 読み上げ用の領域（aria-live、data-testid=announce）の文は、"
-        "出たときの言語のまま残る。開けなかったお知らせの後に English に切り替えると、<html lang=en> の中に"
-        "日本語の文が残る"
-        "（画面には見えないが、読み上げで読まれうる）"
-    ),
-)
 def test_hidden_announcement_follows_the_language(browser, app):
     app.api("/api/session", {"doc": None, "dirty": False}, "PUT")
     app.api("/api/settings", {"settings": {"lang": None}}, "PUT")

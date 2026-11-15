@@ -23,6 +23,7 @@ from circuit_sim.app.config import (
     TOKEN_FORM,
     Settings,
     config_dir,
+    folder_dacl_is_private,
     load_token,
     sddl_trustees,
     valid_pref,
@@ -209,16 +210,46 @@ def test_settings_that_cannot_be_written_raise_oserror(tmp_path):
 # ------------------------------------------------------------------ Windows の権限（ACL）
 
 
+ME = "S-1-5-21-1-2-3-1001"
+
+
 @pytest.mark.parametrize(("sddl", "expected"), [
-    ("D:PAI(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)", {"S-1-5-21-1-2-3-1001", "SY"}),
+    (f"D:PAI(A;;FA;;;{ME})(A;;FA;;;SY)", {ME, "SY"}),
     ("D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;S-1-5-21-9)", {"SY", "BA", "S-1-5-21-9"}),
     ("D:(A;;0x1200a9;;;WD)(D;;FA;;;BG)", {"WD"}),  # 拒否（D）は数えない
-    ("D:P(A;OICIIO;FA;;;CO)(A;OICI;FA;;;SY)", {"SY"}),  # 継承するだけ（IO）は、そのものには効かない
+    # 継承するだけ（IO）も数える: 場所なら、中に作るファイルに効く（レビュー3回目の軽）
+    (f"D:P(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)(A;OICIIO;FR;;;WD)", {ME, "SY", "WD"}),
+    # 条件つきの許可（XA）も許可として数える。後ろの条件の入れ子の括弧も読める
+    (f"D:P(A;;FA;;;{ME})(XA;;FA;;;WD;(@User.Project Any_of {{1, 2}}))", {ME, "WD"}),
+    (f"D:P(A;;FA;;;{ME})(OA;;FA;bf967aba-0de6-11d0-a285-00aa003049e2;;WD)", {ME, "WD"}),
+    (f"D:P(A;;FA;;;{ME})(ZZ;;FA;;;SY)", None),  # 知らない種類: 本人だけとはみなさない
+    (f"D:P(A;;FA;;;{ME})(A;;FA)", None),  # 読めない形
+    (f"D:P(A;;FA;;;{ME}", None),  # 括弧が閉じていない
     ("D:NO_ACCESS_CONTROL", None),  # DACL が無い: 誰でも使える
     ("O:BAG:SYD:(A;;FA;;;AU)S:(AU;SA;FA;;;WD)", {"AU"}),
-])
+    ("D:P", set()),
+], ids=lambda v: v if isinstance(v, str) else repr(v))
 def test_sddl_trustees(sddl, expected):
     assert sddl_trustees(sddl) == expected
+
+
+@pytest.mark.parametrize(("sddl", "user", "ok"), [
+    (f"D:PAI(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)", ME, True),
+    (f"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{ME})", ME, True),  # 並びは問わない
+    ("D:PAI(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)", "S-1-5-21-1-2-3-500", True),  # 組み込みの Administrator
+    (f"D:AI(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)", ME, False),  # 上から受け継ぐ（P が無い）
+    (f"D:PAI(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)(A;OICIIO;FR;;;WD)", ME, False),  # 継承するだけの Everyone
+    (f"D:PAI(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)(XA;;FA;;;WD;(@User.x == 1))", ME, False),  # 条件つきの許可
+    (f"D:PAI(A;OICI;FA;;;{ME})(A;OICI;FA;;;SY)(D;;FA;;;WD)", ME, False),  # 知らない形は付け直す
+    (f"D:PAI(A;OICI;FA;;;{ME})(A;OICI;FA;;;BA)", ME, False),
+    (f"D:PAI(A;;FA;;;{ME})(A;;FA;;;SY)", ME, False),  # 中に作るものへ受け継がせない
+    (f"D:PAI(A;OICI;FR;;;{ME})(A;OICI;FA;;;SY)", ME, False),
+    ("D:PAI(A;OICI;FA;;;S-1-5-21-9)(A;OICI;FA;;;SY)", ME, False),  # ほかの利用者
+    ("D:NO_ACCESS_CONTROL", ME, False),
+])
+def test_folder_dacl_must_match_exactly(sddl, user, ok):
+    """場所の DACL は、付ける形と完全に一致するかで見る。違えば付け直す（レビュー3回目の軽）。"""
+    assert folder_dacl_is_private(sddl, user) is ok
 
 
 def windows_user_sid() -> str:
@@ -252,6 +283,24 @@ def test_token_file_and_folder_get_an_explicit_private_acl_on_windows(tmp_path):
     out = subprocess.run(["icacls", str(folder / TOKEN_FILE)], capture_output=True, text=True,
                          errors="replace", check=True).stdout
     assert "Everyone" not in out and "(I)" not in out, out
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")
+def test_inherit_only_entry_on_the_folder_is_removed_on_windows(tmp_path):
+    """場所に「中に作るものだけに効く」Everyone の項目（IO）を足されても、次の起動で付け直す。
+
+    新しく作る合言葉・設定・転送用の HTML に Everyone が受け継がれない。"""
+    folder = tmp_path / "circuit-sim"
+    load_token(folder)
+    subprocess.run(["icacls", str(folder), "/grant", "*S-1-1-0:(OI)(CI)(IO)(R)"], capture_output=True,
+                   check=True)
+    assert "WD" in saved_sddl(folder, tmp_path) or "S-1-1-0" in saved_sddl(folder, tmp_path)
+    load_token(folder)
+    sddl = saved_sddl(folder, tmp_path)
+    assert folder_dacl_is_private(sddl[sddl.index("D:"):].strip(), windows_user_sid()), sddl
+    (folder / "new.txt").write_text("x", encoding="utf-8")
+    new = saved_sddl(folder / "new.txt", tmp_path)
+    assert sddl_trustees(new[new.index("D:"):].strip()) == {windows_user_sid(), "SY"}, new
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")

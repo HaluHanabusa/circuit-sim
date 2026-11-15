@@ -7,7 +7,7 @@ import { Frame } from "./components/Frame";
 import { Icon } from "./components/Icon";
 import { NoticeBar } from "./components/NoticeBar";
 import { StartScreen } from "./components/StartScreen";
-import { I18nProvider, translate, type Lang } from "./i18n";
+import { I18nProvider, translate, type Lang, type MessageKey, type Params } from "./i18n";
 import { clockTime, entry, whatKey, type Notice, type NoticeData } from "./notices";
 import { openSample, readSpecFile, type OpenResult } from "./open";
 import { hasModifier } from "./platform";
@@ -50,7 +50,9 @@ export function App() {
   const [noticesOpen, setNoticesOpen] = useState(false);
   const [focusRun, setFocusRun] = useState(0);
   const [dragging, setDragging] = useState(false);
-  const [announce, setAnnounce] = useState("");
+  // 読み上げに伝える文。訳した文字列ではなく、キーと差し込む値で持ち、表示するときに訳す（言語を切り替えたら
+  // 読み上げ用の領域の文も切り替わる。10.4）
+  const [announce, setAnnounce] = useState<{ key: MessageKey; params: Params } | null>(null);
   const instance = useRef<string | null>(null);
   const docRef = useRef<Doc | null>(null);
   const nextId = useRef(1);
@@ -86,7 +88,7 @@ export function App() {
     if (e.level === "error" && e.kind === "event") {
       // 新しいエラーの出来事は、帯を自動で開いて、読み上げにも伝える（9.4）
       setNoticesOpen(true);
-      setAnnounce(translate(initialLang(), whatKey(notice), notice.params)); // 表示中の言語（<html lang>）
+      setAnnounce({ key: whatKey(notice), params: notice.params });
     }
   }, []);
 
@@ -98,7 +100,7 @@ export function App() {
           ? list
           : [...list, { code: "N-PREFS-SAVE", params: { path }, details, id: nextId.current++, time: clockTime(new Date()) }],
       );
-      setAnnounce(translate(initialLang(), "notice.N-PREFS-SAVE.what", {}));
+      setAnnounce({ key: "notice.N-PREFS-SAVE.what", params: {} });
     });
     return () => onPrefsFailure(null);
   }, []);
@@ -399,7 +401,7 @@ export function App() {
           }}
         />
         <div className="visually-hidden" aria-live="polite" data-testid="announce">
-          {announce}
+          {announce ? t(announce.key, announce.params) : null}
         </div>
       </div>
     </I18nProvider>

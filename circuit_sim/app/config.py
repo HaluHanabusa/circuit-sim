@@ -71,18 +71,80 @@ def config_dir(
 
 # 本人と SYSTEM のほかに、持っていても漏れとみなさない相手（管理者は、どのファイルも持ち主になって読める）
 WINDOWS_TRUSTED_ALIASES = frozenset({"SY", "BA", "S-1-5-18", "S-1-5-32-544"})
-_ACE = re.compile(r"\(([^;()]*);([^;()]*);[^;()]*;[^;()]*;[^;()]*;([^;()]+)\)")
+# DACL の項目の種類（SDDL）。許可は、条件つき（XA、ZA）とオブジェクト型（OA）も含む。これら以外の種類は
+# 読み方を決めていないので、本人だけとはみなさない
+SDDL_ALLOW = frozenset({"A", "OA", "XA", "ZA"})
+SDDL_DENY = frozenset({"D", "OD", "XD"})
+_DACL_FLAGS = re.compile(r"NO_ACCESS_CONTROL|AI|AR|P")
+
+
+def sddl_dacl(sddl: str) -> tuple[set[str], list[tuple[str, str, str, str]]] | None:
+    """SDDL の DACL を（フラグ、項目の並び）にする。項目は（種類、フラグ、権利、相手）。
+
+    条件つきの項目の後ろの条件（入れ子の括弧）は読み飛ばす。DACL が無い・読めない形なら None。"""
+    if "D:" not in sddl:
+        return None
+    rest = sddl.split("D:", 1)[1].strip()
+    i = rest.find("(")
+    head = rest if i < 0 else rest[:i]
+    if re.search(r"[OGS]:", head):  # 項目の無い DACL の後ろに、ほかの部分が続く
+        head = re.split(r"[OGS]:", head, maxsplit=1)[0]
+        i = -1
+    flags = set(_DACL_FLAGS.findall(head))
+    if _DACL_FLAGS.sub("", head).strip():
+        return None
+    aces: list[tuple[str, str, str, str]] = []
+    while 0 <= i < len(rest) and rest[i] == "(":
+        depth, j = 0, i
+        while j < len(rest):
+            depth += {"(": 1, ")": -1}.get(rest[j], 0)
+            if depth == 0:
+                break
+            j += 1
+        if depth != 0:
+            return None
+        fields = rest[i + 1:j].split(";", 6)
+        if len(fields) < 6 or not fields[0] or not fields[5]:
+            return None
+        aces.append((fields[0], fields[1], fields[2], fields[5]))
+        i = j + 1
+    return flags, aces
 
 
 def sddl_trustees(sddl: str) -> set[str] | None:
-    """SDDL の DACL の、許可の項目（A）が効く相手（SID か略号）。DACL が無い（誰でも使える）なら None。
+    """SDDL の DACL で、許可の項目が効く相手（SID か略号）。
 
-    継承するだけの項目（IO）は、そのもの自身には効かないので数えない。"""
-    dacl = sddl.split("D:", 1)[1] if "D:" in sddl else ""
-    dacl = re.split(r"[OGS]:", dacl, maxsplit=1)[0]
-    if not dacl or "NO_ACCESS_CONTROL" in dacl:
+    継承するだけの項目（IO）も数える（場所なら、中に作るファイルに効く）。DACL が無い（誰でも使える）、
+    読めない形、知らない種類の項目があるなら None（本人だけとはみなさない）。"""
+    dacl = sddl_dacl(sddl)
+    if dacl is None or "NO_ACCESS_CONTROL" in dacl[0]:
         return None
-    return {m.group(3) for m in _ACE.finditer(dacl) if m.group(1) == "A" and "IO" not in m.group(2)}
+    trustees: set[str] = set()
+    for kind, _flags, _rights, who in dacl[1]:
+        if kind in SDDL_ALLOW:
+            trustees.add(who)
+        elif kind not in SDDL_DENY:
+            return None
+    return trustees
+
+
+def user_aliases(user_sid: str) -> set[str]:
+    """SDDL で本人を表す書き方。組み込みの Administrator は、略号 LA で出る。"""
+    return {user_sid, "LA"} if user_sid.endswith("-500") else {user_sid}
+
+
+def folder_dacl_is_private(sddl: str, user_sid: str) -> bool:
+    """場所の DACL が、期待する形と完全に一致する。
+
+    期待する形: 上から受け継がず（P）、本人と SYSTEM だけが、中に作るものまで使える（OICI、FA）。"""
+    dacl = sddl_dacl(sddl)
+    if dacl is None:
+        return False
+    flags, aces = dacl
+    if "P" not in flags or "NO_ACCESS_CONTROL" in flags or len(aces) != 2:
+        return False
+    return any(set(aces) == {("A", "OICI", "FA", me), ("A", "OICI", "FA", "SY")}
+               for me in user_aliases(user_sid))
 
 
 class _Win32:
@@ -211,12 +273,13 @@ class _Win32:
             self.kernel32.LocalFree(sd)
 
     def private(self, path: Path) -> bool:
-        """本人・SYSTEM・管理者のほかに、使える相手がいない。"""
+        """本人・SYSTEM・管理者のほかに、使える相手がいない（ファイル）。"""
         trustees = sddl_trustees(self.sddl(path))
-        me = {self.user_sid()}
-        if self.user_sid().endswith("-500"):
-            me.add("LA")  # 組み込みの Administrator は、SDDL では略号 LA で出る
-        return trustees is not None and trustees <= WINDOWS_TRUSTED_ALIASES | me
+        return trustees is not None and trustees <= WINDOWS_TRUSTED_ALIASES | user_aliases(self.user_sid())
+
+    def private_folder(self, path: Path) -> bool:
+        """場所の DACL が、protect(folder=True) で付ける形と完全に一致する。"""
+        return folder_dacl_is_private(self.sddl(path), self.user_sid())
 
 
 _win32: _Win32 | None = None
@@ -236,8 +299,9 @@ def ensure_dir(path: Path) -> Path:
     """設定の場所を作り、本人だけが入れる権限にする（POSIX は 0700、Windows は本人と SYSTEM の ACL）。"""
     path.mkdir(parents=True, exist_ok=True)
     if WINDOWS:
-        # 本人と SYSTEM だけで、上から受け継がない（D:P）形でなければ付け直す
-        if "D:P" not in win32().sddl(path) or not win32().private(path):
+        # 本人と SYSTEM だけで、上から受け継がない形と完全に一致しなければ付け直す（知らない種類の項目、
+        # 継承するだけの項目があっても付け直す）
+        if not win32().private_folder(path):
             win32().protect(path, folder=True)
     else:
         mode = stat.S_IMODE(path.stat().st_mode)
