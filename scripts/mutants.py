@@ -418,19 +418,43 @@ def mutated_text(root: Path, mutant: Mutant) -> str | None:
 
 # ------------------------------------------------------------------ 通った行の記録
 
-# 試験が起動する Python の子プロセスでも、通った行を記録する（PYTHONPATH に置く）
+# 試験が起動する Python の子プロセスでも、通った行を記録する（PYTHONPATH に置く）。
+# 試験が道具を別の場所に写して流す場合（scripts/check.py を一時フォルダに写して流す試験など）も、名前と
+# 中身が同じなら、その道具の行として記録する（記録しないと、その試験が壊した行を通る試験に選ばれず、
+# 生き残りに数える）
 SITECUSTOMIZE = f'''\
-import atexit, json, os, sys, time
+import atexit, hashlib, json, os, sys, time
 _out = os.environ.get("{COVER_VAR}")
 LINES = set()
 if _out and hasattr(sys, "monitoring"):
     _targets = set(json.loads(os.environ["{COVER_VAR}_TARGETS"]))
     _tool = 4
     _start = time.time()
+    _names = {{}}
+    for _path in _targets:
+        with open(_path, "rb") as _handle:
+            _digest = hashlib.sha256(_handle.read()).digest()
+        _names.setdefault(os.path.basename(_path), []).append((_path, _digest))
+    _found = {{}}
+
+    def _target(filename):
+        if filename not in _found:
+            real = os.path.realpath(filename)
+            match = real if real in _targets else None
+            for path, digest in [] if match else _names.get(os.path.basename(filename), []):
+                try:
+                    with open(filename, "rb") as handle:
+                        if hashlib.sha256(handle.read()).digest() == digest:
+                            match = path
+                except OSError:
+                    pass
+            _found[filename] = match
+        return _found[filename]
 
     def _line(code, line):
-        if code.co_filename in _targets or os.path.realpath(code.co_filename) in _targets:
-            LINES.add((os.path.realpath(code.co_filename), line))
+        target = _target(code.co_filename)
+        if target is not None:
+            LINES.add((target, line))
         return sys.monitoring.DISABLE
 
     sys.monitoring.use_tool_id(_tool, "mutants")

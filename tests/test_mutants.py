@@ -162,6 +162,20 @@ def test_ends_early():
 
 def test_sleeps():
     time.sleep(float(os.environ.get("SLEEP", "0")))
+
+
+def test_runs_a_copy():
+    """道具を別の場所に写して、子の Python で流す（scripts/check.py を写して流す試験の形）。"""
+    if os.environ.get("RUN_COPY"):
+        import shutil, subprocess, sys, tempfile
+        target = pathlib.Path(tempfile.mkdtemp()) / "cycle.py"
+        shutil.copy(here / "scripts" / "cycle.py", target)
+        code = (
+            "import importlib.util, sys; spec = importlib.util.spec_from_file_location('c', sys.argv[1]); "
+            "c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c); "
+            "sys.exit(0 if c.judge(1) == 'positive' else 1)"
+        )
+        assert subprocess.run([sys.executable, "-c", code, str(target)]).returncode == 0
 '''
 
 
@@ -347,6 +361,19 @@ def test_mutant_is_applied_to_the_content_at_the_start_even_if_the_working_folde
     texts = [path.read_text(encoding="utf-8") for path in sorted(seen.iterdir())]
     assert texts == [original, original.replace("if x > 0:", "if (x) <= (0):")]   # 壊す前、壊した後
     assert (root / "scripts" / "cycle.py").read_text(encoding="utf-8") == "# 足した行\n" * 3 + original
+
+
+def test_tests_that_run_a_copy_of_the_tool_are_chosen_for_its_lines(tmp_path):
+    """試験が道具を別の場所に写して流しても、名前と中身が同じなら、その道具の行を通った試験として選ぶ
+    （選ばないと、その試験が落とす壊し方を、生き残りに数える。全件の2回目で、check.py の1件がそうだった）。"""
+    root = fake_repo(tmp_path)
+    proc, summary = run(
+        root, "--only", "cycle:judge:cmp:1", "--tests", "tests/test_fake.py::test_runs_a_copy",
+        env={"RUN_COPY": "1"}, select=True,
+    )
+    assert [(item["status"], item["stage"]) for item in summary["results"]] == [("killed", "selected")], (
+        proc.stdout + proc.stderr
+    )
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="残ったプロセスを /proc で探す（Linux）")
