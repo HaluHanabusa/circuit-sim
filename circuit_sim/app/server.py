@@ -18,7 +18,9 @@ API（画面仕様 12章の番号）:
      Sec-Fetch-Site を見て、same-origin 以外は 403（別のサイト、同じ PC の別の番号のページから届く要求。
      クッキーの SameSite は番号を区別しないので、これで防ぐ）
   3. /api/ は合言葉のクッキーが無ければ 401（同じPCの別の利用者）。クッキーは、起動したときにブラウザへ渡す
-     URL（/?k=合言葉）で付け、合言葉の無い URL（/）へ移す
+     URL（/?k=起動の番号）で付け、番号の無い URL（/）へ移す。URL に載せるのは合言葉ではなく、
+     一度だけ・数分だけ使える起動の番号（Launches）。ブラウザの起動の引数（/proc/<pid>/cmdline）や履歴から読まれても、使い終わって
+     いるか期限が切れている
   4. 書き込みの要求の Content-Type が application/json でなければ 415
   5. 画面のファイルは、決まった形の名前（英数字と . _ -）だけを、画面のフォルダの中からだけ出す。
      絶対パス、UNC（\\\\ や //）、バックスラッシュ、ドライブ名（C:）は、パスを組み立てる前に拒む
@@ -33,7 +35,8 @@ import os
 import re
 import secrets
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -57,6 +60,9 @@ COOKIE = "circuit_sim_key"
 TOKEN_PARAM = "k"
 COOKIE_MAX_AGE = 400 * 24 * 3600  # ブラウザが受け付ける最長（再起動の後も、開いている画面が再接続できる）
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+LAUNCH_SECONDS = 300  # 起動の番号を使える時間（5 分）
+LAUNCH_KEPT = 8  # まだ使われていない起動の番号を、いくつまで持つか（古いものから捨てる）
+STALE_REPORT_SECONDS = 5.0  # 使えない番号で開かれたことを端末に知らせる間隔の下限
 
 # 画面の部品が使うもの以外を読み込ませない（外部への通信を、ブラウザの側でも止める）
 CSP = (
@@ -163,6 +169,64 @@ def sample_text(sample: Sample) -> str:
     if len(safe_parts("/" + sample.file) or []) != 1:
         raise ValueError(f"サンプルの名前の形が違う: {sample.file!r}")
     return resources.files(__package__).joinpath("samples", sample.file).read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ 起動の番号
+
+
+class Launches:
+    """ブラウザに渡す URL（/?k=…）に載せる、一度だけ使える起動の番号（メモリにだけ持つ）。
+
+    番号はクッキー（合言葉）と交換したら捨てる。LAUNCH_SECONDS たったものも使えない。
+    使い終わった・期限が切れた・知らない番号で、クッキーも持たないページが開かれたら on_stale を呼ぶ
+    （端末に、新しい URL の出し方を出す。間隔は STALE_REPORT_SECONDS 以上）。"""
+
+    def __init__(self, seconds: float = LAUNCH_SECONDS, clock: Callable[[], float] = time.monotonic,
+                 on_stale: Callable[[], None] | None = None) -> None:
+        self.seconds = seconds
+        self.clock = clock
+        self.on_stale = on_stale
+        self.lock = threading.Lock()
+        self.open: dict[str, float] = {}  # 番号 → 使えなくなる時刻
+        self.reported_at: float | None = None
+
+    def issue(self) -> str:
+        number = secrets.token_urlsafe(24)
+        with self.lock:
+            self._forget_expired()
+            while len(self.open) >= LAUNCH_KEPT:
+                del self.open[next(iter(self.open))]  # いちばん古いもの
+            self.open[number] = self.clock() + self.seconds
+        return number
+
+    def redeem(self, number: str) -> bool:
+        """番号が使えるなら捨てて True。比べるのにかかる時間は、どこまで合っているかによらない。"""
+        given = number.encode("utf-8", "replace")
+        with self.lock:
+            self._forget_expired()
+            hit = None
+            for known in self.open:
+                if hmac.compare_digest(given, known.encode("ascii")):
+                    hit = known
+            if hit is None:
+                return False
+            del self.open[hit]
+            return True
+
+    def stale(self) -> None:
+        if self.on_stale is None:
+            return
+        with self.lock:
+            now = self.clock()
+            if self.reported_at is not None and now - self.reported_at < STALE_REPORT_SECONDS:
+                return
+            self.reported_at = now
+        self.on_stale()
+
+    def _forget_expired(self) -> None:
+        now = self.clock()
+        for number in [n for n, until in self.open.items() if until <= now]:
+            del self.open[number]
 
 
 # ------------------------------------------------------------------ 要求の確かめ
@@ -345,9 +409,10 @@ def create_app(
     settings: Settings,
     static_dir: Path = STATIC_DIR,
     workspace: Workspace | None = None,
+    launches: Launches | None = None,
     allowed_hosts: list[str] | None = None,
 ) -> FastAPI:
-    """token は合言葉（config.load_token）。
+    """token は合言葉（config.load_token）。launches は起動の番号（起動コマンドが発行して URL に載せる）。
 
     合言葉を確かめない形は持たない（試験のための抜け道を作らない）。"""
     if not token:
@@ -356,6 +421,7 @@ def create_app(
     app.state.instance = secrets.token_hex(8)
     app.state.workspace = workspace or Workspace()
     app.state.settings = settings
+    app.state.launches = launches = launches or Launches()
     ws: Workspace = app.state.workspace
     static_root = str(static_dir)
     # 外側から: 安全のヘッダー → Host の確かめ → 要求の確かめ（Guard）→ 本体
@@ -429,7 +495,12 @@ def create_app(
         bad = [k for k, v in req.settings.items() if not (k in PREFS if v is None else valid_pref(k, v))]
         if bad:
             return JSONResponse({"detail": "unknown setting or value", "names": sorted(bad)}, status_code=422)
-        return JSONResponse({"settings": settings.update(req.settings)})
+        try:
+            return JSONResponse({"settings": settings.update(req.settings)})
+        except OSError as exc:
+            # 書けない場所（権限、空き容量、同じ名前のファイル）。画面は送り直しを止め、お知らせで知らせる
+            return JSONResponse({"detail": "settings could not be written", "path": str(settings.path.parent),
+                                 "reason": exc.strerror or str(exc)}, status_code=500)
 
     @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     def unknown_api(rest: str) -> Response:
@@ -437,11 +508,13 @@ def create_app(
 
     def index(request: Request) -> Response:
         if TOKEN_PARAM in request.query_params:
-            # 起動したときにブラウザへ渡した URL: 合言葉をクッキーにして、合言葉の無い URL へ移す
+            # 起動したときにブラウザへ渡した URL: 起動の番号を合言葉のクッキーと交換し、番号の無い URL へ移す
             response = RedirectResponse("/", status_code=303)
-            if token_ok(request.query_params[TOKEN_PARAM], token):
+            if launches.redeem(request.query_params[TOKEN_PARAM]):
                 response.set_cookie(COOKIE, token, max_age=COOKIE_MAX_AGE, path="/", httponly=True,
                                     samesite="strict")
+            elif not token_ok(request.cookies.get(COOKIE), token):
+                launches.stale()  # このページは使えない: 端末に、新しい URL の出し方を出す
             return response
         page = (static_dir / "index.html").read_text(encoding="utf-8")
         if token_ok(request.cookies.get(COOKIE), token):

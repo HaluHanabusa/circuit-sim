@@ -8,6 +8,7 @@ import { ELLIPSIS, fitMiddle } from "./Header";
 import { NumberField } from "./NumberField";
 import { NoticeBar } from "./NoticeBar";
 import { Toggle } from "./Toggle";
+import { Tooltip } from "./Tooltip";
 
 const wrap = (ui: React.ReactElement, lang: Lang = "ja") => render(<I18nProvider lang={lang}>{ui}</I18nProvider>);
 
@@ -247,5 +248,68 @@ describe("辞書（10.3）", () => {
   });
   it("{mod} は OS の修飾キー", () => {
     expect(translate("en", "header.open.tip")).toMatch(/^Open a spec JSON \((Ctrl|⌘)\+O\)$/);
+  });
+});
+
+describe("ツールチップ（design-system 6.7、A0 の UX 確認の改善2）", () => {
+  function tip() {
+    render(
+      <Tooltip text="tip">
+        <button type="button">b</button>
+      </Tooltip>,
+    );
+    return { button: screen.getByRole("button"), tooltip: screen.getByRole("tooltip", { hidden: true }) };
+  }
+
+  it.each([
+    ["Enter", "Enter"],
+    ["スペース", " "],
+  ])("キーボードのフォーカスで出て、%s で押すと消え、フォーカスが残っていても出し直さない", (_name, key) => {
+    vi.useFakeTimers();
+    try {
+      const { button, tooltip } = tip();
+      act(() => button.focus());
+      expect(tooltip.hidden).toBe(false);
+      fireEvent.keyDown(button, { key });
+      expect(tooltip.hidden).toBe(true);
+      expect(document.activeElement).toBe(button);
+      fireEvent.pointerEnter(button);
+      act(() => void vi.advanceTimersByTime(1000));
+      expect(tooltip.hidden).toBe(true);
+      // 次にフォーカスが来たら、また出る
+      act(() => button.blur());
+      act(() => button.focus());
+      expect(tooltip.hidden).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ポインタで押すと消え、離れて乗り直すまで出し直さない", () => {
+    vi.useFakeTimers();
+    try {
+      const { button, tooltip } = tip();
+      fireEvent.pointerEnter(button);
+      act(() => void vi.advanceTimersByTime(600));
+      expect(tooltip.hidden).toBe(false);
+      fireEvent.pointerDown(button);
+      expect(tooltip.hidden).toBe(true);
+      fireEvent.pointerEnter(button);
+      act(() => void vi.advanceTimersByTime(600));
+      expect(tooltip.hidden).toBe(true);
+      fireEvent.pointerLeave(button);
+      fireEvent.pointerEnter(button);
+      act(() => void vi.advanceTimersByTime(600));
+      expect(tooltip.hidden).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ほかのキー（Tab、矢印）では消えない", () => {
+    const { button, tooltip } = tip();
+    act(() => button.focus());
+    fireEvent.keyDown(button, { key: "ArrowDown" });
+    expect(tooltip.hidden).toBe(false);
   });
 });

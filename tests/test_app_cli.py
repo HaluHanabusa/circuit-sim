@@ -1,6 +1,8 @@
 """起動コマンド circuit-sim（circuit_sim/app/cli.py）の試験。別のプロセスで起動して確かめる。
 
 設定の場所は、試験ごとの一時フォルダ（CIRCUIT_SIM_CONFIG_DIR）。端末の文言の言語は LC_ALL で決める。
+起動したときの URL（/?k=…）に載るのは、一度だけ使える起動の番号（合言葉ではない）。試験も画面と同じく、
+その URL を1回開いてクッキーを受け取る。2つ目の URL が要るときは、端末に Enter を送って出させる。
 """
 from __future__ import annotations
 
@@ -40,7 +42,8 @@ START_LIMIT_S = 5.0
 URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/(\?k=[A-Za-z0-9_-]+)?")
 
 
-def launch(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None = None) -> subprocess.Popen:
+def launch(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None = None,
+           stdin=subprocess.DEVNULL) -> subprocess.Popen:
     full_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config),
                 "LC_ALL": lang, **(env or {})}
     return subprocess.Popen(
@@ -49,7 +52,7 @@ def launch(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None
         env=full_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
+        stdin=stdin,
         text=True,
         encoding="utf-8",
     )
@@ -91,17 +94,31 @@ class Client:
             return json.loads(resp.read())
 
 
-def wait_ready(client: Client, timeout: float) -> float:
+def wait_up(base: str, timeout: float) -> float:
+    """入口のページ（合言葉は要らない）が出るまで待つ。起動の番号は使わない。"""
     started = time.monotonic()
     while True:
         try:
-            client.login()
-            client.json("api/health")
+            with urllib.request.urlopen(base, timeout=1) as resp:
+                resp.read()
             return time.monotonic() - started
         except OSError:
             if time.monotonic() - started > timeout:
                 raise
             time.sleep(0.05)
+
+
+def wait_ready(client: Client, timeout: float) -> float:
+    """受け付けを始めるまで待ってから、起動の URL を1回だけ開いてクッキーを受け取る。"""
+    started = time.monotonic()
+    wait_up(client.base, timeout)
+    client.login()
+    client.json("api/health")
+    return time.monotonic() - started
+
+
+def token_of(config: Path) -> str:
+    return (config / "token").read_text(encoding="ascii").strip()
 
 
 def stop(proc: subprocess.Popen) -> str:
@@ -122,7 +139,7 @@ def test_starts_and_serves_page_quickly(tmp_path):
         port = int(URL_RE.match(url).group(1))
         # 28470 か、使われていれば 28471〜28479（どれも使われていれば OS が選んだポート）
         assert port in (DEFAULT_PORT, *FALLBACK_PORTS) or port > 0
-        assert "?k=" in url
+        assert "?k=" in url and token_of(tmp_path) not in url
     finally:
         stop(proc)
 
@@ -139,7 +156,7 @@ def test_key_is_kept_across_restarts_so_open_pages_reconnect(tmp_path):
     proc = launch("--no-browser", "--port", URL_RE.match(url1).group(1), config=tmp_path)
     try:
         url2, _ = read_lines_until_url(proc)
-        assert url2 == url1
+        assert url2.split("?")[0] == url1.split("?")[0] and url2 != url1  # 同じポート、新しい起動の番号
         deadline = time.monotonic() + START_LIMIT_S
         while True:
             try:
@@ -268,7 +285,7 @@ def test_each_bind_error_has_its_own_guidance(lang):
     other = bind_failure_text(tr, 9000, [(9000, OSError(errno.EADDRNOTAVAIL, "not available"))])
     none = bind_failure_text(tr, None, [(0, OSError(errno.EADDRNOTAVAIL, "not available"))])
     assert len({in_use, denied, other, none}) == 4
-    assert "9000" in in_use and "9000" in denied and "netsh" in denied
+    assert "9000" in in_use and "9000" in denied and "netsh" in denied and "netstat" in denied
     assert "not available" in other and "not available" in none
     assert ("ポート" if lang == "ja" else "Port") in in_use
 
@@ -325,14 +342,66 @@ def test_help_is_in_one_language(tmp_path, lang, words):
         assert "show this help" not in out and "usage:" not in out
 
 
-@pytest.mark.parametrize(("arg", "lang", "text"), [
-    ("70000", "ja_JP.UTF-8", "--port には 0〜65535 のポートを指定してください（指定: 70000）。"),
-    ("abc", "en_US.UTF-8", "--port must be a port from 0 to 65535 (given: abc)."),
+@pytest.mark.parametrize(("args", "lang", "text"), [
+    (["--port", "70000"], "ja_JP.UTF-8",
+     "circuit-sim: エラー: --port には 0〜65535 のポートを指定してください（指定: 70000）。"),
+    (["--port", "abc"], "en_US.UTF-8",
+     "circuit-sim: error: --port must be a port from 0 to 65535 (given: abc)."),
+    (["--bogus"], "ja_JP.UTF-8",
+     "circuit-sim: エラー: 知らないオプションです: --bogus。"
+     "使えるオプションは circuit-sim --help で確かめてください。"),
+    (["--bogus"], "en_US.UTF-8",
+     "circuit-sim: error: Unknown option: --bogus. See circuit-sim --help for the options."),
+    (["spec.json"], "ja_JP.UTF-8", "知らないオプションです: spec.json。"),
+    (["--port"], "ja_JP.UTF-8", "circuit-sim: エラー: --port の後ろに値を指定してください。"),
+    (["--port"], "en_US.UTF-8", "circuit-sim: error: --port needs a value."),
+    (["--no-browser=yes"], "ja_JP.UTF-8", "circuit-sim: エラー: --no-browser には値を付けられません。"),
+    (["--no-browser=yes"], "en_US.UTF-8", "circuit-sim: error: --no-browser doesn't take a value."),
 ])
-def test_bad_port_argument_is_explained(tmp_path, arg, lang, text):
-    proc = launch("--port", arg, config=tmp_path, lang=lang)
+def test_bad_arguments_are_explained_in_one_language(tmp_path, args, lang, text):
+    """引数の誤りの行に、argparse の英語（argument --port:、unrecognized arguments など）を残さない。
+
+    （UX の改善5）"""
+    proc = launch(*args, config=tmp_path, lang=lang)
     out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 2 and text in out
+    assert proc.returncode == 2 and text in out, out
+    for english in ("argument ", "unrecognized", "expected one", "ignored explicit", "invalid"):
+        assert english not in out, out
+    if lang.startswith("ja"):
+        assert "使い方:" in out and "usage:" not in out
+
+
+def test_parser_falls_back_to_the_table_for_other_errors(capsys):
+    """argparse が自分で error を呼ぶ誤り（見分けられないもの）も、言語の表の文で出す。"""
+    parser = cli.Parser(Texts("ja"))
+    with pytest.raises(SystemExit) as info:
+        parser.error("something odd")
+    assert info.value.code == 2
+    assert "circuit-sim: エラー: 引数が正しくありません（something odd）。" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("lang", ["ja", "en"])
+def test_failures_tell_how_to_fix(lang):
+    """設定の場所に書けない、待ち受けるポートを用意できないときは、どう直すかも出す（UX の改善4）。"""
+    tr = Texts(lang)
+    config = tr("config.failed", path="/x", reason="Not a directory")
+    none = bind_failure_text(tr, None, [(0, OSError(errno.EADDRNOTAVAIL, "not available"))])
+    if lang == "ja":
+        assert "フォルダの権限、空き容量、同じ名前のファイルが無いか" in config
+        assert "セキュリティソフトなどが、このPCの中の通信（127.0.0.1）を止めていないか" in none
+    else:
+        assert "permissions, free space, no file with the same name" in config
+        assert "security software isn't blocking connections within this computer (127.0.0.1)" in none
+
+
+@pytest.mark.parametrize("lang", ["ja", "en"])
+def test_access_denied_mentions_both_causes(lang):
+    """WSAEACCES（10013）は、ほかのプログラムがポートを専用で使っているときにも出る。予約の範囲と決めつけない。"""
+    text = bind_failure_text(Texts(lang), 9000, [(9000, winerror(10013))])
+    assert "netstat -ano" in text and "netsh interface ipv4 show excludedportrange" in text
+    other = {"ja": "ほかのプログラムがこのポートを専用で使っている",
+             "en": "Another program may be using it"}[lang]
+    assert other in text
 
 
 @pytest.mark.parametrize(("env", "windows", "lang"), [
@@ -365,25 +434,104 @@ def test_there_is_no_switch_to_skip_the_key():
         create_app(token="", settings=Settings(ROOT / "unused"))
 
 
-def test_opens_default_browser_with_the_key_url(tmp_path):
-    """既定のブラウザ（BROWSER の指定で、偽のブラウザに差し替える）に、合言葉の入った URL を渡す。"""
-    record = tmp_path / "opened.txt"
+def test_browser_gets_a_one_time_number_and_never_the_key(tmp_path):
+    """既定のブラウザ（BROWSER の指定で、偽のブラウザに差し替える）に渡すのは、端末に出したのと同じ、
+
+    一度だけ使える起動の番号の URL。合言葉そのものは、ブラウザの起動の引数にも、端末にも出ない
+    （/proc/<pid>/cmdline から読まれても、使い終われば役に立たない。レビュー2回目の中1）。"""
+    record = tmp_path / "opened.json"
     fake = tmp_path / "fake_browser.py"
     fake.write_text(
-        "import sys, pathlib\n"
-        f"pathlib.Path({str(record)!r}).write_text(sys.argv[1], encoding='utf-8')\n",
+        "import json, sys, pathlib\n"
+        f"pathlib.Path({str(record)!r}).write_text(json.dumps(sys.argv), encoding='utf-8')\n",
         encoding="utf-8",
     )
     if WINDOWS:
         pytest.skip("Windows の BROWSER の指定は、空白を含む場所を扱えないため、ここでは確かめない")
-    proc = launch(config=tmp_path / "config", env={"BROWSER": f"{sys.executable} {fake} %s"})
+    config = tmp_path / "config"
+    proc = launch(config=config, env={"BROWSER": f"{sys.executable} {fake} %s"})
     try:
-        url, _ = read_lines_until_url(proc)
+        url, lines = read_lines_until_url(proc)
         deadline = time.monotonic() + START_LIMIT_S
         while not record.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert record.read_text(encoding="utf-8") == url
-        assert "?k=" in url
+        argv = json.loads(record.read_text(encoding="utf-8"))
+        token = token_of(config)
+        assert argv[-1] == url and "?k=" in url
+        assert not any(token in arg for arg in argv), argv
+        wait_up(url.split("?")[0], START_LIMIT_S)
+        lines += [proc.stdout.readline() for _ in range(3)]
+        assert not any(token in line for line in lines), lines
+        # 偽のブラウザは開かないので、ここで1回使う。2回目は使えない
+        first, second = Client(url), Client(url)
+        first.login()
+        assert first.json("api/health")["instance"]
+        second.login()
+        with pytest.raises(urllib.error.HTTPError) as info:
+            second.json("api/health")
+        assert info.value.code == 401
+    finally:
+        stop(proc)
+
+
+@pytest.mark.parametrize(("lang", "note", "renew", "new", "stale"), [
+    ("ja_JP.UTF-8", "この URL は1回だけ、5 分以内に使えます", "ここで Enter を押すと新しい URL を出します",
+     "新しい URL（1回だけ、5 分以内に使えます）: ", "使い終わったか期限が切れた URL で、画面が開かれました"),
+    ("en_US.UTF-8", "This URL works once, within 5 minutes", "press Enter here for a new URL",
+     "New URL (works once, within 5 minutes): ", "opened from a URL that was already used or has expired"),
+])
+def test_enter_in_the_terminal_gives_a_new_url(tmp_path, lang, note, renew, new, stale):
+    """端末で Enter を押すと、新しい起動の URL を出す。
+
+    使い終わった URL で開かれたら、端末で出し方を案内する。"""
+    proc = launch("--no-browser", config=tmp_path, lang=lang, stdin=subprocess.PIPE)
+    try:
+        url, lines = read_lines_until_url(proc)
+        lines += [proc.stdout.readline() for _ in range(3)]
+        assert any(note in ln for ln in lines) and any(renew in ln for ln in lines), lines
+        wait_ready(Client(url), START_LIMIT_S)
+        Client(url).login()  # 使い終わった URL
+        line = proc.stdout.readline()
+        assert stale in line, line
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        assert line.startswith(new), line
+        fresh = URL_RE.search(line).group(0)
+        assert fresh != url and fresh.split("?")[0] == url.split("?")[0]
+        client = Client(fresh)
+        client.login()
+        assert client.json("api/health")["instance"]
+    finally:
+        stop(proc)
+
+
+def test_enter_source_tells_inputs_apart(tmp_path):
+    """Enter を読める入力（パイプ、端末）と、読めない入力（/dev/null、Windows の NUL、ファイル）を見分ける。
+
+    Windows の os.isatty は NUL でも True を返すので、GetConsoleMode で見分ける（Windows でも流れる）。"""
+    r, w = os.pipe()
+    try:
+        assert cli.enter_source(r) == "pipe"
+    finally:
+        os.close(r)
+        os.close(w)
+    with open(os.devnull, "rb") as null:
+        assert cli.enter_source(null.fileno()) is None
+    path = tmp_path / "input.txt"
+    path.write_text("x", encoding="utf-8")
+    with open(path, "rb") as f:
+        assert cli.enter_source(f.fileno()) is None
+
+
+def test_without_a_readable_input_restart_is_suggested(tmp_path):
+    """Enter を読めない起動（入力が /dev/null など）では、起動し直す方法を案内する。"""
+    proc = launch("--no-browser", config=tmp_path)
+    try:
+        url, lines = read_lines_until_url(proc)
+        lines += [proc.stdout.readline() for _ in range(3)]
+        assert any("circuit-sim を起動し直してください" in ln for ln in lines), lines
+        assert not any("Enter" in ln for ln in lines), lines
     finally:
         stop(proc)
 
@@ -475,4 +623,53 @@ def test_ctrl_break_on_windows_warns_first_then_stops(tmp_path):
         proc.send_signal(signal.CTRL_BREAK_EVENT)
         assert proc.wait(timeout=10) == 0
     finally:
+        stop(proc)
+
+
+@pytest.mark.skipif(not WINDOWS,
+                    reason="Windows の SO_EXCLUSIVEADDRUSE と Ctrl+Break（POのPCの local_ci で流れる）")
+def test_restart_on_windows_binds_the_same_port_while_a_browser_keeps_connections(tmp_path):
+    """Windows: 待っている接続（ブラウザの keep-alive）を開いたまま止めて、すぐ同じポートで起動し直せる。
+
+    SO_EXCLUSIVEADDRUSE のソケットは、受け付けた接続が残っていると同じポートに結べない（Microsoft の文書）。
+    止めるときに待っている接続を RST で閉じるので、28471 へ移らない（開いている画面が戻れる）。"""
+    import http.client
+
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
+           "LC_ALL": "ja_JP.UTF-8"}
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    def start():
+        return subprocess.Popen(
+            [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(port)], cwd=ROOT, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
+            encoding="utf-8", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+
+    proc = start()
+    conns = []
+    try:
+        url, _ = read_lines_until_url(proc)
+        client = Client(url)
+        wait_ready(client, START_LIMIT_S)
+        cookie = "; ".join(f"{c.name}={c.value}" for c in client.jar)
+        for _ in range(3):  # 応答を読み終えて、つないだままにする
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/api/health", headers={"Cookie": cookie})
+            conn.getresponse().read()
+            conns.append(conn)
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except OSError:
+            pytest.skip("この実行には端末（コンソール）が無いので、Ctrl+Break を送れなかった")
+        proc.wait(timeout=15)
+        proc = start()
+        url2, lines = read_lines_until_url(proc)
+        assert f":{port}/" in url2, ("同じポートで起動し直せなかった", lines)
+        assert client.json("api/health")["instance"]  # 前のクッキーのまま戻れる
+    finally:
+        for conn in conns:
+            conn.close()
         stop(proc)

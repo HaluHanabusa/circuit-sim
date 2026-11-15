@@ -4,15 +4,20 @@ Python の playwright と Chromium 系のブラウザ（Chrome、Edge、playwrig
 無ければ、確かめなかったことをスキップの理由として結果に残す。ブラウザは CIRCUIT_SIM_CHROME で指定できる。
 CIRCUIT_SIM_SHOTS にフォルダを指定すると、確かめた画面の画像をそこに残す（作業ツリーの外に置く）。
 アプリ本体は別のプロセス（python -m circuit_sim.app）で起動し、止めたり起動し直したりする。
-設定の場所はモジュールごとの一時フォルダ。画面は、起動したときの URL（合言葉つき）から開く（D-051）。
+設定の場所はモジュールごとの一時フォルダ。画面は、起動の URL（一度だけ使える起動の番号つき）から
+開く（D-051）。番号は1回しか使えないので、ブラウザの場を作るたびに、端末に Enter を送って新しい URL を
+出させる（利用者と同じ）。
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
+import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -54,16 +59,31 @@ class App:
         self.config = config
         self.port = port or free_port()
         self.url = f"http://127.0.0.1:{self.port}/"
-        self.token = load_token(config)  # アプリ本体と同じ合言葉（同じ設定の場所から読む）
-        self.login_url = f"{self.url}?k={self.token}"
+        self.token = load_token(config)  # アプリ本体と同じ合言葉（同じ設定の場所から読む。API を呼ぶため）
         self.proc: subprocess.Popen | None = None
+        self.lines: queue.Queue[str] = queue.Queue()
+
+    @property
+    def login_url(self) -> str:
+        """新しい起動の URL（端末に Enter を送って出させる）。1回だけ使える。"""
+        assert self.proc is not None and self.proc.stdin is not None
+        self.proc.stdin.write(b"\n")
+        self.proc.stdin.flush()
+        deadline = time.monotonic() + 10
+        while True:
+            line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
+            m = re.search(r"http://127\.0\.0\.1:\d+/\?k=[A-Za-z0-9_-]+", line)
+            if m and line.lstrip().startswith(("新しい URL", "New URL")):
+                return m.group(0)
 
     def start(self) -> None:
-        env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(self.config)}
+        env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(self.config), "PYTHONIOENCODING": "utf-8"}
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
-            cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
         )
+        self.lines = queue.Queue()
+        threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         deadline = time.monotonic() + 15
         while True:
             try:
@@ -72,6 +92,11 @@ class App:
             except OSError:
                 assert time.monotonic() < deadline, "アプリ本体が起動しない"
                 time.sleep(0.05)
+
+    @staticmethod
+    def _read(proc: subprocess.Popen, lines: queue.Queue) -> None:
+        for raw in proc.stdout:
+            lines.put(raw.decode("utf-8", "replace"))
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -142,7 +167,7 @@ class Page:
             self.external.append(request.url)
 
     def open(self, wait: str = "[data-testid=start]"):
-        """起動したときの URL（合言葉つき）から開く。画面は合言葉の無い URL へ移る。"""
+        """起動の URL（起動の番号つき）から開く。画面は番号の無い URL へ移る。"""
         self.page.goto(self.app.login_url)
         self.page.wait_for_selector(wait)
         assert self.page.url == self.app.url, "合言葉の無い URL へ移っていない"
@@ -678,6 +703,135 @@ def test_page_without_the_key_explains_how_to_reopen(browser, app):
         page.wait_for_selector("[data-testid=start]", timeout=8000)
     finally:
         context.close()
+
+
+def test_launch_url_works_once_and_another_browser_gets_the_guidance(browser, app):
+    """起動の URL は1回だけ使える。同じ URL を別のブラウザ（別の場）で開いても、アプリ本体は使えない。
+
+    （URL が漏れても、使い終わっていれば役に立たない。レビュー2回目の中1）"""
+    app.reset()
+    url = app.login_url
+    first, second = browser.new_context(locale="ja-JP"), browser.new_context(locale="ja-JP")
+    try:
+        page = first.new_page()
+        page.goto(url)
+        page.wait_for_selector("[data-testid=start]")
+        assert page.url == app.url
+        other = second.new_page()
+        other.goto(url)
+        other.wait_for_selector("[data-testid=unauthorized]")
+        assert other.url == app.url, "使い終わった番号が URL に残った"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_page_from_another_site_reads_settings_before_writing(browser, app):
+    """別のサイトのリンクから開くと、SameSite=Strict のクッキーが入口の要求に付かず、data-prefs が無い。
+
+    そのときも、設定ファイルの好みを既定の値で上書きしない（読んでから書く）。読んだ好み（幅、テーマ）で開く。
+    （レビュー2回目の軽2）"""
+    app.reset()
+    app.api("api/settings", {"settings": {"layout.specWidth": "420", "theme": "dark"}}, "PUT")
+    app.api("api/open", {"sample": "rlc_series"}, "POST")  # 開くと枠が出る（仕切りの幅を書き戻す場面）
+    context = browser.new_context(viewport={"width": 1280, "height": 720}, locale="ja-JP",
+                                  color_scheme="light")
+    try:
+        context.add_cookies([{"name": COOKIE, "value": app.token, "url": app.url, "httpOnly": True,
+                              "sameSite": "Strict"}])
+        # ほかのサイトのページ（外には出ない。playwright が中身を返す）から、リンクでアプリを開く
+        context.route("http://other.example/", lambda route: route.fulfill(
+            content_type="text/html", body=f'<a id="go" href="{app.url}">circuit-sim</a>'))
+        page = context.new_page()
+        page.goto("http://other.example/")
+        with page.expect_navigation():
+            page.click("#go")
+        page.wait_for_selector("[data-testid=frame]")
+        assert not page.evaluate("document.documentElement.hasAttribute('data-prefs')"), \
+            "クッキーが付いた（別のサイトからの移動を再現できていない）"
+        page.wait_for_function("document.documentElement.dataset.theme === 'dark'")
+        width = page.evaluate(
+            "document.querySelector('[data-testid=spec-panel]').getBoundingClientRect().width")
+        assert width == 420
+        page.wait_for_timeout(1000)  # 書き戻すなら、とうに送っている（まとめて送るまで 300 ms）
+        assert app.api("api/settings")["settings"] == {"layout.specWidth": "420", "theme": "dark"}
+        # 利用者が変えた値は書く
+        page.focus("[data-testid=splitter-spec]")
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(800)
+        assert app.api("api/settings")["settings"]["layout.specWidth"] == "436"  # 1回 16 px
+    finally:
+        context.close()
+
+
+def test_preferences_that_cannot_be_saved_are_told_once(browser, app, tmp_path):
+    """設定ファイルに書けないとき（ここでは、設定ファイルと控えの場所が中身のあるフォルダ）、画面は送り直し続けず、
+
+    お知らせの帯で知らせる。起動直後の画面でも帯を出す。利用者が次に好みを変えたら、もう一度送る。
+    （レビュー2回目の軽3）"""
+    settings = app.config / "settings.json"
+    backup = app.config / "settings.json.broken"
+    p = Page(browser, app)
+    page = p.open()
+    puts: list[str] = []
+    page.on("request",
+            lambda r: puts.append(r.url) if r.method == "PUT" and "/api/settings" in r.url else None)
+    if settings.exists():
+        settings.unlink()
+    settings.mkdir()
+    backup.mkdir()
+    (backup / "x").write_text("x", encoding="utf-8")
+    try:
+        page.click("[data-testid=toggle-theme] [role=radio] >> nth=1")
+        page.wait_for_selector("[data-testid=notices]")
+        page.wait_for_function("document.querySelector('[data-testid=notices-latest]')?.innerText"
+                               ".includes('設定ファイルに保存できませんでした')")
+        p.shot("prefs-save-failed-start-ja-dark")
+        page.wait_for_timeout(5000)  # 2 秒ごとの確かめを 2 回以上
+        assert len(puts) == 1, puts
+        page.click("[data-testid=notices-toggle]")
+        row = page.inner_text("[data-testid=notice-row]")
+        assert str(app.config) in row and "空き容量" in row, row
+        p.shot("prefs-save-failed-open-ja-dark")
+        # 直ったら、次に変えたときに保存し直す。お知らせは1件のまま
+        (backup / "x").unlink()
+        backup.rmdir()
+        settings.rmdir()
+        page.click("[data-testid=toggle-lang] [lang=en]")
+        page.wait_for_timeout(800)
+        assert len(puts) == 2
+        saved = json.loads(settings.read_text(encoding="utf-8"))
+        assert saved["theme"] == "dark" and saved["lang"] == "en", saved
+        assert page.locator("[data-testid=notice-row]").count() == 1
+    finally:
+        if backup.is_dir():
+            for child in backup.iterdir():
+                child.unlink()
+            backup.rmdir()
+        if settings.is_dir():
+            settings.rmdir()
+        p.close()
+
+
+def test_tooltip_goes_away_when_pressed_with_the_keyboard(browser, app):
+    """キーボードで開いた後に「実行」に出たツールチップは、Enter で押すと消え、
+
+    フォーカスが残っても出し直さない。
+
+    （UX の改善2）"""
+    p = Page(browser, app)
+    page = p.open()
+    page.focus("[data-testid=sample-rlc_series]")
+    page.keyboard.press("Enter")
+    wait_focus(page, "run-button")
+    page.wait_for_selector("[role=tooltip]:not([hidden])")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("[role=tooltip]:not([hidden])", state="detached", timeout=2000)
+    page.wait_for_timeout(800)
+    assert page.locator("[role=tooltip]:not([hidden])").count() == 0
+    assert page.evaluate("document.activeElement.dataset.testid") == "run-button"
+    p.shot("tip-run-after-enter-ja-light")
+    p.close()
 
 
 # ------------------------------------------------------------------ UX の細部

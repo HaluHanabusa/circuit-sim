@@ -45,8 +45,24 @@ EVIL_BODY = json.dumps({"file": "evil.json", "text": EVIL_SPEC}).encode("utf-8")
 # それより前の版は読むので、上の no-cors の POST が通る
 # （0.115.0 で実際のブラウザから再現した。A0-verifier.md）
 FASTAPI_STRICT_SINCE = (0, 132, 0)
-# アプリ本体の合言葉（D-051）。起動したときに端末へ出る URL（/?k=…）から読み、クッキーとして送る
+# アプリ本体の合言葉（D-051）。起動したときに端末へ出る URL（/?k=起動の番号）を1回開き、返ってきた
+# クッキー（Set-Cookie）を送る（ブラウザと同じ手順。番号は1回しか使えない）
 AUTH: dict[str, str] = {}
+
+
+def redeem(url: str) -> str:
+    """起動の URL を開き、リダイレクトを追わずに、返ってきたクッキー（名前=値）を取る。"""
+    m = re.match(r"http://127\.0\.0\.1:(\d+)(/\?k=[A-Za-z0-9_-]+)", url)
+    with socket.create_connection(("127.0.0.1", int(m.group(1))), timeout=10) as s:
+        s.sendall(f"GET {m.group(2)} HTTP/1.1\r\nHost: 127.0.0.1:{m.group(1)}\r\nConnection: close\r\n\r\n"
+                  .encode("latin-1"))
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+    head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    found = re.search(r"(?im)^set-cookie:\s*([^;\r\n]+)", head)
+    assert found, f"起動の URL でクッキーが付かない: {head}"
+    return found.group(1)
 
 
 def free_port() -> int:
@@ -65,22 +81,23 @@ def server(tmp_path_factory):
     )
     base = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 20
-    while "cookie" not in AUTH:
+    login = ""
+    while not login:
         line = proc.stdout.readline().decode("utf-8", "replace")
-        m = re.search(r"http://127\.0\.0\.1:\d+/\?k=([A-Za-z0-9_-]+)", line)
+        m = re.search(r"http://127\.0\.0\.1:\d+/\?k=[A-Za-z0-9_-]+", line)
         if m:
-            AUTH["cookie"] = f"circuit_sim_key={m.group(1)}"
+            login = m.group(0)
         assert line or proc.poll() is None, "アプリ本体が起動しない"
-        assert time.monotonic() < deadline, "起動したときの URL（合言葉つき）が出ない"
+        assert time.monotonic() < deadline, "起動したときの URL（起動の番号つき）が出ない"
     while True:
         try:
-            req = urllib.request.Request(base + "/api/health", headers={"Cookie": AUTH["cookie"]})
-            urllib.request.urlopen(req, timeout=1).close()
+            urllib.request.urlopen(base + "/", timeout=1).close()  # 入口のページは合言葉なしで出る
             break
         except OSError:
             assert proc.poll() is None, "アプリ本体が起動しない"
             assert time.monotonic() < deadline, "アプリ本体が 20 秒たっても応えない"
             time.sleep(0.05)
+    AUTH["cookie"] = redeem(login)
     yield base, port
     proc.kill()
     proc.wait(timeout=10)

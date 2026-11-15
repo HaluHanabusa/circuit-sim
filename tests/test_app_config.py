@@ -5,19 +5,27 @@ Windows でだけ動く試験は、POの PC の local_ci で流れる（合言�
 """
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from circuit_sim.app.config import (
     CONFIG_ENV,
+    SETTINGS_FILE,
     TOKEN_FILE,
     TOKEN_FORM,
+    Settings,
     config_dir,
     load_token,
+    sddl_trustees,
+    valid_pref,
 )
 
 WINDOWS = os.name == "nt"
@@ -86,6 +94,176 @@ def test_malformed_token_is_replaced(tmp_path, content):
         path.chmod(0o600)
     token = load_token(tmp_path)
     assert TOKEN_FORM.fullmatch(token) and token != content.strip()
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# config.py は標準ライブラリだけを使うので、パッケージ全体を読まずに、ファイルから読む（起動を速く）
+RACE = """
+import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("config", sys.argv[3])
+config = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(config)
+Path(sys.argv[4]).write_text("ready", encoding="utf-8")
+go = Path(sys.argv[2])
+while not go.exists():
+    time.sleep(0.0005)
+print(config.load_token(Path(sys.argv[1])))
+"""
+CONFIG_PY = ROOT / "circuit_sim" / "app" / "config.py"
+
+
+def test_first_starts_at_the_same_time_share_one_key(tmp_path):
+    """初めての起動で同時に立ち上げても、合言葉は1つ（O_EXCL で作り、先を越されたら読み直す）。
+
+    8 つのプロセスを、全員が合図を待つところまで進めてから、一斉に load_token させる。3 回くり返す。"""
+    script = tmp_path / "race.py"
+    script.write_text(RACE, encoding="utf-8")
+    for round_ in range(3):
+        folder, go = tmp_path / f"c{round_}", tmp_path / f"go{round_}"
+        ready = [tmp_path / f"ready{round_}-{i}" for i in range(8)]
+        procs = [subprocess.Popen([sys.executable, "-I", str(script), str(folder), str(go), str(CONFIG_PY),
+                                   str(r)], stdout=subprocess.PIPE, text=True) for r in ready]
+        deadline = time.monotonic() + 30
+        while not all(r.exists() for r in ready):
+            assert time.monotonic() < deadline and all(p.poll() is None for p in procs)
+            time.sleep(0.01)
+        go.write_text("go", encoding="utf-8")
+        tokens = {proc.communicate(timeout=30)[0].strip() for proc in procs}
+        assert all(proc.returncode == 0 for proc in procs)
+        assert len(tokens) == 1, tokens
+        assert tokens == {(folder / TOKEN_FILE).read_text(encoding="ascii").strip()}
+
+
+def test_threads_starting_together_share_one_key(tmp_path):
+    """同じプロセスの中で同時に呼んでも、合言葉は1つ。"""
+    barrier = threading.Barrier(16)
+    results: list[str] = []
+
+    def run():
+        barrier.wait()
+        results.append(load_token(tmp_path / "c"))
+
+    threads = [threading.Thread(target=run) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert len(results) == 16 and len(set(results)) == 1
+
+
+# ------------------------------------------------------------------ 画面の好み
+
+
+@pytest.mark.parametrize("value", ["360", "0", "10000"])
+def test_sizes_are_ascii_digits(value):
+    assert valid_pref("layout.specWidth", value)
+
+
+@pytest.mark.parametrize("value", ["３６０", "٣٦٠", "३६०", "36０", "", "10001", "-1", "1e3", " 360", "360 "])
+def test_sizes_with_other_digits_or_forms_are_refused(value):
+    """\\d は全角や他の文字の数字（٣٦٠、३६०）も通すので、[0-9] だけにした（レビュー2回目の軽5）。"""
+    assert not valid_pref("layout.specWidth", value)
+
+
+@pytest.mark.parametrize(("content", "why"), [
+    # 64 KiB（大きすぎるとみなす境目）より小さいまま、入れ子を深くする
+    ("[" * 30000 + "]" * 30000, "nesting too deep"),
+    ('{"a":' * 10000 + "1" + "}" * 10000, "nesting too deep"),
+    ("{not json", "Expecting"),
+    ('["a list"]', "not an object"),
+    ('{"theme": "dark"' + " " * (70 * 1024) + "}", "too large"),
+    (b"\xff\xfe{}", "codec"),
+], ids=["deep-array", "deep-object", "not-json", "list", "too-large", "not-utf8"])
+def test_broken_settings_are_read_as_defaults_reported_and_kept(tmp_path, content, why):
+    """壊れた設定ファイル（深い入れ子、JSON でない、大きすぎる）は既定で読み、1回だけ知らせ、
+
+    上書きする前に settings.json.broken へ控える（レビュー2回目の軽3）。"""
+    path = tmp_path / SETTINGS_FILE
+    data = content if isinstance(content, bytes) else content.encode("utf-8")
+    path.write_bytes(data)
+    reports = []
+    settings = Settings(tmp_path, on_broken=lambda p, reason, backup: reports.append((p, reason, backup)))
+    assert settings.read() == {}
+    assert settings.read() == {}
+    assert len(reports) == 1 and reports[0][0] == path and why in reports[0][1], reports
+    assert settings.update({"theme": "dark"}) == {"theme": "dark"}
+    assert (tmp_path / (SETTINGS_FILE + ".broken")).read_bytes() == data
+    assert json.loads(path.read_text(encoding="utf-8")) == {"theme": "dark"}
+    assert settings.read() == {"theme": "dark"} and len(reports) == 1
+
+
+def test_settings_that_cannot_be_written_raise_oserror(tmp_path):
+    """書けないとき（ここでは、設定ファイルと控えの場所がどちらも中身のあるフォルダ）は OSError を出す。
+
+    アプリ本体はそれを 500 と理由にして返す（画面は送り直しを止め、お知らせで知らせる）。"""
+    (tmp_path / SETTINGS_FILE).mkdir()
+    (tmp_path / (SETTINGS_FILE + ".broken")).mkdir()
+    (tmp_path / (SETTINGS_FILE + ".broken") / "x").write_text("x", encoding="utf-8")
+    settings = Settings(tmp_path)
+    assert settings.read() == {}
+    with pytest.raises(OSError):
+        settings.update({"theme": "dark"})
+
+
+# ------------------------------------------------------------------ Windows の権限（ACL）
+
+
+@pytest.mark.parametrize(("sddl", "expected"), [
+    ("D:PAI(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)", {"S-1-5-21-1-2-3-1001", "SY"}),
+    ("D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;S-1-5-21-9)", {"SY", "BA", "S-1-5-21-9"}),
+    ("D:(A;;0x1200a9;;;WD)(D;;FA;;;BG)", {"WD"}),  # 拒否（D）は数えない
+    ("D:P(A;OICIIO;FA;;;CO)(A;OICI;FA;;;SY)", {"SY"}),  # 継承するだけ（IO）は、そのものには効かない
+    ("D:NO_ACCESS_CONTROL", None),  # DACL が無い: 誰でも使える
+    ("O:BAG:SYD:(A;;FA;;;AU)S:(AU;SA;FA;;;WD)", {"AU"}),
+])
+def test_sddl_trustees(sddl, expected):
+    assert sddl_trustees(sddl) == expected
+
+
+def windows_user_sid() -> str:
+    out = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True,
+                         errors="replace", check=True).stdout
+    return out.strip().split(",")[-1].strip('"')
+
+
+def saved_sddl(path: Path, tmp: Path) -> str:
+    saved = tmp / f"acl-{path.name}.txt"
+    subprocess.run(["icacls", str(path), "/save", str(saved)], capture_output=True, check=True)
+    return saved.read_bytes().decode("utf-16-le", errors="replace")
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")
+def test_token_file_and_folder_get_an_explicit_private_acl_on_windows(tmp_path):
+    """場所と合言葉のファイルに、本人と SYSTEM だけの権限を明示して付け、上から受け継がない（D:P）。
+
+    上の階層に Everyone の読み取りを足しておいても、合言葉のファイルには届かない（icacls で確かめる）。"""
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    subprocess.run(["icacls", str(parent), "/grant", "*S-1-1-0:(OI)(CI)R"], capture_output=True, check=True)
+    folder = parent / "circuit-sim"
+    load_token(folder)
+    me = windows_user_sid()
+    for target in (folder, folder / TOKEN_FILE):
+        sddl = saved_sddl(target, tmp_path)
+        assert "D:P" in sddl, (target, sddl)
+        trustees = sddl_trustees(sddl[sddl.index("D:"):].strip())
+        assert trustees == {me, "SY"}, (target, sddl)
+    out = subprocess.run(["icacls", str(folder / TOKEN_FILE)], capture_output=True, text=True,
+                         errors="replace", check=True).stdout
+    assert "Everyone" not in out and "(I)" not in out, out
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")
+def test_token_readable_by_everyone_is_replaced_on_windows(tmp_path):
+    """Everyone が読めた合言葉は、漏れたものとみなして作り直し、権限も直す。"""
+    first = load_token(tmp_path / "c")
+    path = tmp_path / "c" / TOKEN_FILE
+    subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:R"], capture_output=True, check=True)
+    second = load_token(tmp_path / "c")
+    assert second != first
+    sddl = saved_sddl(path, tmp_path)
+    assert sddl_trustees(sddl[sddl.index("D:"):].strip()) == {windows_user_sid(), "SY"}, sddl
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows の権限（ACL）。POのPCの local_ci で流れる")

@@ -10,6 +10,7 @@ import json
 import ntpath
 import os
 import posixpath
+import socket
 import stat
 import threading
 import time
@@ -22,12 +23,14 @@ import pytest
 import uvicorn
 
 from circuit_sim.app import server as server_module
-from circuit_sim.app.cli import bind
-from circuit_sim.app.config import Settings
+from circuit_sim.app.cli import GuardedServer, bind
+from circuit_sim.app.config import SETTINGS_FILE, Settings
 from circuit_sim.app.server import (
     COOKIE,
+    LAUNCH_KEPT,
     SAMPLES,
     STATIC_DIR,
+    Launches,
     Workspace,
     check_spec,
     create_app,
@@ -43,15 +46,18 @@ WINDOWS = os.name == "nt"
 
 
 class Running:
-    def __init__(self, config: Path, token: str = TOKEN) -> None:
+    def __init__(self, config: Path, token: str = TOKEN, launches: Launches | None = None, port: int = 0,
+                 settings: Settings | None = None) -> None:
         self.workspace = Workspace()
-        self.settings = Settings(config)
-        app = create_app(token=token, settings=self.settings, workspace=self.workspace)
-        self.sock = bind(0)
+        self.settings = settings or Settings(config)
+        self.launches = launches or Launches()
+        app = create_app(token=token, settings=self.settings, workspace=self.workspace,
+                         launches=self.launches)
+        self.sock = bind(port)
         self.port = self.sock.getsockname()[1]
         self.base = f"http://127.0.0.1:{self.port}"
         config_ = uvicorn.Config(app, log_level="warning", access_log=False, lifespan="off")
-        self.server = uvicorn.Server(config_)
+        self.server = GuardedServer(config_, self.workspace, say=lambda text: None)
         self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [self.sock]}, daemon=True)
 
     def start(self) -> Running:
@@ -276,9 +282,13 @@ def test_screen_files_do_not_need_the_key(srv):
     assert srv.raw("GET", "/boot.js", cookie=False)[0] == 200
 
 
-def test_url_with_the_key_sets_cookie_and_moves_to_plain_url(srv):
-    """起動したときの URL（/?k=合言葉）でクッキー（HttpOnly、SameSite=Strict、Path=/）を付け、/ へ移す。"""
-    status, headers, _ = srv.raw("GET", f"/?k={TOKEN}", cookie=False)
+def test_launch_number_sets_cookie_and_moves_to_plain_url(srv):
+    """起動したときの URL（/?k=起動の番号）で、合言葉のクッキーを付け、/ へ移す。
+
+    クッキーは HttpOnly、SameSite=Strict、Path=/。"""
+    number = srv.launches.issue()
+    assert number != TOKEN and TOKEN not in number
+    status, headers, _ = srv.raw("GET", f"/?k={number}", cookie=False)
     assert status == 303 and headers["location"] == "/"
     cookie = headers["set-cookie"]
     assert cookie.startswith(f"{COOKIE}={TOKEN};")
@@ -287,6 +297,80 @@ def test_url_with_the_key_sets_cookie_and_moves_to_plain_url(srv):
     assert parts["path"] == "Path=/"
     status, headers, _ = srv.raw("GET", "/?k=wrong", cookie=False)
     assert status == 303 and "set-cookie" not in headers
+
+
+def test_launch_number_works_only_once(srv):
+    """起動の番号は1回だけ使える（ブラウザの起動の引数や履歴から読まれても、もう使えない）。"""
+    number = srv.launches.issue()
+    assert "set-cookie" in srv.raw("GET", f"/?k={number}", cookie=False)[1]
+    status, headers, _ = srv.raw("GET", f"/?k={number}", cookie=False)
+    assert status == 303 and "set-cookie" not in headers
+
+
+def test_the_key_itself_is_not_accepted_in_the_url(srv):
+    """合言葉そのものを URL に載せても、クッキーは付かない（URL に合言葉を載せる形を残さない）。"""
+    status, headers, _ = srv.raw("GET", f"/?k={TOKEN}", cookie=False)
+    assert status == 303 and "set-cookie" not in headers
+
+
+def test_launch_number_expires(tmp_path):
+    now = [1000.0]
+    launches = Launches(seconds=300, clock=lambda: now[0])
+    first, second = launches.issue(), launches.issue()
+    now[0] += 299.9
+    assert launches.redeem(first)
+    now[0] += 0.2  # 300 秒を過ぎた
+    assert not launches.redeem(second)
+    # HTTP でも: 期限の切れた番号ではクッキーが付かない
+    running = Running(tmp_path, launches=Launches(seconds=0.2)).start()
+    try:
+        number = running.launches.issue()
+        time.sleep(0.3)
+        assert "set-cookie" not in running.raw("GET", f"/?k={number}", cookie=False)[1]
+    finally:
+        running.stop()
+
+
+def test_only_a_few_unused_launch_numbers_are_kept():
+    launches = Launches()
+    numbers = [launches.issue() for _ in range(LAUNCH_KEPT + 2)]
+    assert not launches.redeem(numbers[0]) and not launches.redeem(numbers[1])  # 古いものから捨てる
+    assert all(launches.redeem(n) for n in numbers[2:])
+
+
+def test_stale_launch_number_without_cookie_is_reported_to_the_terminal(tmp_path):
+    """使い終わった・期限の切れた番号で、クッキーを持たないページが開かれたら、端末に知らせる（間隔をあけて）。
+
+    クッキーを持っているページ（履歴から開き直した、など）では知らせない。"""
+    reports = []
+    running = Running(tmp_path, launches=Launches(on_stale=lambda: reports.append(1))).start()
+    try:
+        number = running.launches.issue()
+        running.raw("GET", f"/?k={number}", cookie=False)
+        assert reports == []
+        running.raw("GET", f"/?k={number}")  # クッキーあり
+        assert reports == []
+        running.raw("GET", f"/?k={number}", cookie=False)
+        running.raw("GET", "/?k=unknown", cookie=False)
+        assert reports == [1]  # 続けて来たものは1回にまとめる
+    finally:
+        running.stop()
+
+
+def test_launch_numbers_are_compared_in_constant_time(monkeypatch):
+    calls = []
+    real = server_module.hmac.compare_digest
+
+    def record(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    launches = Launches()
+    number = launches.issue()
+    launches.issue()
+    monkeypatch.setattr(server_module.hmac, "compare_digest", record)
+    assert launches.redeem(number)
+    assert len(calls) == 2  # 合ったところで止めない
 
 
 def test_key_is_compared_in_constant_time(monkeypatch):
@@ -495,6 +579,98 @@ def test_broken_settings_file_is_ignored(tmp_path):
     settings.path.write_text(json.dumps({"lang": "en", "theme": "neon", "x": "1", "layout.specWidth": 400}),
                              encoding="utf-8")
     assert settings.read() == {"lang": "en"}
+
+
+def test_deeply_nested_settings_file_still_serves_the_page(tmp_path):
+    """深い入れ子の設定ファイルでも、/ と /api/settings は 200（既定で開く。レビュー2回目の軽3）。"""
+    (tmp_path / SETTINGS_FILE).write_text("[" * 30000 + "]" * 30000, encoding="utf-8")
+    reports = []
+    running = Running(tmp_path, settings=Settings(tmp_path, on_broken=lambda *a: reports.append(a))).start()
+    try:
+        status, _, body = running.call("/")
+        assert status == 200 and b'data-prefs="{}"' in body
+        assert running.json("/api/settings") == {"settings": {}}
+        saved = running.json("/api/settings", {"settings": {"theme": "dark"}}, "PUT")["settings"]
+        assert saved == {"theme": "dark"}
+        assert (tmp_path / (SETTINGS_FILE + ".broken")).exists()
+        assert len(reports) == 1
+    finally:
+        running.stop()
+
+
+def test_settings_that_cannot_be_written_are_reported_with_the_place(tmp_path):
+    """書けない場所では、PUT は 500 と、設定の場所と理由を返す（画面がお知らせに出す）。"""
+    (tmp_path / SETTINGS_FILE).mkdir()
+    (tmp_path / (SETTINGS_FILE + ".broken")).mkdir()
+    (tmp_path / (SETTINGS_FILE + ".broken") / "x").write_text("x", encoding="utf-8")
+    running = Running(tmp_path).start()
+    try:
+        status, _, raw = running.call("/api/settings", {"settings": {"theme": "dark"}}, "PUT")
+        assert status == 500
+        body = json.loads(raw)
+        assert body["path"] == str(tmp_path) and body["reason"]
+        assert running.call("/")[0] == 200 and running.json("/api/settings") == {"settings": {}}
+    finally:
+        running.stop()
+
+
+# ------------------------------------------------------------ 止めるとき（Windows の SO_EXCLUSIVEADDRUSE）
+
+
+def idle_connection(port: int) -> socket.socket:
+    """要求を1つ送り、応答を読み終えて、つないだままにする（ブラウザの keep-alive と同じ）。"""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5)
+    conn.sendall(f"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {COOKIE}={TOKEN}\r\n\r\n"
+                 .encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        data += conn.recv(4096)
+    head, rest = data.split(b"\r\n\r\n", 1)
+    length = int(next(line.split(b":")[1] for line in head.split(b"\r\n")
+                      if line.lower().startswith(b"content-length")))
+    while len(rest) < length:
+        rest += conn.recv(4096)
+    return conn
+
+
+def test_idle_connections_are_reset_when_stopping(tmp_path):
+    """止めるとき、待っている接続（keep-alive）は RST で閉じる（FIN で閉じて相手を待つと、Windows の
+
+    SO_EXCLUSIVEADDRUSE のソケットは、その間、同じポートに結べない）。"""
+    running = Running(tmp_path).start()
+    conns = [idle_connection(running.port) for _ in range(3)]
+    try:
+        running.stop()
+        for conn in conns:
+            conn.settimeout(5)
+            with pytest.raises(ConnectionResetError):
+                while conn.recv(4096):
+                    pass
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の SO_EXCLUSIVEADDRUSE（POのPCの local_ci で流れる）")
+def test_same_port_can_be_bound_again_right_after_stopping_on_windows(tmp_path):
+    """SO_EXCLUSIVEADDRUSE を付けたまま、受け付けた接続が相手の側で開いたままでも、
+
+    止めてすぐ同じポートに結べる（開いている画面が、起動し直したアプリ本体に、同じポートで戻れる）"""
+    first = Running(tmp_path).start()
+    port = first.port
+    conns = [idle_connection(port) for _ in range(3)]
+    try:
+        first.stop()
+        again = bind(port)  # 結べなければ OSError（WSAEADDRINUSE）
+        again.close()
+        second = Running(tmp_path, port=port).start()
+        try:
+            assert second.json("/api/health")["instance"]
+        finally:
+            second.stop()
+    finally:
+        for conn in conns:
+            conn.close()
 
 
 def test_urllib_without_cookie_gets_401(srv):

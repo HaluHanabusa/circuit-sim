@@ -1,4 +1,6 @@
 // ツールチップ（design-system 6.7）。ポインタが乗って 500ms で出る。キーボードのフォーカスでも出る。Esc で消える。
+// 押したら（ポインタでも、Enter・スペースでも）消え、次にフォーカスが来るまで（ポインタは、一度離れて乗り直すまで）
+// 出し直さない（A0 の UX 確認の改善2。押した後も、結果の上に残り続けないように）。
 // 中に押せるものを置かない。ここにしか無い情報を作らない（ショートカット、省略した全文、説明、名前だけ）。
 import {
   cloneElement,
@@ -24,9 +26,12 @@ export function Tooltip({ text, children }: Props) {
   const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
   const timer = useRef<number | undefined>(undefined);
   const anchor = useRef<HTMLElement | null>(null);
+  /** 押した後: フォーカスが離れるか、ポインタが離れるまで出さない */
+  const pressed = useRef(false);
 
   const show = (now: boolean) => {
     window.clearTimeout(timer.current);
+    if (pressed.current) return;
     const open = () => {
       const el = anchor.current;
       if (!el) return;
@@ -40,6 +45,10 @@ export function Tooltip({ text, children }: Props) {
   const hide = () => {
     window.clearTimeout(timer.current);
     setShown(false);
+  };
+  const press = () => {
+    pressed.current = true;
+    hide();
   };
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
@@ -58,6 +67,8 @@ export function Tooltip({ text, children }: Props) {
     onFocus?: (e: FocusEvent) => void;
     onBlur?: (e: FocusEvent) => void;
     onPointerDown?: (e: PointerEvent) => void;
+    onPointerLeave?: (e: PointerEvent) => void;
+    onKeyDown?: (e: KeyboardEvent) => void;
   };
   const child = cloneElement(children, {
     ref: (el: HTMLElement | null) => {
@@ -67,19 +78,29 @@ export function Tooltip({ text, children }: Props) {
     },
     "aria-describedby": id,
     onPointerEnter: () => show(false),
-    onPointerLeave: hide,
+    onPointerLeave: (e: PointerEvent) => {
+      own.onPointerLeave?.(e);
+      pressed.current = false; // 離れて乗り直したら出す（フォーカスでは、次に来るまで出ない）
+      hide();
+    },
     onFocus: (e: FocusEvent) => {
       own.onFocus?.(e);
+      pressed.current = false; // 次にフォーカスが来た
       const target = e.target as HTMLElement;
       if (target.matches(":focus-visible")) show(true);
     },
     onBlur: (e: FocusEvent) => {
       own.onBlur?.(e);
+      pressed.current = false;
       hide();
     },
     onPointerDown: (e: PointerEvent) => {
       own.onPointerDown?.(e);
-      hide();
+      press();
+    },
+    onKeyDown: (e: KeyboardEvent) => {
+      own.onKeyDown?.(e);
+      if (e.key === "Enter" || e.key === " ") press();
     },
   });
   return (

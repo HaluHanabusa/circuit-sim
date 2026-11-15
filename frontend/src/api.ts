@@ -25,6 +25,18 @@ export const HEALTH_TIMEOUT_MS = 2000;
 /** アプリ本体が合言葉を確かめられなかった（401）。ターミナルに出ている URL から開き直してもらう。 */
 export class Unauthorized extends Error {}
 
+/** アプリ本体が応えたが、断った・失敗した（401 のほか）。body はアプリ本体が返した JSON（読めなければ null）。 */
+export class HttpError extends Error {
+  readonly status: number;
+  readonly body: Record<string, unknown> | null;
+
+  constructor(status: number, body: Record<string, unknown> | null) {
+    super(`HTTP ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 10000): Promise<T> {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -37,7 +49,15 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 1000
       headers: init.body ? { "Content-Type": "application/json" } : undefined,
     });
     if (response.status === 401) throw new Unauthorized(`HTTP ${response.status}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = (await response.json()) as Record<string, unknown>;
+      } catch {
+        body = null;
+      }
+      throw new HttpError(response.status, body);
+    }
     return (await response.json()) as T;
   } finally {
     window.clearTimeout(timer);
@@ -54,6 +74,7 @@ export const api = {
   session: () => request<{ doc: Doc | null; dirty: boolean }>("/api/session"),
   putSession: (doc: Doc | null, dirty: boolean) =>
     request<{ doc: Doc | null }>("/api/session", { method: "PUT", body: JSON.stringify({ doc, dirty }) }),
+  settings: () => request<{ settings: Record<string, string> }>("/api/settings"),
   putSettings: (settings: Record<string, string | null>) =>
     request<{ settings: Record<string, string> }>("/api/settings", {
       method: "PUT",

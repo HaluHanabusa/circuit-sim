@@ -3,9 +3,15 @@
 Node.js が無くても動く（画面のソースを文字列として調べる）。
 JSX は、正規表現ではなく小さな読み取り器（scan_jsx）で、タグ・属性・子の式・子の文字を分けて調べる
 （正規表現では、括弧・?・: を含む文や、式の中の文字列、属性を式で書いた文字列を見逃した。A0 のレビューの中4、
-検証の問題5）。直書きを写しに1つずつ仕込み、すべて見つかることも確かめる（test_planted_*）。
-見つけられないもの: 変数に入れた文字列（const label = "Open"）。画面に出た文字を調べる試験（受け入れ試験の
-AC-10-3）で拾う。
+検証の問題5）。子の式と、文字を出す属性（TEXT_ATTRS）の式では、そのまま画面に出る位置の文字列を探す
+（式の頭、三項・&&・||・?? の枝、+ でつないだもの。displayed_literals）。
+直書きを写しに1つずつ仕込み、すべて見つかることも確かめる（test_planted_*）。
+見つけられないもの:
+  - 変数や定数に入れた文字列（const label = "Open"、<Tooltip text={label}>）
+  - 関数の引数に渡した文字列（{format("Open")}、{list.map(() => "Item")}）。t("…") のキーと見分けられないため
+  - 配列・オブジェクトの中の文字列（{["Open"][0]}、{{ a: "Open" }.a}）
+  - TEXT_ATTRS に無い名前の属性に渡した文字列（部品が独自の名前で文字を受け取るもの）
+これらは、画面に出た文字を調べる試験（受け入れ試験の AC-10-3）で拾う。
 """
 from __future__ import annotations
 
@@ -68,9 +74,9 @@ COLOR_WORD_RE = re.compile(
     r"(?<![\w-])(" + "|".join(sorted(COLOR_WORDS, key=len, reverse=True)) + r")(?![\w-])", re.I)
 COLOR_LITERAL_RE = re.compile(r"#[0-9a-fA-F]{3,8}(?![\w-])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(",
                               re.I)
-# 文字を画面に出す属性（読み上げ、ツールチップ、入力の見本）
+# 文字を画面に出す属性（読み上げ、ツールチップ、入力の見本）。text は Tooltip の文
 TEXT_ATTRS = frozenset({"aria-label", "aria-description", "aria-roledescription", "aria-valuetext",
-                        "aria-placeholder", "title", "placeholder", "alt", "label"})
+                        "aria-placeholder", "title", "placeholder", "alt", "label", "text"})
 # 色を取る属性（SVG と style の名前。JSX の書き方と CSS の書き方の両方）
 COLOR_ATTRS = frozenset({"fill", "stroke", "color", "stopColor", "stop-color", "floodColor", "flood-color",
                          "lightingColor", "lighting-color"})
@@ -211,19 +217,96 @@ def scan_jsx(code: str) -> list[str]:
     return found
 
 
+# そのまま画面に出る位置の文字列の、前の記号（式の頭は ""）と、後ろの記号
+DISPLAY_BEFORE = ("", "?", ":", "&&", "||", "??", "+", "(")
+OPERATORS = re.compile(r"===|!==|==|!=|<=|>=|&&|\|\||\?\?|=>|[?:+\-*/%<>!=,;]")
+
+
+def displayed_literals(expr: str) -> list[str]:
+    """式の中で、そのまま画面に出る位置の文字列の中身（テンプレートの ${…} は外す）。
+
+    出る位置: 式の頭、三項の枝（? の後、: の後）、&& || ?? の後、+ の前後、まとめの括弧 ( の後。
+    出ない位置: 関数の引数（t("a.b")、Icon の名前）、比較（kind === "error"）、配列・オブジェクトの中、
+    添え字（a["b"]）。"""
+    found: list[str] = []
+    stack: list[str] = []  # 開いている括弧の種類: call、group、array、object
+    prev = ""  # 直前の記号（"" は式の頭か、まとめの括弧の直後）
+    pending: tuple[str, str] | None = None  # 直前の文字列（中身、その前の記号）。後ろに + が来るかを見る
+    i = 0
+    n = len(expr)
+
+    def settle(after: str) -> None:
+        nonlocal pending
+        if pending is not None:
+            text, before = pending
+            inside = not stack or stack[-1] == "group"
+            comparing = before in ("===", "!==", "==", "!=") or after in ("===", "!==", "==", "!=")
+            if inside and not comparing and (before in DISPLAY_BEFORE or after == "+"):
+                found.append(text)
+            pending = None
+
+    while i < n:
+        c = expr[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c in "'\"`":
+            end = string_end(expr, i)
+            settle("")
+            body = expr[i + 1:end - 1]
+            if c == "`":
+                body = re.sub(r"\$\{[^}]*\}", "", body)
+            pending = (body, prev)
+            prev = "str"
+            i = end
+            continue
+        if c in "([{":
+            settle("")
+            if c == "(":
+                stack.append("call" if prev in ("name", ")", "]") else "group")
+            else:
+                stack.append("array" if c == "[" else "object")
+            prev = "" if c == "(" and stack[-1] == "group" else c
+            i += 1
+            continue
+        if c in ")]}":
+            settle(c)
+            if stack:
+                stack.pop()
+            prev = ")" if c == ")" else "]"
+            i += 1
+            continue
+        m = OPERATORS.match(expr, i)
+        if m:
+            settle(m.group(0))
+            prev = m.group(0)
+            i = m.end()
+            continue
+        m = re.compile(r"[\w$.]+").match(expr, i)
+        settle("")
+        if m:
+            prev = "name"
+            i = m.end()
+        else:
+            prev = c
+            i += 1
+    settle("")
+    return found
+
+
+def has_words(text: str) -> bool:
+    return bool(ENGLISH_WORD.search(text) or JAPANESE.search(text))
+
+
 def child_expression(expr: str, found: list[str]) -> None:
     value = string_literal(expr)
     if value is not None:
-        if ENGLISH_WORD.search(value) or JAPANESE.search(value):
+        if has_words(value):
             found.append(f"子の式の文字列: {value!r}")
         return
-    # 三項や && の枝の文字列（cond ? "Yes" : "No"、cond && "Ready"）。関数の引数（t("a.b")）、属性の値
-    # （className="…"）、部品の名前（"error"）は除く
-    for m in re.finditer(r"(?:\?|:|&&|\|\||\?\?)\s*(['\"`])((?:\\.|(?!\1).)*)\1", expr):
-        text = m.group(2)
-        # 小文字の名前（キー a.b、部品の名前 error、組の名前 is-open）は除く
-        if re.search(r"[A-Z][a-z]|[A-Za-z]{2,}\s+[A-Za-z]{2,}|[?:!.]\s*$", text) and not re.fullmatch(
-                r"[a-z0-9_.:-]+", text):
+    # 三項や && の枝、+ でつないだ文字列（cond ? "Yes" : "No"、cond && "Ready"、"Saved: " + name）
+    for text in displayed_literals(expr):
+        if has_words(text):
             found.append(f"子の式の文字列: {text!r}")
     found.extend(scan_jsx(expr))  # 式の中の JSX（cond && <span>Open</span>）
 
@@ -269,8 +352,11 @@ def parse_tag(code: str, i: int, found: list[str]) -> tuple[int, str]:
 
 
 def attribute(name: str, value: str | None, expr: str | None, found: list[str]) -> None:
-    if name in TEXT_ATTRS and value is not None and (ENGLISH_WORD.search(value) or JAPANESE.search(value)):
+    if name in TEXT_ATTRS and value is not None and has_words(value):
         found.append(f"属性 {name}: {value!r}")
+    if name in TEXT_ATTRS and value is None and expr is not None:
+        # 式で書いた文字（aria-label={open ? "Collapse" : "Expand"}、aria-label={"Open " + name}）
+        found.extend(f"属性 {name}: {text!r}" for text in displayed_literals(expr) if has_words(text))
     if name in COLOR_ATTRS and value is not None and is_color(value):
         found.append(f"色の属性 {name}: {value!r}")
     if name == "style" and expr is not None:
@@ -362,7 +448,8 @@ def test_every_notice_has_what_and_fix():
     """AC-9-1: 付録Bのすべてのお知らせが「何が起きたか」と「どう直すか」を持つ。"""
     catalog = (SRC / "notices.ts").read_text(encoding="utf-8")
     codes = re.findall(r'"(N-[A-Z-]+)":', catalog)
-    assert len(codes) == 33
+    # 付録B の 33 件と、付録B の外の N-PREFS-SAVE（strings_from_spec.py の EXTRA）
+    assert len(codes) == 33 + 1
     for code in codes:
         assert JA.get(f"notice.{code}.what") and EN.get(f"notice.{code}.what"), code
         if code == "N-INVALID":  # どう直すかは、入力に合わせて 2.3 の文言から選ぶ（付録B）
@@ -421,6 +508,15 @@ PLANTED_TEXT = [
     "<p>\n  Retry\n</p>",
     "<span>開く</span>",
     '<Tooltip text={"x"}><span aria-description={"Opens the file"} /></Tooltip>',
+    # A0 のレビュー2回目の軽4
+    '<Tooltip text="Open the file"><button /></Tooltip>',
+    '<button aria-label={open ? "Collapse" : "Expand"} />',
+    '<span>{"Saved: " + name}</span>',
+    '<button aria-label={"Open " + name} />',
+    '<span>{name + " saved"}</span>',
+    '<span title={busy ? `Running ${n}` : "Idle"} />',
+    '<span>{(open && "Collapse") || "Expand"}</span>',
+    '<span>{label ?? "Untitled"}</span>',
 ]
 PLANTED_COLOR = [
     ('<span style={{color:"red"}} />', ".tsx"),
@@ -480,6 +576,11 @@ def test_planted_color_is_found(snippet, suffix):
     "<span>{open ? t(\"layout.collapse\") : t(\"layout.expand\")}</span>",
     "<path fill=\"none\" stroke=\"currentColor\" />",
     "<span>{\" \"}</span>",
+    '<button aria-label={open ? t("layout.collapse") : t("layout.expand")} />',
+    '<Tooltip text={t("header.open.tip", { mod: "Ctrl" })}><button /></Tooltip>',
+    '<span>{kind === "error" ? <Icon name="error" /> : null}</span>',
+    '<span>{n.time ?? ""}</span>',
+    '<span title={name + "\u00a0"} />',
 ], ids=repr)
 def test_allowed_forms_are_not_reported(snippet):
     """辞書から引く形、部品の名前、データの差し込み、currentColor は、直書きとして数えない。
@@ -487,3 +588,17 @@ def test_allowed_forms_are_not_reported(snippet):
     （誤検出しない）"""
     assert text_problems(planted(snippet), ".tsx") == []
     assert color_problems(planted(snippet), ".tsx") == []
+
+
+@pytest.mark.parametrize("snippet", [
+    '<Tooltip text={label}><button /></Tooltip>',
+    "<span>{format(\"Open\")}</span>",
+    "<span>{list.map(() => \"Item\")}</span>",
+    "<span>{[\"Open\"][0]}</span>",
+    '<Panel heading="Open" />',
+], ids=repr)
+def test_documented_gaps_are_not_found(snippet):
+    """モジュールの説明に書いた「見つけられないもの」は、本当に見つけられない（説明と事実を合わせておく）。
+
+    見つけられるようにしたら、説明とこの一覧から外す。"""
+    assert text_problems(planted(snippet), ".tsx") == []

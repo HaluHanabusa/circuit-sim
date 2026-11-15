@@ -1,5 +1,7 @@
 // 全体の枠の、仕様を開いているときの配置（画面仕様 1.2）。左に仕様パネル、中央の上に回路図、下にスコープ。
-// 仕切りの位置と、たたんだ状態はブラウザに覚えさせる（AC-1-6）。各領域の中身は A1 で入る。
+// 仕切りの位置と、たたんだ状態は覚える（AC-1-6、D-050）。覚えるのは利用者が変えたときだけ（開いたときの値を
+// 書き戻さない。設定ファイルを読めていないときに、既定の値で利用者の好みを上書きしないように）。
+// 各領域の中身は A1 で入る。
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Doc } from "../api";
 import { useI18n, type MessageKey } from "../i18n";
@@ -11,6 +13,17 @@ import { Tooltip } from "./Tooltip";
 export const SPEC_WIDTH = { initial: 360, min: 300, max: 560 };
 export const SCHEMATIC_HEIGHT = { initial: 180, min: 140, maxRatio: 0.5 };
 export const SCOPE_MIN_HEIGHT = 280;
+
+/** value が開いたときの値から変わったら、name に覚える（開いたときの値はそのまま。再描画では書かない）。 */
+function useRemember(name: string, value: string) {
+  const initial = useRef(value);
+  const changed = useRef(false);
+  useEffect(() => {
+    if (!changed.current && value === initial.current) return;
+    changed.current = true;
+    writePref(name, value);
+  }, [name, value]);
+}
 
 interface Props {
   doc: Doc;
@@ -56,10 +69,10 @@ export function Frame({ doc, connected, onRun }: Props) {
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => writePref("layout.specWidth", String(specWidth)), [specWidth]);
-  useEffect(() => writePref("layout.schemHeight", String(schemHeight)), [schemHeight]);
-  useEffect(() => writePref("layout.specCollapsed", specCollapsed ? "1" : "0"), [specCollapsed]);
-  useEffect(() => writePref("layout.schemCollapsed", schemCollapsed ? "1" : "0"), [schemCollapsed]);
+  useRemember("layout.specWidth", String(specWidth));
+  useRemember("layout.schemHeight", String(schemHeight));
+  useRemember("layout.specCollapsed", specCollapsed ? "1" : "0");
+  useRemember("layout.schemCollapsed", schemCollapsed ? "1" : "0");
 
   // 回路図の高さの上限は、中央の列の 50%。スコープの最小の高さ 280 も守る
   const schemMax = Math.max(

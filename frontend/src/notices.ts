@@ -49,6 +49,8 @@ export const CATALOG = {
   "N-EXPORT-FAIL": { level: "error", kind: "event", dismissible: true },
   "N-PLOTS-FULL": { level: "warning", kind: "event", dismissible: true },
   "N-SIGNALS-FULL": { level: "warning", kind: "event", dismissible: true },
+  // 付録B の外（A0 の直し）: 画面の好みを設定ファイルに書けなかった。文言は strings_from_spec.py の EXTRA
+  "N-PREFS-SAVE": { level: "warning", kind: "event", dismissible: true },
 } as const satisfies Record<string, Entry>;
 
 export type NoticeCode = keyof typeof CATALOG;

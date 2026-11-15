@@ -18,12 +18,14 @@ Python の playwright と Chromium 系のブラウザがある環境でだけ動
 from __future__ import annotations
 
 import os
+import queue
 import re
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -66,34 +68,66 @@ class App:
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}/"
         self.proc: subprocess.Popen | None = None
-        # 合言葉（D-051）: 設定の場所はこのアプリ本体だけのもの。起動したときに端末へ出る URL（/?k=…）を
-        # login_url に持ち、ページはそこから開く（クッキーが付いて / へ移る）。API はクッキーを付けて呼ぶ
+        # 合言葉（D-051）: 設定の場所はこのアプリ本体だけのもの。起動したときに端末へ出る URL
+        # （/?k=起動の番号）は1回しか使えないので、ページを開くたびに端末へ Enter を送って
+        # 新しい URL を出させる（login_url）。
+        # API は、最初の URL を1回開いて受け取ったクッキーを付けて呼ぶ
         self.config = tempfile.mkdtemp(prefix="a0-verify-config-")
-        self.login_url = ""
         self.cookie = ""
+        self.lines: queue.Queue[str] = queue.Queue()
+
+    @property
+    def login_url(self) -> str:
+        self.proc.stdin.write(b"\n")
+        self.proc.stdin.flush()
+        return self._next_url(10)
+
+    def _next_url(self, timeout: float) -> str:
+        deadline = time.monotonic() + timeout
+        while True:
+            assert time.monotonic() < deadline, "起動の URL が出ない"
+            try:
+                line = self.lines.get(timeout=0.2)
+            except queue.Empty:
+                assert self.proc.poll() is None, "アプリ本体が起動しない"
+                continue
+            m = re.search(r"http://127\.0\.0\.1:\d+/\?k=[A-Za-z0-9_-]+", line)
+            if m:
+                return m.group(0)
 
     def start(self) -> None:
         env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": self.config}
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
-            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE,
         )
+        self.lines = queue.Queue()
+
+        def read(proc=self.proc, lines=self.lines):
+            for raw in proc.stdout:
+                lines.put(raw.decode("utf-8", "replace"))
+
+        threading.Thread(target=read, daemon=True).start()
         deadline = time.monotonic() + 20
-        while not self.login_url:
-            line = self.proc.stdout.readline().decode("utf-8", "replace")
-            m = re.search(r"http://127\.0\.0\.1:\d+/\?k=([A-Za-z0-9_-]+)", line)
-            if m:
-                self.login_url, self.cookie = m.group(0), f"circuit_sim_key={m.group(1)}"
-            assert line or self.proc.poll() is None, "アプリ本体が起動しない"
-            assert time.monotonic() < deadline, "起動したときの URL（合言葉つき）が出ない"
+        first = self._next_url(20)
         while True:
             try:
-                req = urllib.request.Request(self.url + "api/health", headers={"Cookie": self.cookie})
-                urllib.request.urlopen(req, timeout=1).close()
-                return
+                urllib.request.urlopen(self.url, timeout=1).close()  # 入口のページは合言葉なしで出る
+                break
             except OSError:
                 assert time.monotonic() < deadline, "アプリ本体が起動しない"
                 time.sleep(0.05)
+        # 最初の URL を1回開き、リダイレクトを追わずにクッキーを取る（ブラウザと同じ手順）
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(f"GET {first[len(self.url) - 1:]} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                      "Connection: close\r\n\r\n".encode("latin-1"))
+            data = b""
+            while chunk := s.recv(65536):
+                data += chunk
+        head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        found = re.search(r"(?im)^set-cookie:\s*([^;\r\n]+)", head)
+        assert found, f"起動の URL でクッキーが付かない: {head}"
+        self.cookie = found.group(1)
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:

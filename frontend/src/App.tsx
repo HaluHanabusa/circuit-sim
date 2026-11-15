@@ -17,7 +17,10 @@ import {
   flushPrefs,
   initialLang,
   initialTheme,
+  onPrefsFailure,
   readFlag,
+  serverPrefsKnown,
+  syncServerPrefs,
   writePref,
   type Theme,
 } from "./prefs";
@@ -87,6 +90,19 @@ export function App() {
     }
   }, []);
 
+  // 画面の好みを設定ファイルに書けなかった: お知らせで知らせる（同じお知らせが出ていれば足さない）
+  useEffect(() => {
+    onPrefsFailure(({ path, details }) => {
+      setNotices((list) =>
+        list.some((n) => n.code === "N-PREFS-SAVE")
+          ? list
+          : [...list, { code: "N-PREFS-SAVE", params: { path }, details, id: nextId.current++, time: clockTime(new Date()) }],
+      );
+      setAnnounce(translate(initialLang(), "notice.N-PREFS-SAVE.what", {}));
+    });
+    return () => onPrefsFailure(null);
+  }, []);
+
   // ---------------------------------------------------------------- つながっているかの確かめ（D8、1.3）
 
   useEffect(() => {
@@ -102,6 +118,20 @@ export function App() {
         const health = await api.health();
         if (stopped) return;
         const before = instance.current;
+        if (!serverPrefsKnown()) {
+          // ページが設定ファイルの好みを持たずに開いた（別のサイトのリンクから来て、クッキーが付かなかった）:
+          // 読んでから書く（既定の値で上書きしない）。言語とテーマは読んだ値を当て直す
+          const prefs = await syncServerPrefs();
+          if (stopped) return;
+          if (prefs?.lang === "ja" || prefs?.lang === "en") {
+            applyLang(prefs.lang);
+            setLang(prefs.lang);
+          }
+          if (prefs?.theme === "light" || prefs?.theme === "dark") {
+            applyTheme(prefs.theme);
+            setTheme(prefs.theme);
+          }
+        }
         void flushPrefs(); // つながっていない間に変えた好みを、設定ファイルへ
         if (before === null) {
           // 最初につながった: アプリ本体が持っている作業の状態を取り戻す（再読み込みで作業を失わせない。1.3）
@@ -273,6 +303,20 @@ export function App() {
   const t = (key: Parameters<typeof translate>[1], params?: Parameters<typeof translate>[2]) =>
     translate(lang, key, params);
 
+  const noticeBar = (
+    <NoticeBar
+      notices={notices}
+      open={noticesOpen}
+      onToggle={toggleNotices}
+      onDismiss={(id) => {
+        // 最後の1件を閉じたら、同じ描画で帯をたたむ（0 件の帯を一瞬でも開いて見せない。9.3）
+        const remaining = notices.filter((n) => n.id !== id);
+        setNotices(remaining);
+        if (remaining.length === 0) setNoticesOpen(false);
+      }}
+    />
+  );
+
   return (
     <I18nProvider lang={lang}>
       <div className={`app${conn === "disconnected" ? " is-disconnected" : ""}`} data-conn={conn}>
@@ -313,19 +357,10 @@ export function App() {
         ) : doc ? (
           <>
             <Frame doc={doc} connected={connected} onRun={() => undefined} />
-            <NoticeBar
-              notices={notices}
-              open={noticesOpen}
-              onToggle={toggleNotices}
-              onDismiss={(id) => {
-                // 最後の1件を閉じたら、同じ描画で帯をたたむ（0 件の帯を一瞬でも開いて見せない。9.3）
-                const remaining = notices.filter((n) => n.id !== id);
-                setNotices(remaining);
-                if (remaining.length === 0) setNoticesOpen(false);
-              }}
-            />
+            {noticeBar}
           </>
         ) : (
+          <>
           <StartScreen
             samples={samples}
             samplesFailed={samplesFailed}
@@ -339,6 +374,10 @@ export function App() {
             onRetrySamples={() => void loadSamples()}
             chooseRef={chooseRef}
           />
+          {/* 起動直後の画面には帯を置かない（1.3）。ただし、仕様を開く前に起きた出来事（好みを保存できなかった）は、
+              ここで知らせる */}
+          {notices.length > 0 && noticeBar}
+          </>
         )}
         {doc && dragging && (
           <div className="drop-overlay" data-testid="drop-overlay">

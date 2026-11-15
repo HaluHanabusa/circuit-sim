@@ -38,6 +38,20 @@ EXTRA = {
         "This page can't use the app. Open it again from the URL shown in the terminal where circuit-sim "
         "is running.",
     ),
+    # A0 の直し（レビュー2回目の軽3）: 画面の好みを設定ファイルに書けなかった（PUT /api/settings が失敗）。
+    # 付録B への追記は ux-designer に確認を頼む（入ったら、ここから外す）
+    "notice.N-PREFS-SAVE.what": (
+        "画面の好み（言語、テーマ、仕切りの位置）を、設定ファイルに保存できませんでした。"
+        "この画面ではそのまま使えますが、次に起動したときは戻りません。",
+        "Couldn't save your display preferences (language, theme, panel sizes) to the settings file. "
+        "They still apply here, but won't come back the next time the app starts.",
+    ),
+    "notice.N-PREFS-SAVE.fix": (
+        "設定の場所（{path}）に書き込めるか（フォルダの権限、空き容量）を確かめてください。"
+        "直った後に好みを変えると、保存し直します。",
+        "Check that the settings folder ({path}) can be written to (permissions, free space). "
+        "Once it's fixed, change a preference to save them again.",
+    ),
 }
 
 # 数値の後ろの空白で、その後ろが単位（接頭辞を含む）のもの。単位の後ろに英字が続くもの（8 signals）は除く
