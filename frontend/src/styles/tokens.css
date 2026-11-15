@@ -1,0 +1,148 @@
+/*
+ * 設計トークン（docs/design/design-system.md）。色の値を書いてよいのは、このファイルだけ。
+ * 部品は役割の名前（--bg-app など）で色を引く。テーマは <html data-theme="light|dark"> で切り替える。
+ * 値は design-system.md の 2.1、2.2、3.1 の表と同じ（tests/app/test_design_tokens.py が照らし合わせる）。
+ */
+
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* 2.1 役割と値 */
+  --bg-app: #eef0f3;
+  --bg-panel: #ffffff;
+  --bg-plot: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: #f1f3f6;
+  --bg-selected: #e2e6ec;
+  --bg-inverse: #15181d;
+  --text-primary: #15181d;
+  --text-secondary: #4a525e;
+  --text-muted: #5f6773;
+  --text-disabled: #9da4ae;
+  --text-inverse: #ffffff;
+  --border-subtle: #dfe3e8;
+  --border-control: #7d8591;
+  --plot-grid: #e6e9ed;
+  --plot-axis: #8c94a0;
+  --shadow-raised: 0 4px 12px rgba(0, 0, 0, 0.12);
+  --overlay-dialog: rgba(0, 0, 0, 0.4);
+
+  /* 2.2 状態の色 */
+  --error-fg: #b3261e;
+  --error-bg: #fdeceb;
+  --error-border: #e9a39d;
+  --missing-fg: #1d57c2;
+  --missing-bg: #e9f0fd;
+  --missing-border: #9db9ee;
+  --warning-fg: #8a5200;
+  --warning-bg: #fff3d6;
+  --warning-border: #dcb15a;
+  --ok-fg: #17713a;
+  --ok-bg: #e4f4e9;
+  --ok-border: #93cba6;
+
+  /* 3.1 波形の色 */
+  --wave-1: #2231d3;
+  --wave-2: #d17414;
+  --wave-3: #1082ab;
+  --wave-4: #8c5bfe;
+  --wave-5: #990a39;
+  --wave-6: #e129a4;
+  --wave-7: #0ea361;
+  --wave-8: #6d6a00;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-app: #0b0d10;
+  --bg-panel: #171a1f;
+  --bg-plot: #101216;
+  --bg-raised: #23272e;
+  --bg-input: #101216;
+  --bg-hover: #1f2329;
+  --bg-selected: #2b3039;
+  --bg-inverse: #e7e9ed;
+  --text-primary: #e7e9ed;
+  --text-secondary: #aab1bb;
+  --text-muted: #969da8;
+  --text-disabled: #5d646f;
+  --text-inverse: #15181d;
+  --border-subtle: #2a2e36;
+  --border-control: #6d7581;
+  --plot-grid: #23272e;
+  --plot-axis: #5f6772;
+  --shadow-raised: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --overlay-dialog: rgba(0, 0, 0, 0.4);
+
+  --error-fg: #ff8f85;
+  --error-bg: #3b1a18;
+  --error-border: #8a3a34;
+  --missing-fg: #8bb6ff;
+  --missing-bg: #16263f;
+  --missing-border: #35558f;
+  --warning-fg: #f0b54a;
+  --warning-bg: #33280f;
+  --warning-border: #7a5d22;
+  --ok-fg: #6fd58b;
+  --ok-bg: #13301d;
+  --ok-border: #2f6f43;
+
+  --wave-1: #167afa;
+  --wave-2: #f8910e;
+  --wave-3: #70e4fd;
+  --wave-4: #b09cff;
+  --wave-5: #f52311;
+  --wave-6: #cd49af;
+  --wave-7: #05c77d;
+  --wave-8: #e8de27;
+}
+
+:root {
+  /* 4.1 書体。欧文の書体を日本語の書体より前に置く（µ と Ω が全角の字形にならないように） */
+  --font-ui: "Segoe UI", system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP",
+    sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono", "Liberation Mono",
+    monospace;
+
+  /* 4.2 大きさ（大きさ / 行の高さ） */
+  --text-xs: 11px;
+  --text-xs-lh: 16px;
+  --text-sm: 12px;
+  --text-sm-lh: 16px;
+  --text-md: 13px;
+  --text-md-lh: 20px;
+  --text-lg: 16px;
+  --text-lg-lh: 24px;
+
+  /* 5 余白と寸法 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --radius-control: 4px;
+  --radius-raised: 6px;
+  --header-h: 48px;
+  --section-head-h: 32px;
+  --row-h: 28px;
+  --control-h: 28px;
+  --run-h: 32px;
+  --badge-h: 20px;
+  --hit-min: 24px;
+  --notice-bar-h: 32px;
+
+  /* 9 動き */
+  --dur-color: 80ms;
+  --dur-fade: 120ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-color: 0ms;
+    --dur-fade: 0ms;
+  }
+}

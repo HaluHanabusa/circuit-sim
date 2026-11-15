@@ -1,0 +1,12 @@
+{
+  "schema_version": "0.1",
+  "template": "rlc_series",
+  "plant": {
+    "Vin": {"value": 10, "unit": "V", "source": "手入力"},
+    "R": {"value": 1, "unit": "ohm", "source": "手入力"},
+    "L": {"value": 1e-3, "unit": "H", "source": "手入力"},
+    "C": {"value": 10e-6, "unit": "F", "source": "手入力"}
+  },
+  "targets": {},
+  "missing": []
+}
