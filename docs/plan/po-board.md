@@ -36,7 +36,9 @@ python scripts\doctor.py --headless
 - `python scripts\doctor.py`: 問題なし。確認は 831 件通過、スキップ4件（Windowsに無い仕組みを試すものと、Windowsでは別の試験が担うもの）。日本語Windowsの実機での確認が取れた。
 - `python scripts\doctor.py --headless`: 問題あり。`claude -p` が 0.2 秒で終了コード 1、`is_error` が真、`structured_output` なし、費用 0 で終わった。Claude Code の中で、問い合わせの前に失敗している形（クラウドの作業環境で認証できなかったときと同じ形）。原因の文面は記録しない作りなので、まだ分からない。
 - ハーネスの判定は error（合格にしない）で、正しく働いた。実物で分かった点: 失敗のときも `subtype` は `success` で、失敗は `is_error` と終了コードで分かる。
-- 成功したときの出力の形（`structured_output` の有無）は、まだ確かめられていない。
+- ログインし直した後（claude 2.1.325）: ヘッドレス実行は成功するが、`structured_output` が返らなかった。4通りを比べて原因を確定した。**使える道具を一覧で絞った役割（code-reviewer）だけが返さない**。構造化された結果は道具の呼び出しとして返る作りで、一覧で絞るとその道具ごと外れるため。
+  - 役割なし、道具を絞らない役割（verifier）、「道具を使うな」と指示した場合は、いずれも `structured_output` が返った（終了コード 0、`is_error` が偽、`stop_reason` が `tool_use`）。成功のときの出力の形は、ハーネスの前提どおり。
+  - 対処: code-reviewer の定義を、一覧で絞る形から、編集の道具を禁じる形に変えた（D-030）。POのPCで再確認する。
 
 ## 次にやること
 

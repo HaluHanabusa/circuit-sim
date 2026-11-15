@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: 差分のレビューを担当する（読み取り専用）。統合前の変更について、正しさ、プロジェクトの決まりへの違反、数値的な安定性、テストの質を確認するときに使う。
-tools: Read, Grep, Glob, Bash
+disallowedTools: Edit, Write, NotebookEdit
 model: inherit
 ---
 
