@@ -801,6 +801,26 @@ def test_repository_without_role_definitions_probes_the_reviewer_only(root, tmp_
     assert result["headless"]["others"] == []
 
 
+def test_only_the_heading_of_a_role_definition_is_read_for_the_tool_list(root):
+    """道具の一覧（tools:）は、見出しの中だけを見る（本文に tools: と書いてあっても、知らせない）。"""
+    define_roles(root, "code-reviewer")
+    path = root / ".claude" / "agents" / "code-reviewer.md"
+    body = path.read_text(encoding="utf-8") + "tools: と書くと、構造化された結果が返らない\n"
+    path.write_text(body, encoding="utf-8")
+    assert DOCTOR.restricts_tools(root, "code-reviewer") is False
+    define_roles(root, "verifier", restricted="verifier")
+    assert DOCTOR.restricts_tools(root, "verifier") is True
+    assert DOCTOR.restricts_tools(root, "no-such-role") is False
+
+
+def test_probe_is_not_run_when_the_instruction_cannot_pass_through_the_launcher(root, tmp_path):
+    """Windows の claude.cmd に、指示をそのまま渡せない場合は、実行しない（どの役割も）。"""
+    refused = DOCTOR.cycle.CycleError("渡せない")
+    with mock.patch.object(DOCTOR.cycle, "launchable", side_effect=refused):
+        code, result = in_process(root, "--no-check", "--headless", find=lambda name, avoid=(): f"/x/{name}")
+    assert code == 1 and result["headless"] == {"ran": False, "reason": "cannot_pass_arguments"}
+
+
 def test_unknown_role_is_not_run(root, tmp_path):
     env = fake_claude(tmp_path, good_output())
     code, result, screen = doctor(root, "--no-check", "--headless", "--role", "no-such-role", env=env)

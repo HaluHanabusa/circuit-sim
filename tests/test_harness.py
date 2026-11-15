@@ -617,6 +617,16 @@ def test_merged_unit_cannot_be_restarted_or_merged_again(repo):
 
 # ------------------------------------------- 決まり2・3: 確認の後の変更と、その例外
 
+def test_implement_record_is_not_compared_with_the_content(repo):
+    """実装の記録は、作った結果を残すだけ。その後で内容が変わっても、確認系のゲートを取り直せば統合できる。"""
+    wt = implement(repo)
+    (wt / "product.py").write_text("x = 3\n", encoding="utf-8")       # 実装の記録の後で、手直しする
+    pass_all(repo)
+    commit(wt)
+    result = cycle(repo, "merge", "U1")
+    assert result.returncode == 0, result.stdout
+
+
 def test_merge_refused_when_product_changes_after_review(repo):
     wt = implement(repo)
     pass_all(repo)
@@ -1063,6 +1073,14 @@ def test_verification_pass_without_any_criterion_is_not_a_pass(implemented, tmp_
     assert state(implemented)["gates"][gate]["verdict"] == expected
     if expected == "fail":
         assert "確かめた基準（criteria）が1つも無い" in result.stdout
+
+
+def test_estimated_cost_is_shown_only_when_the_cli_reports_it(implemented, tmp_path):
+    env = fake_claude(tmp_path, headless(total_cost_usd=0.0125))
+    with_cost = cycle(implemented, "run", "U1", "review", env=env)
+    assert "費用の概算 $0.0125" in with_cost.stdout
+    without = cycle(implemented, "run", "U1", "review", env=fake_claude(tmp_path / "2", headless()))
+    assert "費用の概算" not in without.stdout
 
 
 def test_headless_pass_with_minor_findings_is_a_pass(repo, tmp_path):

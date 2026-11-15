@@ -683,9 +683,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
     elif not args.include_equivalent:
         mutants = [m for m in mutants if m.id not in equivalent]
-    if args.sample:
-        step = max(1, len(mutants) // args.sample)
-        mutants = mutants[::step][:args.sample]
+    if args.sample and args.sample < len(mutants):         # 一覧の全体から、等間隔に選ぶ
+        mutants = [mutants[index * len(mutants) // args.sample] for index in range(args.sample)]
     tests = list(args.tests or [t for t in TOOL_TESTS if (root / t).is_file()])
     if not can_find_leftovers():
         print("注意: このOSでは、試験が残したプロセスを探せない（/proc が要る）。残っていたら手で止める")

@@ -654,8 +654,7 @@ def load_state(root: Path, uid: str) -> dict:
 
 def save_state(root: Path, state: dict) -> None:
     """状態を書く。途中まで書いたファイルを他の実行が読まないよう、別名で書いてから置き換える。"""
-    path = state_file(root, state["id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = state_file(root, state["id"])          # 場所は、記録のロック（locked）が先に作る
     partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
     partial.write_text(text, encoding="utf-8", newline="\n")
@@ -943,8 +942,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             branch = worktree_branch(worktree)
         else:
             branch = args.branch or args.id
-            worktree.parent.mkdir(parents=True, exist_ok=True)
-            git(root, "worktree", "add", str(worktree), "-b", branch)
+            git(root, "worktree", "add", str(worktree), "-b", branch)      # 上の階層は git が作る
         gates = dict(old.get("gates", {}))
         history = list(old.get("history", []))
         if args.reset and gates:

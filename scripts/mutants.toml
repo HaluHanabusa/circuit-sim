@@ -9,3 +9,37 @@ id = "hand:lock-shared"
 file = "scripts/cycle.py"
 original = "fcntl.flock(handle, fcntl.LOCK_EX)"
 replacement = "fcntl.flock(handle, fcntl.LOCK_SH)"
+
+# ---- 同値（壊しても動作が変わらない）。H2 の見本（160 通り）の生き残りから
+
+[[equivalent]]
+id = "cycle:<module>:elem:35"
+reason = "GIT_COMMON_DIR を引き継いでも、git -C で作業ツリーを指すと、git は .git ファイルが指す場所を使う（GIT_DIR が無いときは読まない。git 2.x で、別のリポジトリを指させて確かめた）。GIT_DIR は外すので、効く場面が無い。害の無い用心として一覧に残す"
+
+[[equivalent]]
+id = "cycle:<module>:elem:39"
+reason = "GIT_NAMESPACE は、取得と送信（upload-pack、receive-pack）で参照の名前を分けるだけ。ハーネスが使う git のコマンド（rev-parse、merge-base、ls-files、diff、merge など）には効かない。害の無い用心として一覧に残す"
+
+[[equivalent]]
+id = "cycle:lock_handle:del:3"
+reason = "Windows の分岐（Linux では通らない）。待ちの間の sleep を消すと、取れるまで回り続ける（CPU を使う）だけで、記録と統合の決まりは変わらない"
+
+[[equivalent]]
+id = "cycle:unlock_handle:del:2"
+reason = "Windows の分岐（Linux では通らない）。ロックのファイルは、直後に閉じられ、閉じるとロックも外れる。壊す確認は Windows の実物で流す（W1 で、ロックの分岐を Windows で壊して落ちることを確かめた）"
+
+[[equivalent]]
+id = "cycle:kill_tree:del:1"
+reason = "Windows の分岐（Linux では通らない）。taskkill /T を消すと、claude.cmd の先の本体が残る。W1 で、Windows の実物（GitHub上の自動テスト）で壊して落ちることを確かめた（test_harness.py の打ち切りの試験）。Linux では落とせない"
+
+[[equivalent]]
+id = "cycle:run_captured:const:1"
+reason = "Popen に encoding を渡すと、text の指定によらず文字列で受け取る（text=False でも同じ）"
+
+[[equivalent]]
+id = "cycle:recover_merge:const:1"
+reason = "控えのファイルは、直前で読めている（無ければ、この行に来ない）。missing_ok を外しても、消す動作は変わらない"
+
+[[equivalent]]
+id = "cycle:merge_unit:const:2"
+reason = "取り込んだ後の確認が通らなかった場合の、控えの片付け。控えは直前に書いてあり、ほかの誰も消さない（統合のロックを持っている）。missing_ok を外しても、消す動作は変わらない"
