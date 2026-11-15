@@ -11,6 +11,7 @@ class PidController:
     """偏差 = 指令値 − 測定値 にPIDを掛けて、指令を1つ出す制御器。
 
     pid       : PIDのブロック。制御周期は pid.period。
+                微分を偏差と測定値のどちらに掛けるかは pid.derivative_on。
     measure   : 測る信号の名前（"v(out)" など）。
     output    : 出す指令の名前（PWMの duty や、指令で決まる電源から名前で参照する）。
     reference : 指令値。数値、または時刻で決まる区分一定の値（Schedule）。測定の時刻 t の値を使う。
@@ -41,4 +42,7 @@ class PidController:
 
     def step(self, t: float, measured: np.ndarray) -> list[float]:
         r = self.reference.at(t, TIME_TOL * self.period)
-        return [self.pid.update(r - float(measured[0]))]
+        y = float(measured[0])
+        if self.pid.derivative_on == "measurement":
+            return [self.pid.update(r - y, measurement=y)]
+        return [self.pid.update(r - y)]

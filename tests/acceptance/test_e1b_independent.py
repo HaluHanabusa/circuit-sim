@@ -418,10 +418,6 @@ def test_example_gains_give_a_stable_closed_loop():
     assert _closed_loop_poles(KP, KI, KD, TF, 100e3) < 0.98
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "製品の不具合(軽微。E1b の利用者の経路には無い): tuning.buck_voltage_mode_pid は f_ctrl ≦ 30 kHz で、"
-    "探索の格子の端（f_ctrl/4）を交差周波数として返し、位相余裕を約 255° と報告する。"
-    "そのゲインの閉ループは不安定"))
 @pytest.mark.parametrize("f_ctrl", [25e3])
 def test_initial_gain_formula_never_reports_an_unstable_design(f_ctrl):
     from circuit_sim.tuning import buck_voltage_mode_pid

@@ -66,7 +66,9 @@ class Result:
     devices: list[str] = field(default_factory=list)               # S と D の素子ID（状態の符号のビット順）
     sample_state: np.ndarray | None = None    # 各時刻の値と整合する回路状態の符号（S と D の電流に使う）
     stats: dict[str, int] = field(default_factory=dict)            # 用意した回路状態の数など
-    # stats の欄: states（用意した回路状態の数）、state_changes（不連続点として扱ったステップ）、
+    # stats の欄: states（用意した回路状態の数）、state_changes（回路状態が変わったステップと、時刻で決まる
+    #   電源の不連続点の数）、command_changes（指令で決まる電源の値が変わった制御周期の頭の数。
+    #   state_changes とは別に数える。どちらも、その直後を減衰ステップにする不連続点として扱う）、
     #   retries（捨てた試行）、rescues_at_start（t = 0 でダイオードの状態が落ち着かず、違反が丸め誤差の
     #   幅の中の状態を採った（救済した）なら 1。_initial_state を参照）
 
@@ -906,6 +908,8 @@ def _simulate_switched(
     )
     u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
     u_mid = 0.5 * (u_start + u_end)
+    source_event = event.copy()                          # 時刻で決まる電源の不連続点（指令によるものを除く）
+    command_event = np.zeros(n_steps + 1, dtype=bool)    # 指令で決まる電源の値が変わった点
 
     # --- 制御器と指令 ---------------------------------------------------------
     cmd_names: list[str] = []
@@ -1004,6 +1008,7 @@ def _simulate_switched(
             value = w.value(float(active[c]))
             if k0 > 0 and value != u_end[k0 - 1, j]:
                 event[k0] = True
+                command_event[k0] = True
             u_start[k0:k1, j] = value
             u_end[k0:k1, j] = value
             u_mid[k0:k1, j] = value
@@ -1096,6 +1101,9 @@ def _simulate_switched(
     sample_state = np.empty(n_steps + 1, dtype=np.int64)
     sample_state[0] = code0
     sample_state[1:] = code_out[:n_steps]
+    # 核は「回路状態が変わる、または電源が不連続」のステップを数える。指令の変化だけによるものを分けて数える
+    state_changed = code_out[:n_steps] != sample_state[:n_steps]
+    only_command = command_event[:n_steps] & ~source_event[:n_steps] & ~state_changed
 
     return Result(
         t=h * np.arange(n_steps + 1),
@@ -1109,7 +1117,8 @@ def _simulate_switched(
         sample_state=sample_state,
         stats={
             "states": table.count,
-            "state_changes": int(ctl[kernel.CTL_CHANGES]),
+            "state_changes": int(ctl[kernel.CTL_CHANGES]) - int(np.count_nonzero(only_command)),
+            "command_changes": int(np.count_nonzero(command_event)),
             "retries": int(ctl[kernel.CTL_RETRIES]),
             "rescues_at_start": int(rescued_at_start),
         },

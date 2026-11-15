@@ -64,6 +64,44 @@ def test_c1_pid_matches_difference_equation_with_limits_and_clamp():
     assert np.max(np.abs(u - np.array(expected))) <= 1e-12
 
 
+def test_pid_derivative_on_measurement_matches_difference_equation():
+    """微分を測定値に掛ける: D[k] = a·D[k−1] − b·(y[k] − y[k−1])（y[−1] = y[0]）、P と I は偏差 e = r − y。
+    上下限と積分の飽和を防ぐ処理つきで、差分方程式と 1e-12 以内で一致する。
+
+    指令値 r に段差があっても、微分の項は y だけで決まる（偏差に掛ける場合は Kd·Δr/(Tf + Ts) だけ跳ねる）。
+    """
+    k = np.arange(400)
+    r = np.where(k < 200, 12.0, 10.0)
+    y = 11.0 + 0.8 * np.sin(2 * math.pi * k / 61.0) + 0.05 * (k % 5)
+    lo, hi = 0.0, 0.9
+    pid = Pid(KP, KI, KD, period=TS, t_filter=TF, lower=lo, upper=hi, derivative_on="measurement")
+    u = np.array([pid.update(ri - yi, measurement=yi) for ri, yi in zip(r, y, strict=True)])
+    a, b = TF / (TF + TS), KD / (TF + TS)
+    integ, deriv, prev, expected = 0.0, 0.0, y[0], []
+    for ri, yi in zip(r, y, strict=True):
+        e = ri - yi
+        deriv = a * deriv - b * (yi - prev)
+        prev = yi
+        v = KP * e + integ + deriv
+        if not ((v >= hi and KI * e > 0) or (v <= lo and KI * e < 0)):
+            integ = integ + KI * TS * e
+        expected.append(min(max(KP * e + integ + deriv, lo), hi))
+    assert np.max(np.abs(u - np.array(expected))) <= 1e-12
+    # 偏差に掛ける既定の PID とは、段差の点で違う（試験が両者を見分けている）
+    pid_e = Pid(KP, KI, KD, period=TS, t_filter=TF, lower=lo, upper=hi)
+    u_e = np.array([pid_e.update(ri - yi) for ri, yi in zip(r, y, strict=True)])
+    assert abs(u_e[200] - u[200]) > 0.1
+    assert pid_e.derivative_on == "error"
+
+
+def test_pid_derivative_on_measurement_needs_the_measurement():
+    pid = Pid(KP, KI, KD, period=TS, t_filter=TF, derivative_on="measurement")
+    with pytest.raises(ValueError, match="測定値"):
+        pid.update(1.0)
+    with pytest.raises(ValueError):
+        Pid(KP, KI, KD, period=TS, derivative_on="output")
+
+
 def test_pid_without_filter_is_plain_backward_difference():
     e = error_sequence(50)
     pid = Pid(0.0, 0.0, KD, period=TS)

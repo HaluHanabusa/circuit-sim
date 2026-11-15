@@ -15,6 +15,7 @@ from scipy.signal import cont2discrete
 
 from circuit_sim import Spec, expand
 from circuit_sim.__main__ import main
+from circuit_sim.control import Pid
 from circuit_sim.templates import MissingValueError
 from circuit_sim.tuning import buck_voltage_mode_pid
 from circuit_sim.units import UnitError
@@ -92,6 +93,36 @@ def test_c3_check_detects_wrong_reference(runs):
     _, res, _ = runs["startup", "switching"]
     last = period_averages(res)[-200:].mean()
     assert abs(last - 1.1 * VREF) > 10 * 0.002 * VREF
+
+
+def ripple_offset(v_in, v_out, f_sw=FSW, inductance=L, capacitance=C):
+    """三角波の測定点（周期の頭 = オフの区間の中央）のずれ: Vref − 周期平均 = ΔI·(1 + D)/(24·f·C)。
+
+    測定点ではインダクタ電流が平均に等しく、コンデンサ電流が 0 から負に変わるので、コンデンサ電圧は山の頂点。
+    頂点から周期平均までの差は、コンデンサ電流（三角波）を2回積分して求めた（D = 0.5 で ΔI/(16·f·C)）。
+    """
+    d = v_out / v_in
+    delta_i = (v_in - v_out) * d / (inductance * f_sw)
+    return delta_i * (1.0 + d) / (24.0 * f_sw * capacitance)
+
+
+@pytest.mark.parametrize("vref", [12.0, 6.0])
+def test_triangle_sampling_puts_switching_average_below_reference(runs, vref):
+    """三角波の測定点のずれ（物理として正しい効果。legs.py の説明）: スイッチングモデルの定常の周期平均は
+    Vref より ΔI·(1 + D)/(24·f·C) 低い（D = 0.5 で 7.98 mV、D = 0.25 で 4.99 mV）。平均モデルはずれない。
+
+    区間: 最後の 2 ms（起動の過渡は 5 ms までに収まる。基準3）。許容差 0.3 mV: デューティの分解能 1/200 で
+    オンの区間の位置が1刻み揺れる分（D = 0.25 で 0.1 mV。刻みを T/800 にすると 0.01 mV）の3倍。
+    D = 0.5 だけで成り立つ ΔI/(16·f·C) とは D = 0.25 で 1.0 mV 違うので、式の誤りは見分けられる。
+    """
+    if vref == VREF:
+        sw, av = runs["startup", "switching"][1], runs["startup", "average"][1]
+    else:
+        sw = build("switching", control__Vref={"value": vref, "unit": "V"}).run()
+        av = build("average", control__Vref={"value": vref, "unit": "V"}).run()
+    last = period_averages(sw)[-round(2e-3 / T):].mean()
+    assert vref - last == pytest.approx(ripple_offset(VIN, vref), abs=0.3e-3)
+    assert period_averages(av)[-round(2e-3 / T):].mean() == pytest.approx(vref, abs=0.05e-3)
 
 
 # ------------------------------------------------------------- 基準4: 平均とスイッチングの一致
@@ -183,9 +214,12 @@ def test_c6_command_is_used_from_the_next_control_period(fidelity):
         on = [int(res["gate(q1)"][p * steps: (p + 1) * steps].sum()) for p in range(10)]
         assert on == [100] * 6 + [60] * 4
     else:
-        v_sw = res["v(sw)"]
-        assert np.allclose(v_sw[: 6 * steps], 0.5 * VIN, rtol=0, atol=1e-9)
-        assert np.allclose(v_sw[6 * steps: -1], 0.3 * VIN, rtol=0, atol=1e-9)
+        # レグの電源の電圧 v(sw_avg) が d·Vin。スイッチの節点 v(sw) は、オン抵抗の電圧降下だけ低い
+        v_src = res["v(sw_avg)"]
+        assert np.allclose(v_src[: 6 * steps], 0.5 * VIN, rtol=0, atol=1e-9)
+        assert np.allclose(v_src[6 * steps: -1], 0.3 * VIN, rtol=0, atol=1e-9)
+        r_on = ex.netlist.component("Rleg").value
+        assert np.allclose(res["v(sw)"], v_src - r_on * res["i(L1)"], rtol=0, atol=1e-9)
     for j, (t, v) in enumerate(ex.controllers[0].seen):
         assert t == pytest.approx(j * T, abs=1e-3 * res.h)
         assert v == res["v(out)"][j * steps]
@@ -265,6 +299,117 @@ def test_command_line_runs_the_example(capsys):
     assert main([str(EXAMPLE)]) == 0
     out = capsys.readouterr().out
     assert "buck_voltage_mode" in out and "v(out)" in out
+
+
+def test_messages_read_naturally():
+    """利用者に出る文言: 無次元の量に単位の記号を付けない、制御の単位に接頭語を勧めない、
+    負荷の段差の抵抗が小さすぎるときは「小さすぎる」と言う。"""
+    ex = build(control__d_max={"value": 90, "unit": "%"})
+    assert "d_max: 90 % を 0.9 に換算した" in ex.notes
+    for unit in ("m1/V", "V"):                                   # 読めない単位、量の種類が違う単位
+        with pytest.raises(UnitError) as info:
+            build(control__Kp={"value": 1, "unit": unit})
+        assert "1/V と書く。接頭語は付けない" in str(info.value) and "接頭語つき" not in str(info.value)
+    with pytest.raises(UnitError) as info:
+        build(control__d_max={"value": 1, "unit": "V"})
+    assert "1 か % と書く" in str(info.value)
+    with pytest.raises(UnitError) as info:                       # 回路の値は今までどおり接頭語を勧める
+        build(plant__L={"value": 47, "unit": "uF"})
+    assert "接頭語つきで書く" in str(info.value)
+    step = {"plant__t_load_step": {"value": 5, "unit": "ms"}}
+    with pytest.raises(ValueError) as info:
+        build(plant__R_load_step={"value": 0.9, "unit": "mohm"}, **step)
+    assert "R_load_step（0.0009 Ω）が小さすぎて" in str(info.value) and "近すぎ" not in str(info.value)
+    with pytest.raises(ValueError) as info:
+        build(plant__R_load={"value": 0.9, "unit": "mohm"}, plant__R_load_step={"value": 6, "unit": "ohm"},
+              **step)
+    assert "R_load（0.0009 Ω）が小さすぎて" in str(info.value)
+    with pytest.raises(ValueError) as info:
+        build(plant__L={"value": -1, "unit": "uH"}, control__Kd={"value": -1, "unit": "s/V"})
+    assert "L は 0 より大きくする" in str(info.value) and "Kd は 0 以上にする" in str(info.value)
+
+
+@pytest.mark.parametrize("mode", ["error", "measurement"])
+def test_derivative_on_measurement_does_not_kick_at_the_reference_step(mode):
+    """微分を測定値に掛けると、指令値の段差（12 → 10 V）でデューティが跳ねない。既定は偏差に掛ける。
+
+    段差の直後の制御周期の、デューティの変化（期待値はこの試験の中の式。y は1周期ではほとんど変わらない）:
+      偏差に掛ける : (Kp + Ki·Ts + Kd/(Tf + Ts))·ΔVref = 0.465（0.5 → 0.035）
+      測定値に掛ける: (Kp + Ki·Ts)·ΔVref = 0.026
+    """
+    ex = build("average", 6e-3, control__Vref_step={"value": 10, "unit": "V"},
+               control__t_ref_step={"value": 5, "unit": "ms"})
+    old = ex.controllers[0].pid
+    assert old.derivative_on == "error"                          # テンプレートの既定（仕様どおり）
+    if mode == "measurement":
+        ex.controllers[0].pid = Pid(old.kp, old.ki, old.kd, period=old.period, t_filter=old.t_filter,
+                                    lower=old.limiter.lower, upper=old.limiter.upper, derivative_on=mode)
+    res = ex.run()
+    n = round(T / res.h)
+    cmd = res["cmd(duty)"][::n]
+    k = round(5e-3 / T) + 1                                      # t = 5 ms の測定の結果が使われる周期
+    kp, ki, kd, tf = old.kp, old.ki, old.kd, old.t_filter
+    gain = kp + ki * T + (kd / (tf + T) if mode == "error" else 0.0)
+    assert cmd[k - 1] - cmd[k] == pytest.approx(gain * 2.0, abs=2e-3)
+    if mode == "measurement":
+        assert cmd[k:].min() > 0.4
+    else:
+        assert cmd[k] < 0.05
+
+
+def test_file_without_version_is_read_by_its_contents():
+    """版の欄が無いファイル: control の値が数値なら 0.1（注意を出す）、Quantity なら 0.2 として読む。"""
+    d = spec_dict()
+    d.pop("schema_version")
+    spec = Spec.model_validate_json(json.dumps(d))
+    assert (spec.schema_version, spec.version_inferred) == ("0.2", True)
+    assert not any("版 0.1" in n for n in expand(spec).notes)
+    d["control"] = {k: q["value"] for k, q in d["control"].items()}
+    d["control"]["f_sw"], d["control"]["f_ctrl"], d["control"]["Tf"] = 100e3, 100e3, 2.5e-6
+    spec = Spec.model_validate_json(json.dumps(d))
+    assert (spec.schema_version, spec.version_inferred) == ("0.1", True)
+    assert spec.control["Kp"].unit == "" and spec.control["Kp"].source == "記載なし"
+    notes = expand(spec).notes
+    assert any("版（schema_version）が無く" in n and "版 0.1 として読んだ" in n for n in notes)
+    d["schema_version"] = "0.1"                                  # 版を書いたファイルは、そう書かない
+    spec = Spec.model_validate(d)
+    assert not spec.version_inferred
+    assert not any("schema_version" in n for n in expand(spec).notes)
+    assert any("版 0.1 の形" in n for n in expand(spec).notes)
+
+
+@pytest.mark.parametrize("template,plant", [
+    ("rc_lowpass", {"Vin": (5, "V"), "R": (1, "kohm"), "C": (1, "uF")}),
+    ("rlc_series", {"Vin": (10, "V"), "R": (1, "ohm"), "L": (1, "mH"), "C": (10, "uF")}),
+])
+def test_templates_without_switches_say_they_ignored_fidelity(template, plant):
+    d = {"template": template, "plant": {k: {"value": v, "unit": u} for k, (v, u) in plant.items()}}
+    assert not any("fidelity" in n for n in expand(Spec.model_validate(d)).notes)
+    d["simulation"] = {"fidelity": "average"}
+    ex = expand(Spec.model_validate(d))
+    assert any("simulation.fidelity" in n and "average" in n and "使わなかった" in n for n in ex.notes)
+    assert ex.fidelity is None
+
+
+def test_stats_count_command_changes_apart_from_state_changes():
+    """stats: 指令で決まる電源の値の変化（command_changes）を、回路状態の変化（state_changes）と分けて数える。
+
+    平均モデル（スイッチはレグに無く、負荷の段差のスイッチ S3 だけ）: state_changes は S3 が入る1回。
+    command_changes は、上下限で止めた指令が前の制御周期と変わった回数（この試験で cmd(duty) から数える）。
+    スイッチングモデル: 指令で決まる電源が無いので command_changes は 0。
+    """
+    changes = {"plant__R_load_step": {"value": 3, "unit": "ohm"},
+               "plant__t_load_step": {"value": 1, "unit": "ms"}}
+    res = build("average", 2e-3, **changes).run()
+    n = round(T / res.h)
+    duty = np.clip(res["cmd(duty)"][: -1: n], 0.0, 1.0)
+    assert res.stats["command_changes"] == int(np.count_nonzero(np.diff(duty)))
+    assert res.stats["command_changes"] > 100
+    assert res.stats["state_changes"] == 1
+    sw = build("switching", 0.2e-3).run()
+    assert sw.stats["command_changes"] == 0
+    toggles = int(np.count_nonzero(np.diff(sw["gate(q1)"][:-1])))
+    assert sw.stats["state_changes"] == toggles
 
 
 # ------------------------------------------------------------- 基準8: 再現性

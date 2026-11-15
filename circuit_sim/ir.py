@@ -9,7 +9,7 @@ import math
 from collections import Counter
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 SCHEMA_VERSION = "0.2"
 SUPPORTED_SCHEMA_VERSIONS = ("0.1", "0.2")
@@ -53,6 +53,9 @@ class Spec(BaseModel):
     版 0.2: control の値も plant と同じ Quantity（値、単位、出どころ）。
     版 0.1: control の値は単位の無い数値だった。読むときは、数値（と null）を単位 ""、出どころ
             「記載なし」の Quantity にする（legacy_control() で分かる。単位はテンプレートが SI とみなす）。
+    版の欄（schema_version）が無いファイルは、中身から決める: control に Quantity の形でない値
+            （数値や null）があれば 0.1、無ければ 0.2。version_inferred が True になる
+            （0.1 と決めたときはテンプレートが注意を出す）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -65,30 +68,43 @@ class Spec(BaseModel):
     simulation: SimulationSettings = Field(default_factory=SimulationSettings)
     missing: list[str] = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _read_legacy_control(cls, data: Any) -> Any:
-        """版 0.1 の control の数値を Quantity の形にする。
+    _version_inferred: bool = PrivateAttr(default=False)
 
-        数値でも null でも Quantity の形でもなければエラー。
+    @model_validator(mode="wrap")
+    @classmethod
+    def _read_versions(cls, data: Any, handler: Any) -> Spec:
+        """版の欄が無ければ中身から決め、版 0.1 の control の数値を Quantity の形にする。
+
+        版 0.1 の control の値が、数値でも null でも Quantity の形でもなければエラー。
         """
-        if not isinstance(data, dict) or data.get("schema_version") != "0.1":
-            return data
-        control = data.get("control")
-        if not isinstance(control, dict):
-            return data
-        converted = {}
-        for name, value in control.items():
-            if value is None or (isinstance(value, int | float) and not isinstance(value, bool)):
-                converted[name] = {"value": value, "unit": "", "source": LEGACY_SOURCE}
-            elif isinstance(value, dict):
-                converted[name] = value
-            else:
-                raise ValueError(
-                    f"仕様の版 0.1 の control.{name} は数値でないので読めない（{value!r}）。"
-                    "版 0.2 の形（value、unit、source）で書く"
-                )
-        return {**data, "control": converted}
+        if not isinstance(data, dict):
+            return handler(data)
+        inferred = "schema_version" not in data
+        if inferred:
+            control = data.get("control")
+            bare = isinstance(control, dict) and any(not isinstance(v, dict) for v in control.values())
+            data = {**data, "schema_version": "0.1" if bare else SCHEMA_VERSION}
+        if data.get("schema_version") == "0.1" and isinstance(data.get("control"), dict):
+            converted = {}
+            for name, value in data["control"].items():
+                if value is None or (isinstance(value, int | float) and not isinstance(value, bool)):
+                    converted[name] = {"value": value, "unit": "", "source": LEGACY_SOURCE}
+                elif isinstance(value, dict):
+                    converted[name] = value
+                else:
+                    raise ValueError(
+                        f"仕様の版 0.1 の control.{name} は数値でないので読めない（{value!r}）。"
+                        "版 0.2 の形（value、unit、source）で書く"
+                    )
+            data = {**data, "control": converted}
+        spec = handler(data)
+        spec._version_inferred = inferred
+        return spec
+
+    @property
+    def version_inferred(self) -> bool:
+        """読んだファイルに版の欄が無く、中身から版を決めたなら True。"""
+        return self._version_inferred
 
     def null_fields(self) -> list[str]:
         """値が入っていないパラメータ名の一覧。"""

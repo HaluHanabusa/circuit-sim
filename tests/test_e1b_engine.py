@@ -238,8 +238,93 @@ def test_leg_expansion_names_and_errors():
         ("S1", "S", ("p", "o"), "q1"), ("S2", "S", ("o", "n"), "q2")]
     assert gates[0].outputs == ["q1", "q2"] and gates[0].duty == "duty"
     parts, gates = leg.expand("average")
-    assert gates == [] and parts[0].nodes == ("o", "n")
+    assert gates == []
+    assert [(c.id, c.type, c.nodes) for c in parts] == [
+        ("Vleg", "V", ("o_avg", "n")), ("Rleg", "R", ("o_avg", "o"))]
+    assert parts[1].value == leg.r_on
     w = parts[0].waveform
     assert (w.command, w.gain, w.lower, w.upper) == ("duty", 48.0, 0.0, 1.0)
     with pytest.raises(ValueError):
         leg.expand("ideal")
+
+
+# ---------------------------------------------------------------- 平均モデルのレグの電圧（値で確かめる）
+
+R_TEST = 2.0       # レグにつなぐ抵抗の負荷 [Ω]（L と C が無いので、出力は代数的に決まる）
+
+
+def leg_on_resistor(duty, r_on=1e-3, v_dc=VIN):
+    """平均モデルのレグに抵抗 R_TEST だけをつないだ回路と、指令の列を出す制御器。"""
+    leg = HalfBridgeLeg(positive="in", negative="0", output="sw", duty="d", frequency=FSW, v_dc=v_dc,
+                        r_on=r_on)
+    parts, _ = leg.expand("average")
+    net = Netlist(components=parts + [Component(id="R1", type="R", nodes=("sw", "0"), value=R_TEST)])
+    return leg, net, Sequence(duty, period=TS, inputs=())
+
+
+def test_average_leg_voltage_is_duty_times_vdc_by_value():
+    """平均モデルのレグの電圧: 区間 j の電源の電圧 v(sw_avg) は d_j·Vdc、出力 v(sw) は d_j·Vdc·R/(R + r_on)。
+
+    期待値は、この試験の中の式（電圧源 d·Vdc とオン抵抗と負荷の分圧）。指令は 0〜1 で止まる（−0.2 → 0、
+    1.3 → 1）。許容差は電圧の 1e-12（L も C も無い代数の回路なので、解くときの丸め誤差だけ）。
+    レグの電圧の係数の誤り（例えば 1.5%）は、許容差の 10^10 倍の差になる。
+    """
+    duty = [0.5, 0.25, 0.8, -0.2, 1.3, 0.0, 1.0, 0.613]
+    leg, net, ctrl = leg_on_resistor(duty)
+    n = len(duty)
+    res = simulate(net, n * TS, TS / 10, controllers=[ctrl])
+    steps = 10
+    for j, d in enumerate(duty):
+        dc = min(max(d, 0.0), 1.0)
+        source = res["v(sw_avg)"][j * steps: (j + 1) * steps]
+        out = res["v(sw)"][j * steps: (j + 1) * steps]
+        assert np.allclose(source, dc * VIN, rtol=0, atol=1e-12 * VIN), (j, d)
+        assert np.allclose(out, dc * VIN * R_TEST / (R_TEST + leg.r_on), rtol=0, atol=1e-12 * VIN), (j, d)
+        current = res.i("Vleg")[j * steps: (j + 1) * steps]
+        assert np.allclose(current, -out / R_TEST, rtol=0, atol=1e-12 * VIN / R_TEST)
+
+
+def test_average_leg_voltage_check_detects_a_wrong_coefficient():
+    """失敗すべきときに失敗する: レグの電圧が 1.5% 違う（Vdc を 1.015 倍）回路は、上の式と大きく違う。"""
+    duty = [0.5, 0.25, 0.8]
+    _, net, ctrl = leg_on_resistor(duty, v_dc=1.015 * VIN)
+    res = simulate(net, 3 * TS, TS / 10, controllers=[ctrl])
+    assert abs(res["v(sw_avg)"][0] - 0.5 * VIN) > 1e6 * 1e-12 * VIN
+
+
+def test_average_leg_with_fixed_duty_is_a_dc_source():
+    """固定のデューティ（数値）では、電圧源は d·Vdc の直流（0〜1 で止める）。"""
+    for duty, expected in ((0.3, 0.3 * VIN), (1.4, VIN), (-0.1, 0.0)):
+        leg = HalfBridgeLeg(positive="in", negative="0", output="sw", duty=duty, frequency=FSW, v_dc=VIN)
+        parts, _ = leg.expand("average")
+        net = Netlist(components=parts + [Component(id="R1", type="R", nodes=("sw", "0"), value=R_TEST)])
+        res = simulate(net, 2 * TS, TS / 10)
+        assert np.allclose(res["v(sw_avg)"], expected, rtol=0, atol=1e-12 * VIN)
+        assert np.allclose(res["v(sw)"], expected * R_TEST / (R_TEST + leg.r_on), rtol=0, atol=1e-12 * VIN)
+
+
+def test_on_resistance_brings_average_model_closer_to_switching_at_high_q():
+    """平均モデルのレグのオン抵抗: 固定デューティ 0.5 の起動（Q = 8.75、LC が大きく振れる）で、周期平均の
+    スイッチングモデルとの差が、オン抵抗を入れない平均モデルより小さい。
+
+    見積もり: オン抵抗が無いと、振動の減衰が r_on/(2L) = 10.6 /s だけ遅い（1/(2RC) = 833 /s の 1.3%）。
+    振れ幅 12 V の振動が 1 ms で e^-0.83 まで減る間に、その 1.3% × 0.83 ≈ 1.1% が残り、約 0.055 V
+    （Vin·D の 0.46%）違う見込み。オン抵抗を入れれば、残るのは平均化そのものの誤差
+    （(ω0·T)² の程度、0.1% 以下）。
+    基準: 入れたとき 0.2% 以下、入れないとき 0.3% 以上（実測は 0.065% と 0.464%）。
+    """
+    t_end = 3e-3
+    net_s, gates = leg_buck("switching")
+    ps = period_averages(simulate(net_s, t_end, gates=gates), N)
+    net_a, _ = leg_buck("average")
+    pa = period_averages(simulate(net_a, t_end, TS / 10), 10)
+    lossless = Netlist(components=[
+        Component(id="Vleg", type="V", nodes=("sw", "0"), waveform=DC(value=0.5 * VIN)),
+        *[c for c in net_a.components if c.id not in ("Vleg", "Rleg")],
+    ])
+    p0 = period_averages(simulate(lossless, t_end, TS / 10), 10)
+    ref = 0.5 * VIN
+    with_r_on, without = np.abs(ps - pa)[1:].max() / ref, np.abs(ps - p0)[1:].max() / ref
+    print(f"\n開ループの周期平均の差（Vin·D 比）: オン抵抗あり {with_r_on:.4%}、なし {without:.4%}")
+    assert with_r_on <= 0.002
+    assert without >= 0.003

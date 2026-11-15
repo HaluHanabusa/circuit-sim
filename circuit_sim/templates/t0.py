@@ -35,7 +35,9 @@ class Expanded:
     probes      : 要約に出す信号の名前
     notes       : 単位の換算、既定の刻みの調整など、利用者に伝えること
     gates, controllers : simulate() に渡すゲート信号と制御器（スイッチや制御の無い回路では空）
-    signals     : 表示する信号の定義（名前、単位、既定で表示するか、電流の正の向き）。空なら probes
+    signals     : 表示する信号の構造化した情報（名前、単位、既定で表示するか、種類、節点・素子・正の向き
+                  など。
+                  items.SignalInfo）。説明の文言は画面の辞書が持つ。空なら probes
     fidelity    : モデルの精度（"switching" / "average"。精度を選べないテンプレートでは None）
     """
 
@@ -86,7 +88,7 @@ def _values(spec: Spec, names: list[str], notes: list[str]) -> dict[str, float]:
         raise ValueError(f"正の値が必要なパラメータ: {bad}")
     unused = [n for n in spec.plant if n not in names]
     if unused:
-        notes.append(f"このテンプレートが使わない項目を無視した: {unused}")
+        notes.append(f"このテンプレートが使わない項目を無視した: {'、'.join(unused)}")
     return values
 
 
@@ -180,9 +182,19 @@ def _timing(spec: Spec, poles: np.ndarray, notes: list[str]) -> tuple[float, flo
     return t_end, h
 
 
+def _fidelity_note(spec: Spec, notes: list[str]) -> None:
+    """スイッチの無いテンプレートはモデルを選べない。simulation.fidelity の指定は使わず、知らせる。"""
+    if spec.simulation.fidelity is not None:
+        notes.append(
+            f"このテンプレートにはスイッチが無く、モデルを選べないので、simulation.fidelity の指定"
+            f"（{spec.simulation.fidelity}）は使わなかった"
+        )
+
+
 def rc_lowpass(spec: Spec) -> Expanded:
     """電圧源(ステップ) - R - C。出力はコンデンサ電圧 v(out)。"""
     notes: list[str] = []
+    _fidelity_note(spec, notes)
     p = _values(spec, ["Vin", "R", "C"], notes)
     netlist = Netlist(components=[
         Component(id="V1", type="V", nodes=("in", "0"), waveform=Step(final=p["Vin"])),
@@ -197,6 +209,7 @@ def rc_lowpass(spec: Spec) -> Expanded:
 def rlc_series(spec: Spec) -> Expanded:
     """電圧源(ステップ) - R - L - C の直列。出力はコンデンサ電圧 v(out)。"""
     notes: list[str] = []
+    _fidelity_note(spec, notes)
     p = _values(spec, ["Vin", "R", "L", "C"], notes)
     netlist = Netlist(components=[
         Component(id="V1", type="V", nodes=("in", "0"), waveform=Step(final=p["Vin"])),

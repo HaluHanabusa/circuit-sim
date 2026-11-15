@@ -46,15 +46,45 @@ class Item:
         return DIMENSION_LABEL[self.dimension][1]
 
 
+SignalKind = Literal["node_voltage", "element_current", "command", "gate"]
+
+
 @dataclass(frozen=True)
 class SignalInfo:
-    """表示する信号。name は Result から取り出す名前、unit は単位（無次元は ""）、shown は既定で表示するか、
-    positive は電流の正の向き（電流でなければ None）。"""
+    """表示する信号の、構造化した情報。文言は持たない
+    （説明は画面の辞書の signal.<テンプレート>.<名前>.desc）。
+
+    name    : Result から取り出す名前（"v(out)"、"i(L1)"、"cmd(duty)"、"gate(q1)"）
+    unit    : 単位の記号（無次元は ""）
+    shown   : 既定で表示するか
+    kind    : "node_voltage"（節点の電圧。基準は節点 0）、"element_current"（素子の電流）、
+              "command"（制御器の指令）、"gate"（PWMのゲート信号。1 = オン）
+    node    : node_voltage の節点
+    element : element_current の素子ID。gate では、そのゲートが動かすスイッチの素子ID
+    positive: element_current の正の向き（素子の中を、1つ目の節点から2つ目の節点へ。素子の nodes と同じ順）
+    command : command の指令の名前
+    gate    : gate のゲート信号の名前
+    """
 
     name: str
     unit: str
     shown: bool
-    positive: str | None = None
+    kind: SignalKind
+    node: str | None = None
+    element: str | None = None
+    positive: tuple[str, str] | None = None
+    command: str | None = None
+    gate: str | None = None
+
+    def __post_init__(self) -> None:
+        expected = {
+            "node_voltage": f"v({self.node})" if self.node else None,
+            "element_current": f"i({self.element})" if self.element and self.positive else None,
+            "command": f"cmd({self.command})" if self.command else None,
+            "gate": f"gate({self.gate})" if self.gate and self.element else None,
+        }.get(self.kind)
+        if expected is None or expected != self.name:
+            raise ValueError(f"信号 {self.name}: 種類 {self.kind} に要る欄が無いか、名前と合わない")
 
 
 def _readable(unit: str) -> bool:
@@ -104,9 +134,9 @@ def read_items(spec: Spec, items: tuple[Item, ...], notes: list[str]) -> dict[st
             kinds.add("読めない" if not _readable(q.unit) else "量の種類が違う")
             continue
         if values[it.key] != q.value:
-            notes.append(
-                f"{it.key}: {q.value:g} {q.unit.strip()} を {values[it.key]:g} {it.si_unit} に換算した"
-            )
+            # 無次元の量は単位の記号を付けない（「0.9 1」と書かない）
+            si = "" if it.dimension == "ratio" else f" {it.si_unit}"
+            notes.append(f"{it.key}: {q.value:g} {q.unit.strip()} を {values[it.key]:g}{si} に換算した")
     if wrong:
         heading = {
             frozenset({"読めない"}): "単位を読めない項目がある。",
@@ -114,14 +144,18 @@ def read_items(spec: Spec, items: tuple[Item, ...], notes: list[str]) -> dict[st
         }.get(frozenset(kinds), "単位を読めない、または量の種類が違う項目がある。")
         raise UnitError(heading + "。".join(wrong))
     if legacy_used:
+        why = (
+            "仕様に版（schema_version）が無く、control の値が単位の無い数値なので、版 0.1 として読んだ。"
+            if spec.version_inferred else "仕様の版 0.1 の形なので、"
+        )
         notes.append(
-            "仕様の版 0.1 の形なので、control の数値を単位の無い値として読み、"
-            f"SI単位の値とみなした（出どころは「記載なし」）: {', '.join(legacy_used)}。"
+            f"{why}control の数値を SI単位の値とみなした（出どころは「記載なし」）: "
+            f"{'、'.join(legacy_used)}。"
             "単位と出どころを確かめて、版 0.2 の形（value、unit、source）で書き直す"
         )
     known = {(it.section, it.key) for it in items}
     unused = [f"plant.{k}" for k in spec.plant if ("plant", k) not in known]
     unused += [f"control.{k}" for k in (spec.control or {}) if ("control", k) not in known]
     if unused:
-        notes.append(f"このテンプレートが使わない項目を無視した: {unused}")
+        notes.append(f"このテンプレートが使わない項目を無視した: {'、'.join(unused)}")
     return values

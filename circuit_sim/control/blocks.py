@@ -9,6 +9,7 @@ import math
 from typing import Literal
 
 AntiWindup = Literal["clamp", "none"]
+DerivativeOn = Literal["error", "measurement"]
 
 
 class Limiter:
@@ -38,6 +39,12 @@ class Pid:
              Kd·s / (1 + s·Tf) を後退差分で離散化したもの（Tf = 0 なら Kd·(e[k] − e[k−1]) / Ts）。
              reset の直後の最初のサンプルは e[−1] = e[0]、D[−1] = 0（微分の項は 0。起動で跳ねない）
       u[k] = clip(P[k] + I[k] + D[k], lower, upper)
+    微分を掛けるもの（derivative_on）:
+      "error"      : 偏差 e に掛ける（上の式。既定）。
+      "measurement": 測定値 y に掛ける。D[k] = a·D[k−1] − b·(y[k] − y[k−1])（y[−1] = y[0]）。
+                     偏差 e = r − y の微分から指令値 r の変化を除いたもので、指令値の段差で出力が跳ねない。
+                     帰還の経路（y から u）は "error" と同じなので、開ループと安定余裕は変わらない。
+                     update() に測定値を渡す。
     積分の飽和を防ぐ処理（anti_windup）:
       "clamp": 積分を進める前の出力 P[k] + I[k−1] + D[k] が上限以上、かつ Ki·e[k] > 0
                （下限以下、かつ Ki·e[k] < 0）のときは、積分を進めない（I[k] = I[k−1]）。
@@ -57,6 +64,7 @@ class Pid:
         lower: float = -math.inf,
         upper: float = math.inf,
         anti_windup: AntiWindup = "clamp",
+        derivative_on: DerivativeOn = "error",
     ):
         for name, v in (("kp", kp), ("ki", ki), ("kd", kd)):
             if not math.isfinite(v):
@@ -67,11 +75,14 @@ class Pid:
             raise ValueError(f"微分のフィルタの時定数 t_filter は 0 以上の有限値にする（現在 {t_filter}）")
         if anti_windup not in ("clamp", "none"):
             raise ValueError(f"anti_windup は 'clamp' か 'none'（現在 {anti_windup!r}）")
+        if derivative_on not in ("error", "measurement"):
+            raise ValueError(f"derivative_on は 'error' か 'measurement'（現在 {derivative_on!r}）")
         self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
         self.period = float(period)
         self.t_filter = float(t_filter)
         self.limiter = Limiter(lower, upper)
         self.anti_windup = anti_windup
+        self.derivative_on = derivative_on
         self._a = self.t_filter / (self.t_filter + self.period)
         self._b = self.kd / (self.t_filter + self.period)
         self.reset()
@@ -80,14 +91,20 @@ class Pid:
         """内部状態（積分、微分、前回の偏差）を初期値に戻す。"""
         self.integral = 0.0
         self.derivative = 0.0
-        self._e_prev: float | None = None
+        self._d_prev: float | None = None     # 前回の、微分を掛けるもの（−y か e）
 
-    def update(self, e: float) -> float:
-        """偏差 e[k] から出力 u[k] を計算し、内部状態を進める。"""
+    def update(self, e: float, measurement: float | None = None) -> float:
+        """偏差 e[k]（と、微分を測定値に掛けるときは測定値 y[k]）から出力 u[k] を計算し、内部状態を進める。"""
         e = float(e)
-        e_prev = e if self._e_prev is None else self._e_prev
-        self.derivative = self._a * self.derivative + self._b * (e - e_prev)
-        self._e_prev = e
+        if self.derivative_on == "measurement":
+            if measurement is None:
+                raise ValueError("微分を測定値に掛けるPIDには、update() に測定値を渡す")
+            d_in = -float(measurement)
+        else:
+            d_in = e
+        d_prev = d_in if self._d_prev is None else self._d_prev
+        self.derivative = self._a * self.derivative + self._b * (d_in - d_prev)
+        self._d_prev = d_in
         proportional = self.kp * e
         if self.anti_windup == "clamp":
             v = proportional + self.integral + self.derivative

@@ -78,19 +78,26 @@ def parse_unit(text: str) -> tuple[str, int]:
     raise UnitError(f"単位 '{text}' は読めない")
 
 
+def _how_to_write(dimension: str) -> str:
+    """その次元の単位の書き方の案内。制御の値の単位（EXACT_UNITS）は接頭語を受け付けない。"""
+    exact = [u for u, (d, _) in EXACT_UNITS.items() if d == dimension]
+    if exact:
+        return f"{' か '.join(exact)} と書く。接頭語は付けない"
+    si_symbol = DIMENSION_LABEL[dimension][1]
+    return f"{si_symbol} か、mH や kohm のような接頭語つきで書く。m はミリ、M はメガ"
+
+
 def to_si(value: float, unit: str, dimension: str) -> float:
     """値を SI単位に換算する。単位が読めない、または次元が dimension と違えば UnitError。"""
     expected, si_symbol = DIMENSION_LABEL[dimension]
     try:
         found, exponent = parse_unit(unit)
     except UnitError as exc:
-        raise UnitError(
-            f"{exc}（{expected}を期待。{si_symbol} か、mH や kohm のような接頭語つきで書く。"
-            "m はミリ、M はメガ）"
-        ) from None
+        raise UnitError(f"{exc}（{expected}を期待。{_how_to_write(dimension)}）") from None
     if found != dimension:
         raise UnitError(
-            f"単位 '{unit}' は{DIMENSION_LABEL[found][0]}の単位（{expected} [{si_symbol}] を期待）"
+            f"単位 '{unit}' は{DIMENSION_LABEL[found][0]}の単位。ここには{expected}の単位が要る"
+            f"（{_how_to_write(dimension)}）"
         )
     # 負の指数は割り算にする（10 の負のべきは2進数で正確に表せないので、掛けると最後の桁がずれる）
     return value * 10.0**exponent if exponent >= 0 else value / 10.0 ** (-exponent)
