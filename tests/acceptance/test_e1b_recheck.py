@@ -9,6 +9,8 @@
     閉ループは状態 [x_k, u_k, I_{k−1}, D_{k−1}, e_{k−1}] の 6×6 の行列の固有値（多項式を作らない）。
     位相は、隣り合う点の主値の差が 3° を超える区間を二分して細かくしてから np.unwrap（低い周波数から連続）。
 製品側の不具合で落ちる試験は xfail(strict=True) にしてある。直ったら XPASS で落ちるので、印を外す。
+4回目の検証（docs/verification/E1b-verifier-4.md）で、「足りない」の判定を D-057（目標 − 1e-6° 未満）に
+改めた。
 """
 from __future__ import annotations
 
@@ -334,7 +336,9 @@ def _check_design(args, opts):
         assert g.kp < 0 or g.kd < 0
     if g is not None:
         assert err.shortfall_deg == pytest.approx(target - g.phase_margin_deg)
-        assert ("足りない" in str(err)) == (g.phase_margin_deg < target)
+        # 「足りない」は 目標 − 1e-6° を下回るときだけ（D-057。4回目の検証で、目標ちょうどの判定から改めた。
+        # 実装の定数を読まずに決定記録の値を書く）
+        assert ("足りない" in str(err)) == (g.phase_margin_deg < target - 1e-6)
     return err.reason
 
 

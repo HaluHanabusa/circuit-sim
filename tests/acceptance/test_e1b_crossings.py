@@ -16,6 +16,8 @@
   位相余裕: 交差ごとに、連続の位相（(b) の格子の np.unwrap に、交差の点の主値を 2π の整数倍で合わせる）と、
         −1 からの角度（180° − |主値|）の両方。
 製品側の不具合（軽微）で落ちる試験は xfail(strict=True) にしてある。直ったら XPASS で落ちるので、印を外す。
+4回目の検証（docs/verification/E1b-verifier-4.md）で、D-057 の決まり（零点の比 (0, 1]、減衰 (0, 2]、
+「満たす」は目標 − 1e-6° 以上）に合わせて、引数の端の期待と「満たす」の判定を改めた。
 """
 from __future__ import annotations
 
@@ -46,6 +48,10 @@ ROOT = Path(__file__).resolve().parents[2]
 # 極の半径: 参照の固有値と相対 1e-9（同じ行列の別の組み方。丸めは 1e-13 程度）。
 PM_TOL = 0.01
 TARGET_TOL = 2e-6
+# 「満たす」の判定（D-057、4回目の検証で追加）: 余裕が 目標 − 1e-6° 以上なら満たす（受け入れの判定と同じ。
+#   実装の定数を読まずに、決定記録の値をここに書く）。参照の余裕は丸めで 1e-6° 未満ずれうるので、境目から
+#   MEETS_TOL 以内の例は判定しない。
+MEETS_TOL = 1e-6
 
 
 # ------------------------------------------------------------------ 参照
@@ -271,8 +277,8 @@ def test_near_crossings_returned_designs_meet_target_and_best_is_true(case):
     assert best.pole_radius == pytest.approx(radius, rel=1e-9)
     if err is None:
         assert pm >= target - TARGET_TOL and radius < 1.0
-    else:
-        assert ("は満たす）" in str(err)) == (pm >= target)
+    elif abs(pm - (target - MEETS_TOL)) > MEETS_TOL:     # D-057 の判定（目標 − 1e-6° 以上で満たす）
+        assert ("は満たす）" in str(err)) == (pm >= target - MEETS_TOL)
 
 
 def _sweep_cases(seed, n):
@@ -329,6 +335,8 @@ def test_unstable_reason_is_reachable_and_true():
 
 
 def test_candidate_at_the_target_within_rounding_is_not_called_short():
+    """余裕が丸めだけ（1.3e-13°）目標を下回る候補を「0.0° 足りない」と書かない（3回目の軽微2。
+    4回目で直った）。"""
     plant, f_ctrl = UNSTABLE_CASE
     opts = {"zero_damping": 0.1437543236478271, "filter_ratio": 0.0, "phase_margin_deg": 24.361861916713153,
             "zero_ratio": 0.9590984284499318}
@@ -373,13 +381,16 @@ def test_bool_text_and_none_arguments_are_refused(name, value):
 
 
 @pytest.mark.parametrize("name,value,ok", [
-    ("zero_ratio", 1.0, False), ("zero_ratio", 0.0, False), ("zero_ratio", 0.999, True),
-    ("zero_damping", 1.0, False), ("zero_damping", 0.0, False), ("zero_damping", 0.5, True),
+    ("zero_ratio", 1.0, True), ("zero_ratio", 1.0000001, False), ("zero_ratio", 0.0, False),
+    ("zero_ratio", 0.999, True),
+    ("zero_damping", 1.0, True), ("zero_damping", 2.0, True), ("zero_damping", 2.0000001, False),
+    ("zero_damping", 0.0, False), ("zero_damping", 0.5, True),
     ("filter_ratio", 0.0, True), ("phase_margin_deg", 180.0, False), ("phase_margin_deg", 0.0, False),
     ("phase_margin_deg", 30.0, True), ("f_cross_max", 0.0, False), ("v_in", 0.0, False),
 ])
 def test_design_argument_boundaries(name, value, ok):
-    """範囲の端: 開いた区間の端は断り、内側は計算する（断るなら invalid_argument 以外の理由）。"""
+    """範囲の端: 範囲の外は断り、内側と閉じた端は計算する（断るなら invalid_argument 以外の理由）。
+    零点の比は (0, 1]、零点の減衰は (0, 2]（D-057。4回目の検証で、1.0 を断る期待から改めた）。"""
     try:
         _call(**{name: value})
         reason = None
@@ -390,6 +401,7 @@ def test_design_argument_boundaries(name, value, ok):
 
 @pytest.mark.parametrize("value", [np.int64(24), np.float32(24.0)])
 def test_numpy_scalar_arguments_are_accepted(value):
+    """numpy の数（正の有限値）を受ける（3回目の軽微1。4回目で直った）。"""
     g = _call(v_in=value)
     assert g.phase_margin_deg == pytest.approx(_call(v_in=24.0).phase_margin_deg, abs=1e-6)
 
