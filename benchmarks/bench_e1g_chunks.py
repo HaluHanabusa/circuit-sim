@@ -1,136 +1,261 @@
-"""区切り（進み具合、中断、発散の確かめ）の費用を測る（E1g の受け入れ基準5・12。合否ではなく記録）。
+"""区切り（進み具合、中断、発散の確かめ）の費用と、知らせの間隔を測る（E1g の受け入れ基準3・4・5・12）。
 
-使い方（リポジトリの直下で）:
-    python benchmarks/bench_e1g_chunks.py [--repeat 5] [--baseline 前の版の circuit_sim の親フォルダ]
+合否ではなく記録（速さは機械で変わる）。使い方（リポジトリの直下で）:
+    python benchmarks/bench_e1g_chunks.py [--repeat 15] [--baseline 前の版の circuit_sim の親フォルダ]
+                                          [--sections cost,direct,intervals]
 
-測るもの（どれも同じ回路を同じ刻みで、最良の値を取る）:
-  区切る      : いまの既定（区切りごとに発散の確かめ。progress と cancel を渡す）
-  区切らない  : 区切りの点を無くしたもの（CHUNK_STEPS_FIRST と CHUNK_STEPS_MAX を 1e12 にする。制御器のある
-                回路は、制御周期ごとの呼び出しだけ。発散の確かめは計算の終わりに1回）。結果はビット単位で同じ
-  前の版      : --baseline に E1g の前の circuit_sim（例: git archive 4447f5a circuit_sim | tar -x -C 場所）を
-                渡したとき（区切りも発散の確かめも無い）
-どの形も、別のプロセスで1回計算して CPU 時間を返す（読み込みと準備の分は捨てる）。形と回路を交互にくり返し
-（--repeat 回。1つのプロセスの中では --inner 回の最良）、その中央値を比べる。機械の揺れ（この環境で ±10% 程度）が片方にだけ乗らないように。
-回路: 降圧コンバータ（同梱の例、制御器つき、スイッチング 20 万ステップ / 平均 20 万ステップ）、
-      降圧（ダイオード整流、制御器なし。核の1回の呼び出しが全体になる回路。40 万ステップ）、
-      RC はしご 20 段（スイッチなし、未知数 41、20 万ステップ）。
+測るもの
+  cost      : 同じ回路を同じ刻みで計算する所要時間を、次の形で比べる
+                区切る      いまの既定（区切りごとに発散の確かめ。progress と cancel を渡す）
+                区切らない  区切りの点を無くしたもの（CHUNK_STEPS_FIRST と CHUNK_STEPS_MAX を 1e12 にする。
+                            制御器のある回路は、制御周期ごとの呼び出しだけ。発散の確かめは計算の終わりに1回）。
+                            結果はビット単位で同じ（tests/test_e1g_progress.py）
+                前の版      --baseline に E1g の前の circuit_sim を渡したとき（区切りも発散の確かめも無い）。
+                            例: git archive 168c764 circuit_sim | tar -x -C 場所
+              回路ごとに別のプロセスを立て、その中で形を交互にくり返す（--repeat 回。順番も回す）。
+              機械の揺れが片方にだけ乗らないように。比は、最良どうしの比と、同じ回の対の比の中央値の
+              両方を出す（機械によっては、同じ形のくり返しでも最良と中央値が 10〜40% 違う。差が数 % より
+              小さいときは、どちらの比も揺れの中）
+  direct    : 発散の確かめと区切りの手間（simulate._Monitor の中で使った時間）を、計算の時間に対する
+              割合で測る。形どうしの揺れを受けないので、「区切りと確かめによる所要時間の増加」の値に使える
+  intervals : 大きな計算（100 万〜200 万ステップ）で、中断の求めを見る間隔と、進み具合を知らせる間隔の最大
+              （呼び出しの初めから最初の1回までと、最後の1回から戻るまでを含む。準備と後処理も入る）
+
+回路: 降圧コンバータ（同梱の例、制御器つき、スイッチング / 状態平均化モデル）、
+      降圧（ダイオード整流、制御器なし。核の1回の呼び出しが計算の全体になる回路）、
+      RC はしご 20 段（スイッチなし、未知数 41）。cost と direct は 20 万〜40 万ステップ。
 """
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
+import json
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-CASES_CODE = r'''
-import json, time
-from pathlib import Path
-from circuit_sim import DC, Component, Netlist, Pwm, Spec, Step, expand, simulate
-
-ROOT = Path(%(root)r)
-
-
-def buck(fidelity, t_end):
-    d = json.loads((ROOT / "examples" / "buck_voltage_mode.json").read_text(encoding="utf-8"))
-    d["simulation"] = {"fidelity": fidelity, "t_end": t_end}
-    return expand(Spec.model_validate(d))
-
-
-def rectifier():
-    return Netlist(components=[
-        Component(id="V1", type="V", nodes=("in", "0"), waveform=DC(value=24.0)),
-        Component(id="S1", type="S", nodes=("in", "sw"), gate="q1"),
-        Component(id="D1", type="D", nodes=("0", "sw")),
-        Component(id="L1", type="L", nodes=("sw", "out"), value=47e-6),
-        Component(id="C1", type="C", nodes=("out", "0"), value=100e-6),
-        Component(id="R1", type="R", nodes=("out", "0"), value=100.0),
-    ])
-
-
-def ladder(n=20):
-    comps = [Component(id="V1", type="V", nodes=("n0", "0"), waveform=Step(final=1.0, t_step=1e-4))]
-    for j in range(n):
-        comps += [Component(id=f"R{j}", type="R", nodes=(f"n{j}", f"n{j + 1}"), value=10.0),
-                  Component(id=f"C{j}", type="C", nodes=(f"n{j + 1}", "0"), value=1e-6)]
-    return Netlist(components=comps)
-
-
-SW, AV = buck("switching", 10e-3), buck("average", 200e-3)
-CASES = {
-    "buck_switching": lambda **kw: SW.run(**kw),
-    "buck_average": lambda **kw: AV.run(**kw),
-    "rectifier": lambda **kw: simulate(rectifier(), 4e-3, gates=[Pwm(name="q1", frequency=100e3, duty=0.3)],
-                                       steps_per_period=1000, **kw),
-    "ladder": lambda **kw: simulate(ladder(), 0.2, 1e-6, **kw),
+CASES = ("buck_switching", "buck_average", "rectifier", "ladder")
+# 回路 → （cost と direct の計算の長さ、intervals の計算の長さ）[s]
+T_END = {
+    "buck_switching": (10e-3, 50e-3),     # 20 万ステップ、100 万ステップ
+    "buck_average": (200e-3, 2.0),        # 20 万、200 万
+    "rectifier": (4e-3, 0.1),             # 40 万（1周期 1000 分割）、200 万（1周期 200 分割）
+    "ladder": (0.2, 2.0),                 # 20 万、200 万
 }
 
 
-def best(case, repeat, **kw):
-    out = []
+def load_package(name: str, parent: Path):
+    """parent/circuit_sim を、別の名前のパッケージとして読み込む（前の版を同じプロセスに並べるため）。"""
+    spec = importlib.util.spec_from_file_location(
+        name, parent / "circuit_sim" / "__init__.py",
+        submodule_search_locations=[str(parent / "circuit_sim")])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_case(cs, case: str, long: bool):
+    """回路 case を計算する関数（cs は circuit_sim のパッケージ。版ごとに作る）。"""
+    t_end = T_END[case][1 if long else 0]
+    if case.startswith("buck_"):
+        d = json.loads((ROOT / "examples" / "buck_voltage_mode.json").read_text(encoding="utf-8"))
+        d["simulation"] = {"fidelity": case.removeprefix("buck_"), "t_end": t_end}
+        ex = cs.expand(cs.Spec.model_validate(d))
+        return lambda **kw: ex.run(**kw)
+    comp = cs.Component
+    if case == "rectifier":
+        net = cs.Netlist(components=[
+            comp(id="V1", type="V", nodes=("in", "0"), waveform=cs.DC(value=24.0)),
+            comp(id="S1", type="S", nodes=("in", "sw"), gate="q1"),
+            comp(id="D1", type="D", nodes=("0", "sw")),
+            comp(id="L1", type="L", nodes=("sw", "out"), value=47e-6),
+            comp(id="C1", type="C", nodes=("out", "0"), value=100e-6),
+            comp(id="R1", type="R", nodes=("out", "0"), value=100.0),
+        ])
+        gate = cs.Pwm(name="q1", frequency=100e3, duty=0.3)
+        divisions = 200 if long else 1000
+        return lambda **kw: cs.simulate(net, t_end, gates=[gate], steps_per_period=divisions, **kw)
+    comps = [comp(id="V1", type="V", nodes=("n0", "0"), waveform=cs.Step(final=1.0, t_step=1e-4))]
+    for j in range(20):
+        comps += [comp(id=f"R{j}", type="R", nodes=(f"n{j}", f"n{j + 1}"), value=10.0),
+                  comp(id=f"C{j}", type="C", nodes=(f"n{j + 1}", "0"), value=1e-6)]
+    net = cs.Netlist(components=comps)
+    return lambda **kw: cs.simulate(net, t_end, 1e-6, **kw)
+
+
+def current_package():
+    sys.path.insert(0, str(ROOT))
+    cs = importlib.import_module("circuit_sim")
+    return cs, importlib.import_module("circuit_sim.simulate")      # 名前 simulate は関数を指すので
+
+
+# ------------------------------------------------------------------ 別のプロセスで動かす中身
+
+
+def worker_cost(case: str, repeat: int, baseline: Path | None) -> dict:
+    cs, sim = current_package()
+    first, largest = sim.CHUNK_STEPS_FIRST, sim.CHUNK_STEPS_MAX
+    run_new = make_case(cs, case, long=False)
+    run_old = make_case(load_package("circuit_sim_before", baseline), case, long=False) if baseline else None
+    quiet = {"progress": lambda f: None, "cancel": lambda: False}
+
+    def one(mode: str) -> tuple[float, int]:
+        if mode == "baseline":
+            fn, kw = run_old, {}
+        else:
+            fn, kw = run_new, (quiet if mode == "chunked" else {})
+            sim.CHUNK_STEPS_FIRST, sim.CHUNK_STEPS_MAX = (first, largest) if mode == "chunked" else (
+                10**12, 10**12)
+        t0 = time.perf_counter()
+        res = fn(**kw)
+        return time.perf_counter() - t0, len(res.t) - 1
+
+    modes = ["chunked", "unchunked"] + (["baseline"] if baseline else [])
+    steps = 0
+    for mode in modes:                      # 1回目は読み込みと準備を含むので捨てる
+        _, steps = one(mode)
+    times: dict[str, list[float]] = {m: [] for m in modes}
+    for r in range(repeat):
+        shift = r % len(modes)
+        for mode in modes[shift:] + modes[:shift]:
+            times[mode].append(one(mode)[0])
+    return {"steps": steps, "times": times}
+
+
+def worker_direct(case: str, repeat: int) -> dict:
+    cs, sim = current_package()
+    spent = {"check": 0.0, "monitor": 0.0}
+
+    def timed(fn, key):
+        def wrapper(*args):
+            t0 = time.perf_counter()
+            try:
+                return fn(*args)
+            finally:
+                spent[key] += time.perf_counter() - t0
+        return wrapper
+
+    monitor = sim._Monitor
+    monitor.check_values = timed(monitor.check_values, "check")       # after() の中から呼ばれる分も入る
+    monitor.after, monitor.tick = timed(monitor.after, "monitor"), timed(monitor.tick, "monitor")
+    run = make_case(cs, case, long=False)
+    run()
+    rows = []
     for _ in range(repeat):
-        t0 = time.process_time()          # このプロセスの CPU 時間（ほかのプロセスの揺れを受けにくい）
-        res = CASES[case](**kw)
-        out.append(time.process_time() - t0)
-    return min(out), len(res.t) - 1
-'''
+        spent["check"] = spent["monitor"] = 0.0
+        t0 = time.perf_counter()
+        run()
+        rows.append((time.perf_counter() - t0, spent["check"], spent["monitor"]))
+    total, check, monitor_time = min(rows)
+    return {"total": total, "check": check, "monitor": monitor_time}
 
 
-WORKER = r"""
-import importlib, sys, time
-mode, case = sys.argv[1], sys.argv[2]
-ns = {}
-exec(sys.argv[3], ns)
-kw = {}
-if mode == "chunked":
-    kw = {"progress": lambda f: None, "cancel": lambda: False}
-elif mode == "unchunked":
-    sim = importlib.import_module("circuit_sim.simulate")
-    sim.CHUNK_STEPS_FIRST = sim.CHUNK_STEPS_MAX = 10**12
-ns["CASES"][case](**kw)                       # 1回目は読み込みと準備を含むので捨てる
-t, steps = ns["best"](case, int(sys.argv[4]), **kw)
-print(t, steps)
-"""
+def worker_intervals(case: str) -> dict:
+    cs, _ = current_package()
+    run = make_case(cs, case, long=True)
+    polls: list[float] = []
+    reports: list[float] = []
+
+    def cancel() -> bool:
+        polls.append(time.perf_counter())
+        return False
+
+    t0 = time.perf_counter()
+    res = run(progress=lambda f: reports.append(time.perf_counter()), cancel=cancel)
+    t1 = time.perf_counter()
+
+    def largest_gap(times: list[float]) -> float:
+        points = [t0] + times + [t1]
+        return max(b - a for a, b in zip(points, points[1:], strict=False))
+
+    return {"steps": len(res.t) - 1, "total": t1 - t0, "polls": len(polls), "cancel_gap": largest_gap(polls),
+            "reports": len(reports), "progress_gap": largest_gap(reports)}
 
 
-def measure(mode: str, case: str, code: str, path: Path, inner: int) -> tuple[float, int]:
-    done = subprocess.run([sys.executable, "-c", WORKER, mode, case, code, str(inner)], cwd=str(path),
-                          capture_output=True, text=True, check=True,
-                          env={"PYTHONPATH": str(path), "PATH": "/usr/bin:/bin"})
-    t, steps = done.stdout.split()
-    return float(t), int(steps)
+# ------------------------------------------------------------------ 表にする
+
+
+def in_new_process(*args: str) -> dict:
+    done = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker", *args],
+                          cwd=str(ROOT), capture_output=True, text=True, check=True)
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def compare(times: dict[str, list[float]], a: str, b: str) -> str:
+    """a / b − 1 を、最良どうしの比と、同じ回の対の比の中央値で。"""
+    best = min(times[a]) / min(times[b]) - 1
+    paired = statistics.median(x / y for x, y in zip(times[a], times[b], strict=True)) - 1
+    return f"{best:+6.1%} / {paired:+6.1%}"
+
+
+def show_cost(repeat: int, baseline: Path | None) -> None:
+    print("所要時間 [s]（最良）と差（最良どうしの比 / 同じ回の対の比の中央値）")
+    head = f"{'回路':16} {'ステップ':>8} {'区切る':>8} {'区切らない':>8} {'区切る ÷ 区切らない':>18}"
+    if baseline:
+        head += f" {'前の版':>8} {'区切る ÷ 前の版':>18} {'区切らない ÷ 前の版':>18}"
+    print(head)
+    for case in CASES:
+        got = in_new_process("cost", case, str(repeat), str(baseline or ""))
+        t = got["times"]
+        line = (f"{case:16} {got['steps']:8d} {min(t['chunked']):8.3f} {min(t['unchunked']):8.3f} "
+                f"{compare(t, 'chunked', 'unchunked'):>18}")
+        if baseline:
+            line += (f" {min(t['baseline']):8.3f} {compare(t, 'chunked', 'baseline'):>18} "
+                     f"{compare(t, 'unchunked', 'baseline'):>18}")
+        print(line, flush=True)
+
+
+def show_direct(repeat: int) -> None:
+    print("発散の確かめと区切りに使った時間（計算の時間に対する割合。区切り全体は、発散の確かめを含む）")
+    print(f"{'回路':16} {'所要時間':>8} {'発散の確かめ':>10} {'区切り全体':>10}")
+    for case in CASES:
+        got = in_new_process("direct", case, str(repeat))
+        print(f"{case:16} {got['total']:8.3f} {got['check'] / got['total']:10.2%} "
+              f"{got['monitor'] / got['total']:10.2%}", flush=True)
+
+
+def show_intervals() -> None:
+    print("中断の求めを見る間隔と、進み具合を知らせる間隔の最大 [ms]（基準はどちらも 200 ms 以内）")
+    print(f"{'回路':16} {'ステップ':>8} {'所要時間':>8} {'中断を見た回数':>10} {'間隔の最大':>10} "
+          f"{'知らせた回数':>10} {'間隔の最大':>10}")
+    for case in CASES:
+        got = in_new_process("intervals", case)
+        print(f"{case:16} {got['steps']:8d} {got['total']:8.2f} {got['polls']:10d} "
+              f"{got['cancel_gap'] * 1e3:10.1f} {got['reports']:10d} {got['progress_gap'] * 1e3:10.1f}",
+              flush=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repeat", type=int, default=7)
-    parser.add_argument("--inner", type=int, default=3, help="1つのプロセスの中でくり返す回数（最良を取る）")
-    parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--repeat", type=int, default=15, help="形を交互にくり返す回数")
+    parser.add_argument("--baseline", type=Path, help="E1g の前の circuit_sim の親フォルダ")
+    parser.add_argument("--sections", default="cost,direct,intervals")
+    parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    code = CASES_CODE % {"root": str(ROOT)}
-    cases = ("buck_switching", "buck_average", "rectifier", "ladder")
-    modes = [("chunked", ROOT), ("unchunked", ROOT)]
-    if args.baseline:
-        modes.append(("baseline", args.baseline))
-    times: dict = {(c, m): [] for c in cases for m, _ in modes}
-    steps: dict = {}
-    # 形を交互に測り（機械の揺れが片方にだけ乗らないように）、最良を取る
-    for _ in range(args.repeat):
-        for case in cases:
-            for mode, path in modes:
-                t, steps[case] = measure(mode, case, code, path, args.inner)
-                times[case, mode].append(t)
-    # 値は、プロセスごとの最良の中央値（最良どうしの比は揺れに弱いので、中央値で比べる）
-    print(f"{'回路':16} {'ステップ':>9} {'区切る':>9} {'区切らない':>10} {'差':>7} {'前の版':>9} {'差':>7}")
-    for case in cases:
-        a, b = statistics.median(times[case, "chunked"]), statistics.median(times[case, "unchunked"])
-        line = f"{case:16} {steps[case]:9d} {a:9.3f} {b:10.3f} {a / b - 1:+7.1%}"
-        if args.baseline:
-            c = statistics.median(times[case, "baseline"])
-            line += f" {c:9.3f} {a / c - 1:+7.1%}"
-        print(line)
+    if args.worker:
+        kind, case, *rest = args.worker
+        if kind == "cost":
+            got = worker_cost(case, int(rest[0]), Path(rest[1]).resolve() if rest[1] else None)
+        elif kind == "direct":
+            got = worker_direct(case, int(rest[0]))
+        else:
+            got = worker_intervals(case)
+        print(json.dumps(got))
+        return 0
+    sections = args.sections.split(",")
+    if "cost" in sections:
+        show_cost(args.repeat, args.baseline.resolve() if args.baseline else None)
+        print()
+    if "direct" in sections:
+        show_direct(min(args.repeat, 5))
+        print()
+    if "intervals" in sections:
+        show_intervals()
     return 0
 
 

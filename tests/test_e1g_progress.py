@@ -24,6 +24,7 @@ from circuit_sim import (
     Netlist,
     Pwm,
     SimulationCancelled,
+    Sine,
     Spec,
     Step,
     expand,
@@ -84,7 +85,7 @@ def check_progress(seen, span):
 
 @pytest.mark.parametrize("case", ["buck_switching", "rectifier", "ladder"])
 def test_progress_rises_to_one_and_never_stalls_longer_than_0_2_s(case):
-    """20 万ステップ以上: 降圧（制御器つき、40 万ステップ）、整流（制御器なし、40 万ステップ）、
+    """20 万ステップ以上: 降圧（制御器つき、20 万ステップ）、整流（制御器なし、40 万ステップ）、
     はしご（スイッチなし、未知数 41、20 万ステップ）。"""
     if case == "buck_switching":
         ex = buck()
@@ -208,3 +209,41 @@ def test_chunked_and_unchunked_results_are_bit_identical(case, unchunked, monkey
     chunks.clear()
     whole = CASES[case]()
     same(chunked, whole)
+
+
+def sine_rc() -> Netlist:
+    """正弦波の電源（区切って作る配列に、値が格子点ごとに違う波形が入る）と、途中でステップする電源。"""
+    return Netlist(components=[
+        Component(id="V1", type="V", nodes=("a", "0"),
+                  waveform=Sine(amplitude=1.7, frequency=1e3, offset=0.3, phase_deg=17.0)),
+        Component(id="R1", type="R", nodes=("a", "b"), value=1e3),
+        Component(id="C1", type="C", nodes=("b", "0"), value=1e-7),
+        Component(id="V2", type="V", nodes=("c", "0"), waveform=Step(final=2.0, t_step=3.3e-3)),
+        Component(id="R2", type="R", nodes=("c", "b"), value=2e3),
+    ])
+
+
+BLOCK_CASES = {
+    **CASES,
+    "sine_and_step": lambda **kw: simulate(sine_rc(), 2e-2, 1e-6, **kw),
+}
+
+
+@pytest.mark.parametrize("case", list(BLOCK_CASES))
+def test_setup_and_post_processing_in_blocks_give_the_same_result(case, monkeypatch):
+    """準備（電源・ゲート信号の配列）と後処理（注意、信号の配列）を区切って行っても、まとめて行ったときと
+    結果（波形、信号、集計、注意）がビット単位で同じ。区切りの行数を小さく半端にして、何度も区切らせる。"""
+    ticks = []
+    original = simulate_module._Monitor.tick
+
+    def count(self):
+        ticks.append(self.phase)
+        return original(self)
+
+    monkeypatch.setattr(simulate_module._Monitor, "tick", count)
+    monkeypatch.setattr(simulate_module, "SETUP_BLOCK", 509)
+    blocked = BLOCK_CASES[case]()
+    assert ticks.count("setup") > 10 and ticks.count("post") > 10
+    monkeypatch.setattr(simulate_module, "SETUP_BLOCK", 10**12)
+    whole = BLOCK_CASES[case]()
+    same(blocked, whole)

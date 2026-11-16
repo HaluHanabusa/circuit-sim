@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import pickle
 import re
@@ -46,7 +47,9 @@ from circuit_sim.messages import (
     Value,
     message_of,
 )
+from circuit_sim.templates import TEMPLATE_DISPLAY
 
+simulate_module = importlib.import_module("circuit_sim.simulate")   # 名前 simulate は関数を指すので
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "circuit_sim"
 EXAMPLES = ROOT / "examples"
@@ -157,6 +160,35 @@ def test_no_raise_or_note_with_plain_text_in_engine_and_templates():
     # 確かめそのものが働くこと（番号つきにする前の形）
     old = ast.parse('raise ValueError(f"t_end が h より短い {x}")\nnotes.append("文")')
     assert _has_text(old.body[0].exc.args[0]) and _has_text(old.body[1].value.args[0])
+
+
+CODED = {"Message", "CodedError", "CircuitError", "UnitError", "DivergenceError", "CodedTypeError",
+         "CodedKeyError", "SimulationCancelled", "MissingValueError", "StepLimitError"}
+# 番号つきのエラーを組み立てて返す関数（raise 関数(...) の形で使う）
+CODED_BUILDERS = {"_explain_unsolvable", "units_error"}
+
+
+def test_every_raise_in_engine_and_templates_is_a_coded_error():
+    """raise するのは、番号つきのエラーの型（か、それを組み立てる関数の戻り値、作っておいた変数）だけ。
+
+    raise KeyError(名前) のように、文字列の定数を渡さない形の番号の無いエラーも見つける（上の試験は、
+    文字列をそのまま渡す形だけを見る）。
+    """
+    bad = []
+    for path in CHECKED:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise) or node.exc is None or isinstance(node.exc, ast.Name):
+                continue
+            call, name = node.exc, ""
+            if isinstance(call, ast.Call):
+                name = getattr(call.func, "id", getattr(call.func, "attr", ""))
+            if name not in CODED | CODED_BUILDERS:
+                bad.append(f"{path.relative_to(ROOT)}:{node.lineno} {name}")
+    assert bad == []
+    # 確かめそのものが働くこと（E1g の途中まで残っていた形）
+    old = ast.parse("raise KeyError(comp_id)").body[0]
+    assert old.exc.func.id not in CODED | CODED_BUILDERS
 
 
 # ------------------------------------------------------------------ 番号の無い文が無いこと（実際に計算して）
@@ -273,6 +305,13 @@ ERROR_CASES = {
         Component(id="R1", type="R", nodes=("a", "a"), value=1.0)]),
     "版0.1の数でない値": lambda: Spec.model_validate({"schema_version": "0.1", "template": "rc_lowpass",
                                                       "plant": {}, "control": {"Kp": "x"}}),
+    "スイッチとダイオードが多すぎる": lambda: simulate(Netlist(components=[
+        Component(id="V1", type="V", nodes=("n0", "0"), waveform=DC(value=1))] + [
+        Component(id=f"D{j}", type="D", nodes=(f"n{j}", f"n{j + 1}" if j < 62 else "0"))
+        for j in range(63)]), 1e-3, 1e-5),
+    "結果に無い信号": lambda: rlc((1, "ohm"), (1, "mH"), (10, "uF")).run()["v(nothing)"],
+    "回路に無い素子": lambda: rlc((1, "ohm"), (1, "mH"), (10, "uF")).run().i("X9"),
+    "表示定義に無い値": lambda: TEMPLATE_DISPLAY["buck_voltage_mode"].value("nothing"),
 }
 
 
@@ -378,6 +417,115 @@ def test_screen_notices_exist_in_appendix_b():
     for code, notices in SCREEN_NOTICES.items():
         assert code in MESSAGES
         assert set(notices) <= known, code
+
+
+# 付録B のお知らせのうち、差し込む値をエンジンの params からそのまま取るもの（実行の結果と、計算の前の判定）。
+# ほかのお知らせ（N-MISSING、N-INVALID、N-UNIT-*、N-UNUSED、N-OPEN-*）は、画面が項目ごとに組み立てる
+ENGINE_FILLED = {"N-RUN-CIRCUIT", "N-RUN-SWITCH", "N-RUN-DIVERGED", "N-RUN-STEPS", "N-RUN-MEMORY",
+                 "N-RUN-NOTE-STEP", "N-RUN-NOTE-ROUND", "N-STEPS-LIMIT", "N-STEP-COARSE", "N-REF-RANGE",
+                 "N-STEP-AFTER-END", "N-STEP-SNAP"}
+SCREEN_SIDE = {"n"}                    # 実行の番号は画面が持つ
+# 付録B.2 の下の決まり: エンジンが時定数や目安の刻みを返さないとき、画面はその部分を省いた文にする
+OPTIONAL = {"N-RUN-NOTE-STEP": {"tau", "h_suggest"}, "N-STEP-COARSE": {"tau", "h_suggest"}}
+
+
+def appendix_b_placeholders() -> dict[str, set[str]]:
+    """お知らせの番号 → 文面（何が起きたか、どう直すか）の差し込む値の名前。"""
+    text = SCREENS.read_text(encoding="utf-8").split("## 付録B お知らせの一覧")[1].split("## 付録C")[0]
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^\| (N-[A-Z-]+) \|", line)
+        if m:
+            out[m.group(1)] = set(re.findall(r"\{([a-z_]+)\}", line))
+    return out
+
+
+class _Diverging:
+    """指令で値が決まる電源 → R → C につなぐ制御器（発散の3つの番号を出すため）。"""
+
+    period, inputs, outputs = 1e-4, ("v(out)",), ("u",)
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def reset(self):
+        return [1.0]
+
+    def step(self, t, measured):
+        return [self.fn(float(measured[0]))]
+
+
+def _commanded_rc(gain=1.0):
+    return Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=Command(command="u", gain=gain)),
+        Component(id="R1", type="R", nodes=("in", "out"), value=1e3),
+        Component(id="C1", type="C", nodes=("out", "0"), value=1e-6)])
+
+
+def _freewheel(ic=0.0):
+    return Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=DC(value=10)),
+        Component(id="S1", type="S", nodes=("in", "sw"), gate="q"),
+        Component(id="D1", type="D", nodes=("0", "sw")),
+        Component(id="L1", type="L", nodes=("sw", "out"), value=1e-3, ic=ic),
+        Component(id="R1", type="R", nodes=("out", "0"), value=1.0)])
+
+
+_GATE = Pwm(name="q", frequency=1e4, duty=0.5, carrier="triangle")
+RUN_ERROR_CASES = {
+    "回路の変数の発散": lambda: simulate(_commanded_rc(), 1.0, 1e-5,
+                                         controllers=[_Diverging(lambda v: 1.0 + 3.0 * v)]),
+    "有限でない値": lambda: simulate(_commanded_rc(1e200), 1e-2, 1e-5,
+                                     controllers=[_Diverging(lambda v: 1e200)]),
+    "有限でない指令": lambda: simulate(_commanded_rc(), 1e-2, 1e-5,
+                                       controllers=[_Diverging(lambda v: float("nan"))]),
+    # ダイオードの状態の反転を 0 回までにすると（下の試験が _flip_limit を差し替える）、最初の転流で
+    # 確定しない。三角波キャリアは t = 0 でスイッチがオフなので、インダクタに初期電流があると
+    # t = 0 で転流が要る
+    "ダイオードが確定しない": lambda: simulate(_freewheel(), 2e-4, gates=[_GATE]),
+    "ダイオードが t=0 で確定しない": lambda: simulate(_freewheel(ic=1.0), 2e-4, gates=[_GATE]),
+}
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+def test_engine_params_have_the_placeholders_of_the_screen_notices(monkeypatch):
+    """画面は、対応するお知らせの文面の {…} を、エンジンの params の同じ名前の値で埋める（基本設計書 10.4）。
+
+    実際に出した注意とエラーの params に、お知らせの差し込む値の名前がそろっていることを確かめる。"""
+    seen: dict[str, list[set[str]]] = {}
+    for case in list(NOTE_CASES) + list(SIM_CASES):
+        made = NOTE_CASES[case]() if case in NOTE_CASES else SIM_CASES[case]()
+        for n in collect_notes(made):
+            seen.setdefault(n.code, []).append(set(n.params))
+    notes: list = []                                   # 素子を挙げられないときの形（同じ所で作る）
+    simulate_module._resolution_notes(np.array([-1e9 + 0j]), 1e-3, notes, n_steps=10**6, limit=10)
+    seen.setdefault(notes[0].code, []).append(set(notes[0].params))
+    monkeypatch.setattr(simulate_module, "_flip_limit", lambda n_diodes: 0)
+    for case in list(ERROR_CASES) + list(RUN_ERROR_CASES):
+        with pytest.raises(Exception) as info:
+            (ERROR_CASES.get(case) or RUN_ERROR_CASES[case])()
+        if isinstance(info.value, Coded):
+            seen.setdefault(info.value.code, []).append(set(info.value.params))
+    for code in ("RUN_DIVERGED", "RUN_DIVERGED_NOT_FINITE", "CONTROLLER_COMMAND_NOT_FINITE",
+                 "DIODES_NOT_SETTLED", "DIODES_NOT_SETTLED_AT_START", "STEP_COARSE_OVER_LIMIT_NO_IDS",
+                 "TOO_MANY_DEVICES"):
+        assert code in seen, code                      # 上の例が、ねらった番号を実際に出している
+
+    placeholders = appendix_b_placeholders()
+    assert placeholders["N-RUN-DIVERGED"] == {"n", "t", "signal"}       # 表を読めていること
+    checked = 0
+    for code, notices in SCREEN_NOTICES.items():
+        for notice in set(notices) & ENGINE_FILLED:
+            need = placeholders[notice] - SCREEN_SIDE - OPTIONAL.get(notice, set())
+            if not need:
+                continue
+            assert code in seen, f"{code} を出す例が無い（{notice} の {need} を確かめられない）"
+            for params in seen[code]:
+                assert need <= params, (code, notice, need - params)
+                checked += 1
+    assert checked >= 15
+    for code in ("STEP_COARSE", "STEP_COARSE_OVER_LIMIT", "STEP_COARSE_UNDAMPED"):
+        assert all({"h", "tau", "h_suggest"} <= params for params in seen[code])
 
 
 def test_basic_design_table_matches_the_code_table():

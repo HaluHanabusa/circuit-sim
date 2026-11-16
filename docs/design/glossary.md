@@ -219,7 +219,17 @@ PO の問い（2026-11-16）「電気、電子の専門用語はきちんと押�
 
 **片付いた（E1g、2026-11-16）。** 下の 10 行を、注意とエラーの辞書（`circuit_sim/messages.py` の日本語）と、初期ゲインの設計の文（`tuning/initial.py`）で直した。ほかに、D-063 の言い換え（「回路状態」→「スイッチング状態（回路状態）」、「モデルの精度」→「モデルの種類」、「搬送波」→「キャリア」）を、解けない回路のエラー（`CIRCUIT_EXPLAINED_IN_STATE`）とコードの説明にも入れた。英語の文面は 11章と各表の英語の列にそろえた（time step、stop time、load step、integer multiple、freewheeling path、aliasing、switching state、gain crossover frequency）。試験 `tests/test_e1g_messages.py` が、辞書の日本語に直す前の言葉が残っていないことを確かめる。
 
-直す前の文面を見ている受け入れ試験は、E1g の実装では直さず（落ちたまま）、E1g の検証担当が直す（D-063 の7）。E1g の実装の時点で落ちたのは `test_e1a_units_limits.py`（「計算時間」）、`test_e1b_extreme_inputs.py` と `test_e1b_near_unit_circle.py`（「閉ループの極の半径」）、`test_e1c_followups.py` と `test_e1c_recheck.py`（「行き場」。xfail(strict) の2つは、文が見つからなくなって XPASS）。
+直す前の文面を見ている受け入れ試験は、E1g の実装では直さず（落ちたまま）、E1g の検証担当が直す（D-063 の7）。E1g の実装の時点で、用語の是正で落ちるのは次の 11 件（直す前の言葉を新しい言葉に置き換えた写しでは、どれも元の結果に戻ることを確かめた）。
+
+| 受け入れ試験 | 見ている言葉 → 直した言葉 |
+|---|---|
+| `test_e1a_units_limits.py::test_c14_slowly_decaying_oscillation_shortens_the_default_time_and_says_so` | 「計算時間」→「終了時刻」 |
+| `test_e1b_extreme_inputs.py::test_huge_load_agrees_with_150_digit_reference`（6 件） | 「閉ループの極の半径」→「閉ループ極の絶対値の最大」 |
+| `test_e1b_near_unit_circle.py::test_radius_shown_as_below_one_when_it_says_below_one` | 「極の半径」→「閉ループ極の絶対値の最大」 |
+| `test_e1c_followups.py::test_x_interruption_example_of_the_review_is_noted` | 遮断の注意を探す言葉「行き場」→「還流経路」（`interruption_notes`） |
+| `test_e1c_followups.py::test_x_normal_turn_off_in_current_driven_circuit_is_not_an_interruption`、`test_e1c_recheck.py::test_leakage_through_low_off_resistance_is_not_an_interruption` | 同じ「行き場」。xfail(strict) の試験で、注意を探せなくなって XPASS になる。言葉を直すと、もとの xfail に戻る（製品の軽微な不具合は残っている。xfail の印は外さない） |
+
+用語の是正とは別に、E1g の仕様が決めた変更（コマンドラインの CSV の注意の行、D-048 の記録の決まり）で期待値が古くなった受け入れ試験が 2 件ある（`basic-design.md` 15.3）。
 
 | # | 場所 | 直す前の文 | 直した文 | E1g で直した番号（`circuit_sim/messages.py`） |
 |---|---|---|---|---|

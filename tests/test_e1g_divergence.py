@@ -142,14 +142,63 @@ def test_stable_gain_runs_to_the_end():
 
 class Exploding(PositiveFeedback):
     def step(self, t, measured):
-        return [1e300 if t < 5e-4 else 1e300 * 1e300]       # 2回目で inf
+        return [1e300 if t < 5e-4 else 1e300 * 1e300]       # t = 0.5 ms の演算から inf
 
 
-def test_infinite_measurement_is_reported_as_divergence_not_as_a_controller_error():
-    netlist = rc_with_command()
+def test_circuit_divergence_is_reported_before_the_controller_command():
+    """指令 1e300（有限）が t = 0.1 ms から電源に入り、回路の変数が発散とみなす大きさを超える。そのあと
+    t = 0.5 ms の演算で指令が inf になるが、知らせるのは先に起きた回路の変数の発散（時刻と変数つき）。
+    区切りの位置（確かめの時刻）によらず、同じ時刻と変数になる。"""
+    results = []
+    for first_chunk in (7, 512, 10**12):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(simulate_module, "CHUNK_STEPS_FIRST", first_chunk)
+            with pytest.raises(DivergenceError) as info:
+                simulate(rc_with_command(), 1e-2, 1e-5, controllers=[Exploding(0.0)])
+        err = info.value
+        results.append((err.code, err.params["signal"], err.params["k"]))
+    # 指令は 0.1 ms（k = 10）から使われる。その点の記録は変わる前の値（D-048）なので、最初に超えるのは k = 11
+    assert results == [("RUN_DIVERGED", "v(in)", 11)] * 3
+    assert err.params["t"].value == pytest.approx(11e-5) and err.params["value"].value == pytest.approx(1e300)
+
+
+class NotANumber(PositiveFeedback):
+    def step(self, t, measured):
+        return [float("nan")]
+
+
+def test_command_that_is_not_finite_is_reported_with_time_and_signal():
+    """回路の変数は有限のまま、制御器の指令だけが有限でない: 番号 CONTROLLER_COMMAND_NOT_FINITE。
+    差し込む値に、時刻と、有限でない指令の名前（結果の名前の形 cmd(名前)）が入る。"""
     with pytest.raises(DivergenceError) as info:
-        simulate(netlist, 1e-2, 1e-5, controllers=[Exploding(0.0)])
-    assert info.value.code in ("RUN_DIVERGED", "CONTROLLER_COMMAND_NOT_FINITE")
+        simulate(rc_with_command(), 1e-2, 1e-5, controllers=[NotANumber(0.0)])
+    err = info.value
+    assert err.code == "CONTROLLER_COMMAND_NOT_FINITE"
+    assert err.params["t"].value == 0.0 and err.params["signal"] == "cmd(u)"
+    assert "['u']" in str(err) and "nan" in str(err) and "not finite" in err.text("en")
+
+
+class Huge(PositiveFeedback):
+    def step(self, t, measured):
+        return [1e200]
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+def test_value_that_is_not_finite_is_reported_with_time_and_signal():
+    """指令も電源の gain も有限だが、積（1e200 × 1e200）が倍精度をあふれて、電源の値が inf になる:
+    番号 RUN_DIVERGED_NOT_FINITE。時刻は、その値が最初に記録された格子点（k = 11）。"""
+    netlist = Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=Command(command="u", gain=1e200)),
+        Component(id="R1", type="R", nodes=("in", "out"), value=1e3),
+        Component(id="C1", type="C", nodes=("out", "0"), value=1e-6),
+    ])
+    with pytest.raises(DivergenceError) as info:
+        simulate(netlist, 1e-2, 1e-5, controllers=[Huge(0.0)])
+    err = info.value
+    assert err.code == "RUN_DIVERGED_NOT_FINITE"
+    assert err.params["k"] == 11 and err.params["t"].value == pytest.approx(11e-5)
+    assert err.params["signal"] in ("v(in)", "v(out)", "i(V1)")
+    assert "有限でなくなった" in str(err) and "stopped being finite" in err.text("en")
 
 
 def test_template_buck_with_unstable_gains_is_a_bounded_limit_cycle_and_is_not_stopped():

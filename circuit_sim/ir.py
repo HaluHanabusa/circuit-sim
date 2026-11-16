@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from .messages import CodedError, Names, Value
+from .messages import CodedError, CodedKeyError, Names, Value
 
 SCHEMA_VERSION = "0.2"
 SUPPORTED_SCHEMA_VERSIONS = ("0.1", "0.2")
@@ -309,4 +309,4 @@ class Netlist(BaseModel):
         for c in self.components:
             if c.id == comp_id:
                 return c
-        raise KeyError(comp_id)
+        raise CodedKeyError("NETLIST_NO_COMPONENT", id=comp_id, ids=Names(c.id for c in self.components))

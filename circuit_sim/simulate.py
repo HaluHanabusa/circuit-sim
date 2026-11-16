@@ -169,6 +169,7 @@ class Result:
         units : 見出しに単位を角かっこで付ける（"t [s],v(out) [V],cmd(duty) [1]"。画面と同じ形。D-042）
         notes : 注意を、データの後ろに1つ1行で足す（"# [番号] 注意: 文"。表計算ソフトや numpy.loadtxt では
                 # で始まる行を飛ばせる）
+        行の終わりは、どの行も csv モジュールの既定（CR LF。E0 から同じ）。
         """
         names = names or self.unknowns
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -182,7 +183,7 @@ class Result:
                 w.writerow([repr(float(self.t[k]))] + [repr(float(c[k])) for c in cols])
             if notes:
                 for note in self.notes:
-                    f.write(render_note_line(note, "CSV_NOTE") + "\n")
+                    f.write(render_note_line(note, "CSV_NOTE") + w.dialect.lineterminator)
 
     def unit_of(self, name: str) -> str:
         """信号の単位の記号（無次元は ""）。"""
@@ -1203,12 +1204,13 @@ def _simulate_switched(
     monitor = _Monitor(n_steps, h, progress, cancel)
     u_start, u_end, source_event, u_last = _sample_sources(system, n_steps, h, notes, monitor.tick)
     u_mid = np.empty_like(u_start)
-    # 不連続点の印（核に渡す）: 時刻で決まる電源のステップは EVENT_SOURCE（変わった後の値を記録）、
-    # 指令で決まる電源の変わり目だけなら EVENT_COMMAND（変わる直前の値を記録。D-048）
-    event = np.zeros(n_steps, dtype=np.int8)
+    # 不連続点の印（核に渡す）: event は電源が不連続に変わる点（時刻で決まる電源のステップと、指令で決まる
+    # 電源の変わり目）。そのうち source_event（時刻で決まる電源のステップ）の点には変わった後の値を記録し、
+    # 指令で決まる電源だけが変わる点には、変わる直前の値を記録する（D-048）
+    event = np.empty(n_steps, dtype=bool)
     for b0, b1 in _blocks(n_steps, monitor.tick):
         u_mid[b0:b1] = 0.5 * (u_start[b0:b1] + u_end[b0:b1])
-        event[b0:b1] = np.where(source_event[b0:b1], kernel.EVENT_SOURCE, kernel.EVENT_NONE)
+        event[b0:b1] = source_event[b0:b1]
     command_event = np.zeros(n_steps + 1, dtype=bool)    # 指令で決まる電源の値が変わった点
 
     # --- 制御器と指令 ---------------------------------------------------------
@@ -1260,8 +1262,10 @@ def _simulate_switched(
             if monitor.out is not None:
                 # 回路の変数が先に発散していれば、そちらを知らせる（測った値が有限でないと、指令もそうなる）
                 monitor.check_values(int(ctl[kernel.CTL_K]))
-            raise DivergenceError("CONTROLLER_COMMAND_NOT_FINITE", t=Value(t, "s"), outputs=Names(c.outputs),
-                                  values=str(y))
+            # signal は、有限でない最初の指令（結果の名前の形。画面の N-RUN-DIVERGED の {signal} に使う）
+            first_bad = c.outputs[int(np.argmax(~np.isfinite(y)))]
+            raise DivergenceError("CONTROLLER_COMMAND_NOT_FINITE", t=Value(t, "s"),
+                                  signal=f"cmd({first_bad})", outputs=Names(c.outputs), values=str(y))
         return y
 
     active = np.zeros(len(cmd_names))      # いま使っている指令
@@ -1310,12 +1314,11 @@ def _simulate_switched(
                 code |= on.astype(np.int64) << j
             sw_code[b0:b1] = code
         # 指令で決まる電源は、区間のあいだ一定。前の区間と値が変わったら、その点を電源の不連続点にする
-        # （時刻で決まる電源のステップと重ならなければ、変わる直前の値を記録する印）
+        # （時刻で決まる電源のステップと重ならなければ、その点の記録は変わる直前の値のまま）
         for j, c, w in commanded:
             value = w.value(float(active[c]))
             if k0 > 0 and value != u_end[k0 - 1, j]:
-                if event[k0] == kernel.EVENT_NONE:
-                    event[k0] = kernel.EVENT_COMMAND
+                event[k0] = True
                 command_event[k0] = True
             u_start[k0:k1, j] = value
             u_end[k0:k1, j] = value
@@ -1341,21 +1344,26 @@ def _simulate_switched(
     monitor.attach(out, system.unknowns, *_divergence_limits(system, t_end))
 
     # --- 制御周期ごとに区切って核を呼ぶ（その中も、確かめの区切りで区切る） ----------------
+    # k_done は計算の済んだ最後の格子点（核の ctl[CTL_K] と同じ値。制御周期ごとに ctl から読み直す手間を
+    # 省くため、こちらで数える）。next_check は次の確かめの点（monitor.after() の後にだけ変わる）
+    k_done, next_check = 0, monitor.next_check
     while True:
-        while int(ctl[kernel.CTL_K]) < k1:
+        while k_done < k1:
+            k_stop = k1 if k1 < next_check else next_check
             status = kernel.run_switched(
                 table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
                 table.Rx, table.Ru, table.code, table.count,
                 d_pos, d_neg, n_sw,
-                u_start, u_mid, u_end, event, sw_code,
-                x, ctl, min(k1, monitor.next_check),
+                u_start, u_mid, u_end, event, source_event, sw_code,
+                x, ctl, k_stop,
                 damping_steps, SIMULTANEOUS_FLIPS, max_flips, DIODE_ON_VOLTAGE,
                 out, code_out,
             )
             if status == kernel.DONE:
-                k = int(ctl[kernel.CTL_K])
-                if k >= monitor.next_check:
-                    monitor.after(k)
+                k_done = k_stop            # 核は k_stop まで進んで戻る（k_done < k_stop なので）
+                if k_done >= next_check:
+                    monitor.after(k_done)
+                    next_check = monitor.next_check
                 continue
             code = int(ctl[kernel.CTL_CODE])
             if status == kernel.NEED_STATE:

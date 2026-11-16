@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ..ir import Quantity, Spec
-from ..messages import CodedError, Message, Names, Value
+from ..messages import CodedError, CodedKeyError, Message, Names, Value
 from ..signals import SignalInfo, SignalKind
 from ..units import DIMENSION_LABEL, UnitError, parse_unit, to_si
 
@@ -107,7 +107,8 @@ class Display:
         for v in self.values:
             if v.key == key:
                 return v
-        raise KeyError(key)
+        raise CodedKeyError("DISPLAY_NO_VALUE", template=self.template, key=key,
+                            keys=Names(v.key for v in self.values))
 
 
 __all__ = ["Display", "FixedValue", "Item", "MissingValueError", "SignalInfo", "SignalKind", "read_items"]

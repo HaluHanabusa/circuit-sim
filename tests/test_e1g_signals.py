@@ -165,6 +165,8 @@ def test_template_note_appears_in_notes_cli_and_csv_with_its_code(tmp_path, caps
     assert all(not line.startswith("#") for line in lines[: len(res.t) + 1])     # 注意はデータの後ろ
     data = np.loadtxt(csv_path, delimiter=",", skiprows=1)            # # の行は読み飛ばせる
     assert data.shape == (len(res.t), 3) and np.array_equal(data[:, 1], res["v(out)"])
+    raw = csv_path.read_bytes()                                       # 行の終わりは、注意の行も同じ（CR LF）
+    assert raw.endswith(b"\r\n") and raw.count(b"\n") == raw.count(b"\r\n") == len(lines)
 
 
 def test_csv_header_units_for_dimensionless_and_time(tmp_path):

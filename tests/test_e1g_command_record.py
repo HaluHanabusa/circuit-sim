@@ -80,6 +80,46 @@ def test_source_current_at_the_change_is_the_value_just_before():
     assert res.stats["command_changes"] == len(CHANGES)
 
 
+class Watching:
+    """決めた指令を出しながら、電源の電流と電圧（代数的な変数）を測る制御器。"""
+
+    period = TC
+    inputs = ("i(V1)", "v(in)")
+    outputs = ("u",)
+
+    def __init__(self):
+        self.schedule = Schedule(U0, CHANGES)
+        self.seen = []
+
+    def reset(self):
+        self.seen = []
+        return [self.schedule.at(0.0)]
+
+    def step(self, t, measured):
+        self.seen.append((t, measured.copy()))
+        # 次の制御周期の先頭から使われる値（時刻 k·h の丸めを吸収する余裕つき）
+        return [self.schedule.at(t + self.period, 1e-6 * self.period)]
+
+
+def test_controller_measures_the_recorded_value_just_before_the_change():
+    """制御器が測る値は、記録される値と同じ（control/interface.py: その時刻の切り替えの直前の値）。
+    指令が変わる時刻に測った電源の電流と電圧は、変わる前の指令での値。"""
+    ctrl = Watching()
+    res = simulate(netlist(), T_END, TC / 20, controllers=[ctrl])
+    v, u_now, u_before = exact(res.t)
+    assert res.stats["command_changes"] == len(CHANGES)
+    for t, measured in ctrl.seen:
+        k = int(round(t / res.h))
+        assert measured[0] == res["i(V1)"][k] and measured[1] == res["v(in)"][k]        # 記録と同じ値
+    for tc, _ in CHANGES:
+        k = int(round(tc / res.h))
+        assert res["cmd(u)"][k - 1] == u_before[k] and res["cmd(u)"][k] == u_now[k]     # ちょうど tc で変わる
+        measured = next(m for t, m in ctrl.seen if abs(t - tc) < 1e-12)
+        assert measured[1] == pytest.approx(u_before[k], abs=1e-12)
+        assert measured[0] == pytest.approx(-(u_before[k] - v[k]) / R, rel=1e-4)
+        assert abs(u_now[k] - u_before[k]) >= 2.0                    # 変わった後の値とは 2 V 以上違う
+
+
 def test_second_order_is_kept_when_halving_the_step():
     """刻みを半分にしていくと、v(out) と i(V1) の誤差が約 1/4 になる（比 3.5 以上）。
 

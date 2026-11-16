@@ -234,12 +234,6 @@ CTL_CHANGES = 4    # 集計: 不連続点として扱ったステップの数
 CTL_RETRIES = 5    # 集計: 捨てた試行の数
 CTL_SIZE = 6
 
-# run_switched() の event の値
-EVENT_NONE = 0
-EVENT_SOURCE = 1    # 時刻で決まる電源のステップ。その格子点には変わった後の値を記録する（D-019）
-EVENT_COMMAND = 2   # 指令で値が決まる電源の変わり目だけ。その格子点には変わる直前の値を記録する
-#                     （スイッチの切り替え点と同じ。D-048）。どちらも、その直後を減衰ステップにする
-
 
 def run_switched(
     P: np.ndarray,
@@ -260,6 +254,7 @@ def run_switched(
     u_mid: np.ndarray,
     u_end: np.ndarray,
     event: np.ndarray,
+    record_after: np.ndarray,
     sw_code: np.ndarray,
     x: np.ndarray,
     ctl: np.ndarray,
@@ -300,7 +295,11 @@ def run_switched(
       slot_code[:n_slots] : 各スロットの回路状態の符号
     入力（時間格子上の配列）
       u_start[k], u_end[k] : 区間 [t[k], t[k+1]] の両端の電源値。u_mid[k] はその平均
-      event[k]   : t[k] で電源が不連続に変わるなら EVENT_SOURCE か EVENT_COMMAND（変わらないなら EVENT_NONE）
+      event[k]   : t[k] で電源が不連続に変わるなら True（時刻で決まる電源のステップと、指令で値が決まる
+                   電源の変わり目）。その直後を減衰ステップにする
+      record_after[k] : t[k] の記録を、電源が変わった後の値にするなら True（時刻で決まる電源のステップ。
+                   D-019）。False なら変わる前の値のまま（指令で値が決まる電源だけが変わる点。スイッチの
+                   切り替え点と同じ。D-048）。event[k] が True の点でだけ見る
       sw_code[k] : 区間 [t[k], t[k+1]) のスイッチのビット
       d_pos, d_neg : ダイオードのアノード・カソードの未知数の番号（基準節点は -1）
     進行状態（書き換える）
@@ -308,8 +307,8 @@ def run_switched(
       ctl : 上の CTL_* の並び
     記録
       out[k]      : t[k] の値。スイッチやダイオードが t[k] で切り替わる場合は切り替わる前の値、
-                    時刻で決まる電源が t[k] でステップする場合は変わった後の値（EVENT_SOURCE）、
-                    指令で値が決まる電源だけが変わる場合は変わる前の値（EVENT_COMMAND）
+                    時刻で決まる電源が t[k] でステップする場合は変わった後の値（record_after[k]）、
+                    指令で値が決まる電源だけが変わる場合は変わる前の値
       code_out[k] : 区間 [t[k], t[k+1]) の回路状態の符号
 
     戻り値は DONE / NEED_STATE / NOT_SETTLED。NEED_STATE のときは、呼び出し側が
@@ -422,7 +421,7 @@ def run_switched(
 
         # --- 採用 ---
         n_retries += flips
-        if event[k] == EVENT_SOURCE:
+        if disc and record_after[k]:
             out[k] = xk
         if be or disc:
             n_changes += 1

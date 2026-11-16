@@ -262,6 +262,10 @@ class CodedKeyError(Coded, KeyError):
         super().__init__(str(message))
         self._set_message(message)
 
+    def __str__(self) -> str:
+        # KeyError の str() は引数を repr にする（引用符が付く）。ほかの番号つきのエラーと同じく、文面を返す
+        return str.__str__(self.message)
+
 
 class SimulationCancelled(Coded, Exception):
     """利用者が計算を中断した（simulate の cancel が真を返した）。途中の結果は返さない。
@@ -684,6 +688,10 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "素子が1つしかつながっていない節点がある: {nodes:repr}",
         "Some nodes connect to only one component: {nodes:repr}",
     ),
+    "NETLIST_NO_COMPONENT": (
+        "素子 {id} は無い。素子ID: {ids:repr}",
+        "No component with ID {id}. Component IDs: {ids:repr}",
+    ),
     # --- 単位（units.py） --------------------------------------------------------------------
     "UNIT_UNREADABLE": ("単位 '{unit}' は読めない", "The unit '{unit}' can't be read"),
     "UNIT_UNREADABLE_EXPECTED": (
@@ -875,6 +883,10 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "SIGNAL_INFO_INCONSISTENT": (
         "信号 {name}: 種類 {kind} に要る欄が無いか、名前と合わない",
         "Signal {name}: fields needed for kind {kind} are missing or don't match the name",
+    ),
+    "DISPLAY_NO_VALUE": (
+        "テンプレート {template} の表示定義に、値 {key} は無い。ある値: {keys:repr}",
+        "The display definition of template {template} has no value {key}. Available values: {keys:repr}",
     ),
     # --- 制御ブロックと PWM（control/） ------------------------------------------------------
     "PWM_FREQUENCY_NOT_FINITE": ("{name}: frequency は有限値が必要", "{name}: frequency must be finite"),
