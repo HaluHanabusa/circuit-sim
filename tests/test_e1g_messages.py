@@ -506,6 +506,8 @@ def test_engine_params_have_the_placeholders_of_the_screen_notices(monkeypatch):
             (ERROR_CASES.get(case) or RUN_ERROR_CASES[case])()
         if isinstance(info.value, Coded):
             seen.setdefault(info.value.code, []).append(set(info.value.params))
+            json.dumps(info.value.to_dict(), ensure_ascii=False)          # 画面に渡せる形
+            assert info.value.text("en") and info.value.text("en") != info.value.text("ja")
     for code in ("RUN_DIVERGED", "RUN_DIVERGED_NOT_FINITE", "CONTROLLER_COMMAND_NOT_FINITE",
                  "DIODES_NOT_SETTLED", "DIODES_NOT_SETTLED_AT_START", "STEP_COARSE_OVER_LIMIT_NO_IDS",
                  "TOO_MANY_DEVICES"):
