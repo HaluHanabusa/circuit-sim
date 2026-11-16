@@ -1,0 +1,281 @@
+<!doctype html>
+<!-- 案B「一覧」（密度と強弱）/ 起動直後 -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>案B 一覧 起動直後</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+
+<style>
+body{margin:0}
+:root{
+--bg-app:#eef0f3;--bg-panel:#ffffff;--bg-plot:#ffffff;--bg-raised:#ffffff;--bg-input:#ffffff;
+--bg-hover:#f1f3f6;--bg-selected:#e2e6ec;--bg-inverse:#15181d;--bg-band:#f5f6f8;
+--text-primary:#15181d;--text-secondary:#4a525e;--text-muted:#5f6773;--text-disabled:#9da4ae;--text-inverse:#ffffff;
+--border-subtle:#dfe3e8;--border-strong:#c9ced6;--border-control:#7d8591;--plot-grid:#e6e9ed;--plot-axis:#8c94a0;
+--wave-1:#2231d3;--wave-2:#d17414;--wave-3:#1082ab;--wave-4:#8c5bfe;--wave-5:#990a39;--wave-6:#e129a4;--wave-7:#0ea361;--wave-8:#6d6a00;--missing-fg:#1d57c2;--warning-fg:#8a5200;--error-fg:#b3261e;--ok-fg:#17713a;
+color-scheme:light;
+--bg-app:#e9ecf0;--bg-band:#f4f5f7;--border-subtle:#d9dde3;
+--font-ui:"Segoe UI Variable Text","Segoe UI Variable","Segoe UI","Yu Gothic UI",-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans CJK JP","Noto Sans",sans-serif;
+--font-mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace;
+--fs:14px;--lh:20px;--fs-sm:13px;--fs-tick:12px;--fs-legend:13px;--fs-h:15px;--w-strong:600;
+--hdr:48px;--ntc:32px;--ctl:32px;--ctl-px:12px;--run-h:32px;--run-w:96px;--tool-h:30px;--radius:4px;
+--yaxis-w:60px;--xaxis-h:28px;--row:30px;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg-app)}
+.app{height:100vh;min-height:100vh;display:grid;grid-template-rows:var(--hdr) minmax(0,1fr) var(--ntc);
+  background:var(--bg-app);color:var(--text-primary);font-family:var(--font-ui);font-size:var(--fs);line-height:var(--lh);
+  -webkit-font-smoothing:auto;text-rendering:optimizeLegibility;font-kerning:normal;overflow:hidden}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+button{font:inherit;color:inherit;cursor:pointer}
+button:disabled{cursor:default}
+.ic{flex:none;display:block}
+.btn{display:inline-flex;align-items:center;gap:6px;height:var(--ctl);padding:0 var(--ctl-px);border:1px solid var(--border-control);
+  background:var(--bg-panel);border-radius:var(--radius);color:var(--text-primary);white-space:nowrap}
+.btn:disabled{border-color:var(--border-subtle);color:var(--text-disabled);background:transparent}
+.btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:var(--run-h);min-width:var(--run-w);padding:0 16px;
+  border:0;border-radius:var(--radius);background:var(--bg-inverse);color:var(--text-inverse);font-weight:var(--w-strong);white-space:nowrap}
+.btn-primary:disabled{background:var(--bg-selected);color:var(--text-disabled)}
+.tool{display:inline-flex;align-items:center;gap:6px;height:var(--tool-h);padding:0 10px;border:1px solid transparent;border-radius:var(--radius);
+  background:transparent;color:var(--text-secondary);white-space:nowrap}
+.tool.on{background:var(--bg-selected);border-color:var(--text-primary);color:var(--text-primary)}
+.tool:disabled{color:var(--text-disabled)}
+.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:var(--ctl);height:var(--ctl);border:0;border-radius:var(--radius);
+  background:transparent;color:var(--text-secondary)}
+.seg{display:inline-flex;height:var(--ctl);border:1px solid var(--border-control);border-radius:var(--radius);overflow:hidden}
+.seg button{border:0;background:transparent;padding:0 10px;color:var(--text-secondary)}
+.seg button.on{background:var(--bg-inverse);color:var(--text-inverse)}
+.sw{display:inline-block;width:20px;height:12px;border-radius:2px;background:var(--bg-plot);position:relative;flex:none;vertical-align:middle}
+.sw::after{content:"";position:absolute;left:3px;right:3px;top:5px;height:2px;background:var(--c)}
+.sw.dashed::after{background:repeating-linear-gradient(90deg,var(--c) 0 4px,transparent 4px 7px)}
+.chk{width:16px;height:16px;border-radius:2px;border:1px solid var(--border-control);background:var(--bg-inverse);position:relative;flex:none;display:inline-block;vertical-align:middle}
+.chk::after{content:"";position:absolute;left:5px;top:2px;width:4px;height:8px;border:solid var(--text-inverse);border-width:0 2px 2px 0;transform:rotate(45deg)}
+.sel{display:inline-flex;align-items:center;justify-content:space-between;gap:6px;height:calc(var(--ctl) - 4px);padding:0 6px 0 8px;
+  border:1px solid var(--border-control);border-radius:var(--radius);background:var(--bg-input);white-space:nowrap}
+.muted{color:var(--text-muted)}
+.sec{color:var(--text-secondary)}
+.nowrap{white-space:nowrap}
+.ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* スコープ */
+.plots{position:relative;display:grid;grid-template-rows:var(--flag-h,18px) minmax(0,1fr) minmax(0,1fr) var(--xaxis-h);min-height:0}
+.flagstrip{margin-left:var(--yaxis-w)}
+.pane{position:relative;display:grid;grid-template-columns:var(--yaxis-w) minmax(0,1fr);min-height:0}
+.pane + .pane{border-top:1px solid var(--border-subtle)}
+.pane .plot{border-top:1px solid var(--border-subtle)}
+.yaxis{position:relative;border-right:1px solid var(--plot-axis)}
+.yaxis .unit{position:absolute;top:6px;right:10px;font-family:var(--font-mono);font-size:var(--fs-tick);color:var(--text-secondary)}
+.yaxis .tick{position:absolute;right:8px;transform:translateY(-50%);font-family:var(--font-mono);font-size:var(--fs-tick);color:var(--text-secondary);line-height:1}
+.yaxis .tick::after{content:"";position:absolute;right:-8px;top:50%;width:5px;height:1px;background:var(--plot-axis)}
+.plot{position:relative;background:var(--bg-plot);overflow:hidden}
+.legend{position:absolute;z-index:2;left:8px;top:6px;display:flex;gap:12px;align-items:center;padding:2px 6px;border-radius:3px;
+  background:color-mix(in srgb,var(--bg-plot) 82%,transparent);font-family:var(--font-mono);font-size:var(--fs-legend)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.axismode{position:absolute;z-index:2;right:8px;top:6px;height:26px;padding:0 8px;font-size:14px;border:1px solid var(--border-subtle);
+  border-radius:var(--radius);background:var(--bg-plot);color:var(--text-secondary)}
+.xaxis{position:relative;margin-left:var(--yaxis-w);border-top:1px solid var(--plot-axis)}
+.xaxis .xt{position:absolute;top:6px;transform:translateX(-50%);font-family:var(--font-mono);font-size:var(--fs-tick);color:var(--text-secondary);line-height:1}
+.xaxis .xt::before{content:"";position:absolute;left:50%;top:-7px;width:1px;height:5px;background:var(--plot-axis)}
+.xaxis .xt:first-child{transform:none}
+.xaxis .xunit{position:absolute;right:8px;top:6px;font-family:var(--font-mono);font-size:var(--fs-tick);color:var(--text-secondary);line-height:1;
+  background:var(--bg-panel);padding-left:6px}
+.curs{position:absolute;z-index:1;left:var(--yaxis-w);right:0;top:0;bottom:var(--xaxis-h);pointer-events:none}
+.cur{position:absolute;top:0;bottom:0;width:0;border-left:1px solid var(--text-primary)}
+.cur.b{border-left:1px dashed var(--text-primary)}
+.cur .flag{position:absolute;top:0;left:-8px;width:16px;height:16px;background:var(--bg-inverse);color:var(--text-inverse);
+  font-family:var(--font-mono);font-size:12px;line-height:16px;text-align:center;border-radius:2px}
+.focus-ring{outline:2px solid var(--text-primary);outline-offset:2px}
+
+.schem .w{fill:none;stroke:var(--text-primary);stroke-width:1.5}
+.schem .el{fill:none;stroke:var(--text-primary);stroke-width:1.5}
+.schem .el.fill{fill:var(--bg-plot)}
+.schem .box{fill:var(--bg-plot)}
+.schem .dash{stroke-dasharray:4 3}
+.schem .muted{stroke:var(--text-muted);fill:var(--text-muted)}
+.schem rect.muted{fill:none}
+.schem .dot{fill:var(--text-primary)}
+.schem .arrow{fill:var(--text-primary)}
+.schem .lead{fill:none;stroke:var(--text-secondary);stroke-width:1}
+.schem .sig{fill:none;stroke:var(--text-secondary);stroke-width:1;stroke-dasharray:4 3}
+.schem text{font-family:var(--font-mono)}
+.schem text.jp,.schem tspan.jp{font-family:var(--font-ui);font-size:14px}
+.schem .t-name{font-size:12px;fill:var(--text-secondary)}
+.schem .t-val{font-size:13px;fill:var(--text-primary)}
+.schem .t-val .t-name{font-size:12px;fill:var(--text-secondary)}
+.schem .t-val.muted,.schem .t-name.muted{fill:var(--text-muted);stroke:none}
+.schem .t-node{font-size:12px;fill:var(--text-muted)}
+.schem .t-sig{font-size:12px;fill:var(--text-secondary)}
+.schem .t-sum{font-size:13px;fill:var(--text-primary);font-family:var(--font-ui)}
+.schem .t-sign{font-size:12px;fill:var(--text-secondary);font-family:var(--font-ui)}
+.schem .t-box{font-size:12px;fill:var(--text-primary)}
+.schem .probe rect{fill:var(--bg-plot);stroke:var(--border-control);stroke-width:1}
+.schem .probe rect.swbg{fill:var(--bg-plot);stroke:none}
+.schem .t-probe{font-size:12px;fill:var(--text-primary)}
+
+.wave{position:absolute;inset:0;width:100%;height:100%;display:block}
+.wave .g{stroke:var(--plot-grid);stroke-width:1;vector-effect:non-scaling-stroke}
+.wave .trace{stroke-width:1.5;vector-effect:non-scaling-stroke;stroke-linejoin:round}
+
+.hdr{display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--border-subtle);background:var(--bg-panel);min-width:0}
+.hdr .div{width:1px;height:24px;background:var(--border-subtle);margin:0 8px}
+.brand{font-weight:600;font-size:15px}
+.file{display:flex;align-items:baseline;gap:8px;min-width:0}
+.fname{font-size:14px}
+.tag{display:inline-flex;align-items:center;height:24px;padding:0 8px;border-radius:4px;background:var(--bg-band);border:1px solid var(--border-subtle);color:var(--text-secondary);font-size:14px;white-space:nowrap}
+.hdr .grp{display:flex;gap:6px;align-items:center}
+.spacer{flex:1}
+.runstat{display:flex;align-items:center;gap:6px;margin-left:6px}
+.runstat .k{color:var(--text-secondary)}
+.runstat b{font-weight:600}
+.lab{color:var(--text-secondary);margin-right:2px}
+.main{display:grid;grid-template-columns:460px minmax(0,1fr) 360px;grid-template-rows:auto minmax(0,1fr);grid-template-areas:'spec schem side' 'spec scope side';min-height:0}
+.spec{grid-area:spec}.schem-area{grid-area:schem;min-width:0}.scope{grid-area:scope;min-width:0}.side{grid-area:side;border-left:1px solid var(--border-strong)}
+.region{display:flex;flex-direction:column;min-height:0;background:var(--bg-panel)}
+.rhead{display:flex;align-items:center;gap:10px;height:40px;padding:0 8px 0 12px;flex:none;background:var(--bg-band);border-bottom:1px solid var(--border-subtle)}
+.rhead h2{margin:0;font-size:var(--fs-h);font-weight:600;white-space:nowrap}
+.rhead .sum{color:var(--text-secondary);white-space:nowrap}
+.spec{border-right:1px solid var(--border-strong)}
+.tbl-wrap{overflow:auto;min-height:0;flex:1}
+table.spec-t{width:100%;border-collapse:collapse;table-layout:fixed}
+.spec-t th{position:sticky;top:0;z-index:1;background:var(--bg-panel);height:30px;font-weight:600;color:var(--text-secondary);text-align:left;padding:0 6px;border-bottom:1px solid var(--border-subtle)}
+.spec-t th.r,.spec-t td.v{text-align:right}
+.spec-t td{height:var(--row);padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spec-t td:first-child,.spec-t th:first-child{padding-left:12px}
+.spec-t tr.g td{height:30px;font-weight:600;background:var(--bg-band);border-top:1px solid var(--border-subtle);border-bottom:1px solid var(--border-subtle)}
+.spec-t tr.g td .n{float:right;font-weight:400;color:var(--text-muted);font-variant-numeric:tabular-nums;padding-right:8px}
+.spec-t td.s{font-family:var(--font-mono);font-weight:600}
+.spec-t td.it{color:var(--text-secondary)}
+.spec-t td.v{font-family:var(--font-mono)}
+.spec-t td.src{color:var(--text-secondary)}
+.spec-t tr.d td.v,.spec-t tr.n td.v{color:var(--text-secondary)}
+.spec-t tr.n td.v{font-family:var(--font-ui)}
+.spec-t tr.ro td{color:var(--text-secondary)}
+.schem-area{background:var(--bg-plot);border-bottom:1px solid var(--border-strong)}
+.schem-area .rhead{background:var(--bg-band)}
+.schem-box{display:flex;justify-content:center;padding:6px 0 10px;overflow:hidden}
+.schem-box svg.schem{width:100%;max-width:960px;height:auto}
+.scope{display:grid;grid-template-rows:40px minmax(0,1fr) auto;min-height:0;background:var(--bg-panel)}
+.rd-n{display:none}
+.tools{display:flex;align-items:center;gap:2px;padding:0 8px 0 12px;background:var(--bg-band);border-bottom:1px solid var(--border-subtle);min-width:0}
+.tools h2{margin:0 12px 0 0;font-size:var(--fs-h);font-weight:600;white-space:nowrap}
+.tools .sep{width:1px;height:20px;background:var(--border-subtle);margin:0 6px}
+.plots{margin:6px 12px 4px 4px}
+.side .sect{border-bottom:1px solid var(--border-subtle)}
+.side .sect:last-child{border-bottom:0}
+dl.kv{display:grid;grid-template-columns:auto 1fr;margin:0;padding:6px 12px 10px;row-gap:2px;column-gap:16px}
+dl.kv dt{color:var(--text-secondary);line-height:26px}
+dl.kv dd{margin:0;text-align:right;line-height:26px;white-space:nowrap}
+.rg{display:grid;grid-template-columns:1fr 1fr 1fr;column-gap:8px;padding:0 12px}
+.rg .h{font-weight:600;color:var(--text-secondary);text-align:right;line-height:28px}
+.rg .t{text-align:right;font-family:var(--font-mono);line-height:24px;white-space:nowrap}
+.rg .t.e{color:var(--text-secondary)}
+.sig{padding:8px 0 6px;border-top:1px solid var(--border-subtle);margin-top:8px}
+.sig .nm{display:flex;align-items:center;gap:8px;padding:0 12px;height:28px}
+.sig .nm .name{font-family:var(--font-mono);font-weight:600}
+.sig .nm .sel{margin-left:auto}
+.sig .rg .t{line-height:26px}
+.others{padding:0 12px 8px}
+.others .o{display:flex;align-items:center;gap:8px;height:28px}
+.others .u{margin-left:auto;color:var(--text-secondary)}
+.chk0{width:16px;height:16px;border-radius:2px;border:1px solid var(--border-control);background:var(--bg-input);flex:none;display:inline-block}
+.more{display:flex;align-items:center;gap:6px;padding:0 12px;height:36px;color:var(--text-secondary);border-top:1px solid var(--border-subtle)}
+.notices{display:flex;align-items:center;gap:12px;padding:0 8px 0 12px;border-top:1px solid var(--border-strong);background:var(--bg-panel);white-space:nowrap}
+.notices h2{margin:0;font-size:14px;font-weight:600}
+.notices .cnt{display:inline-flex;align-items:center;gap:5px;color:var(--text-muted)}
+.notices .msg{color:var(--text-secondary)}
+@media (max-width:1599px){
+ .hdr .opt{display:none}.hdr .div{margin:0 4px}.seg button{padding:0 8px}
+ .main{grid-template-columns:380px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);grid-template-areas:'spec schem' 'spec scope'}
+ .side{display:none}
+ .spec-t col.c-it{width:0} .spec-t td.it,.spec-t th.it{padding:0;font-size:0}
+ .rd-n{display:block;border-top:1px solid var(--border-subtle)}
+ .rd-n table{width:100%;border-collapse:collapse;table-layout:fixed}
+ .rd-n th{font-weight:600;color:var(--text-secondary);text-align:right;padding:4px 12px;height:28px;white-space:nowrap;border-bottom:1px solid var(--border-subtle)}
+ .rd-n th .mono{color:var(--text-primary);font-weight:400;margin-left:4px}
+ .rd-n th.l,.rd-n td.l{text-align:left}
+ .rd-n td{height:28px;padding:0 12px;text-align:right;font-family:var(--font-mono);white-space:nowrap}
+ .rd-n td:first-child{padding-left:16px}
+ .rd-n .nm{display:inline-flex;align-items:center;gap:8px}
+}
+@media (max-height:800px){ .schem-area .rhead{display:none} .schem-area{position:relative} .schem-box{padding:4px 0} .schem-box svg.schem{max-height:150px} }
+@media (max-width:1599px){ .preview .schem-box{overflow-x:auto;justify-content:flex-start;padding-left:12px} .preview .schem-box svg.schem{min-width:760px} .pvals{grid-template-columns:1fr 1fr} }
+/* 起動直後 */
+.startmain{display:grid;grid-template-columns:560px minmax(0,1fr);min-height:0}
+.startl{background:var(--bg-panel);border-right:1px solid var(--border-strong);overflow:auto}
+.startl .blk{padding:16px 16px 20px}
+.startl h3{margin:0 0 10px;font-size:15px;font-weight:600}
+.drop{height:132px;border:2px dashed var(--border-control);border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:var(--bg-band)}
+.drop .big{font-size:15px}
+.drop .or{display:flex;align-items:center;gap:10px;color:var(--text-secondary)}
+.privacy{margin:8px 0 0;color:var(--text-secondary)}
+.slist{border-top:1px solid var(--border-subtle)}
+.srow{display:grid;grid-template-columns:1fr 20px;align-items:center;width:100%;padding:10px 12px 10px 16px;border:0;border-bottom:1px solid var(--border-subtle);background:transparent;text-align:left;gap:2px 8px}
+.srow .nm{font-weight:600}
+.srow .ds{color:var(--text-secondary);grid-column:1}
+.srow .ic{grid-row:1 / span 2;grid-column:2;color:var(--text-secondary)}
+.srow.on{background:var(--bg-selected);box-shadow:inset 3px 0 0 var(--text-primary)}
+.srow.on .ic{color:var(--text-primary)}
+.preview{display:flex;flex-direction:column;min-height:0;overflow:auto;background:var(--bg-app)}
+.preview .ph{display:flex;align-items:baseline;gap:12px;padding:18px 24px 6px}
+.preview .ph h2{margin:0;font-size:20px;font-weight:600;line-height:28px}
+.preview .pd{padding:0 24px 14px;color:var(--text-secondary)}
+.pcard{margin:0 24px 16px;background:var(--bg-panel);border:1px solid var(--border-subtle)}
+.pcard .rhead{height:36px}
+.pcard .schem-box{padding:10px 0}
+.pvals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));column-gap:0}
+.pvals .col{border-right:1px solid var(--border-subtle)}
+.pvals .col:last-child{border-right:0}
+.pvals .gh{padding:8px 12px 4px;font-weight:600}
+.pvals .r{display:grid;grid-template-columns:108px 1fr;padding:0 12px;line-height:26px}
+.pvals .r .s{font-family:var(--font-mono);font-weight:600}
+.pvals .r .v{font-family:var(--font-mono);text-align:right}
+.pvals .r.d .v{color:var(--text-secondary);font-family:var(--font-ui)}
+.pfoot{display:flex;align-items:center;gap:12px;margin:0 24px 24px}
+.pfoot .note{color:var(--text-secondary)}
+
+</style>
+</helmet>
+<div class="app" style="min-height:100vh;grid-template-rows:var(--hdr) minmax(0,1fr)">
+<header class="hdr">
+<div class="brand">circuit-sim</div><span class="div"></span><div class="file"><span class="sec">仕様を開いていません</span></div><span class="div"></span>
+<div class="grp"><button class="btn"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h4l1.5 1.5H14v6.5H2z" fill="none"/></svg>開く</button><button class="btn">サンプル<svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5 8 10l3.5-3.5" fill="none"/></svg></button><button class="btn" disabled="disabled"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7M5 6.8 8 9.8l3-3M3 11.5v2h10v-2" fill="none"/></svg>保存</button></div>
+<div class="spacer"></div>
+<div class="grp"><button class="btn-primary" disabled="disabled"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.5v9l7.5-4.5z" fill="currentColor" stroke="none"/></svg>実行</button><span class="runstat"><span class="k">仕様を開いてください</span></span></div><span class="div"></span>
+<div class="grp"><span class="lab opt">表示</span><div class="seg" role="radiogroup" aria-label="表示の密度"><button class="on" role="radio" aria-checked="true">標準</button><button role="radio" aria-checked="false">詰める</button></div>
+<div class="seg" role="radiogroup" aria-label="言語"><button class="on" role="radio" aria-checked="true">日本語</button><button role="radio" aria-checked="false">English</button></div>
+<div class="seg" role="radiogroup" aria-label="テーマ"><button class="on" role="radio" aria-checked="true">明</button><button role="radio" aria-checked="false">暗</button></div></div>
+</header>
+<main class="startmain">
+<section class="startl" aria-label="開く">
+<div class="blk"><h3>仕様JSONを開く</h3>
+<div class="drop"><span class="big">ここに仕様JSON（.json）をドロップ</span><span class="or">または <button class="btn"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.8h5.2L12 4.6v9.6H4zM9 2v3h3" fill="none"/></svg>ファイルを選ぶ…</button></span></div>
+<p class="privacy">ファイルはこのPCの外に送られません。</p></div>
+<div class="blk" style="padding-bottom:0"><h3>サンプルから始める</h3></div>
+<div class="slist">
+<button class="srow"><span class="nm">RCローパス</span><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4.5 10 8l-3.5 3.5" fill="none"/></svg><span class="ds">ステップ応答。時定数 1 ms。</span></button>
+<button class="srow"><span class="nm">直列RLC</span><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4.5 10 8l-3.5 3.5" fill="none"/></svg><span class="ds">ステップ応答。減衰振動（減衰係数 0.05、共振 1.59 kHz）。</span></button>
+<button class="srow on focus-ring" style="outline-offset:-2px"><span class="nm">降圧コンバータ</span><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4.5 10 8l-3.5 3.5" fill="none"/></svg><span class="ds">24 V → 12 V、100 kHz。同期整流、電圧モードの PID 制御。</span></button>
+</div>
+</section>
+<section class="preview" aria-label="サンプルの中身">
+<div class="ph"><h2>降圧コンバータ</h2><span class="mono sec">buck_voltage_mode.json</span></div>
+<div class="pd">24 V → 12 V、100 kHz。同期整流、電圧モードの PID 制御。</div>
+<div class="pcard"><div class="rhead"><h2>回路図</h2></div><div class="schem-box"><svg class="schem" viewBox="0 0 960 186" role="img" aria-label="降圧コンバータの回路図"><path class="w" d="M40 60H124M156 60H280M340 60H520V90M520 120V150H40V119M40 91V60"/><path class="w" d="M220 60V90M220 122V150M430 60V70"/><path class="w" d="M430 94V118"/><path class="w" d="M430 126V150"/><circle class="el" cx="40" cy="105" r="14"/><path class="el" d="M40 95v6M37 98h6M37 112h6"/><circle class="el fill" cx="124" cy="60" r="2.2"/><circle class="el fill" cx="156" cy="60" r="2.2"/><path class="el" d="M125 59 152 47"/><path class="sig" d="M140 52V27"/><circle class="el fill" cx="220" cy="90" r="2.2"/><circle class="el fill" cx="220" cy="122" r="2.2"/><path class="el" d="M221 91 233 117"/><path class="sig" d="M229 105H243"/><path class="el" d="M280 60a7.5 7.5 0 0 1 15 0a7.5 7.5 0 0 1 15 0a7.5 7.5 0 0 1 15 0a7.5 7.5 0 0 1 15 0"/><rect class="el dash muted" x="424" y="70" width="12" height="24"/><path class="el" d="M418 118h24M418 126h24"/><rect class="el" x="514" y="90" width="12" height="30"/><circle class="dot" cx="220" cy="60" r="2.5"/><circle class="dot" cx="430" cy="60" r="2.5"/><circle class="dot" cx="220" cy="150" r="2.5"/><circle class="dot" cx="280" cy="150" r="2.5"/><circle class="dot" cx="430" cy="150" r="2.5"/><path class="el" d="M280 150v6M270 156h20M274 160h12M278 164h4"/><path class="arrow" d="M356 55l8 5-8 5z"/><path class="arrow" d="M35 132l5 8 5-8z"/><path class="lead" d="M40 60V26M220 60V26M470 60V26M360 60V46"/><text class="t-name" x="62" y="98">V1</text><text class="t-val" x="62" y="115"><tspan class="jp">直流 </tspan>24 V</text><text class="t-node" x="72" y="52">in</text><text class="t-name" x="140" y="80" text-anchor="middle">S1</text><text class="t-node" x="230" y="52">sw</text><text class="t-name" x="208" y="109" text-anchor="end">S2</text><text class="t-name" x="310" y="40" text-anchor="middle">L1</text><text class="t-val" x="310" y="84" text-anchor="middle">47 µH</text><text class="t-node" x="396" y="52">out</text><text class="t-name muted" x="444" y="80">R_esr</text><text class="t-val muted jp" x="444" y="96">なし</text><text class="t-name" x="444" y="116">C1</text><text class="t-val" x="444" y="132">100 µF</text><text class="t-name" x="534" y="100">R1</text><text class="t-val" x="534" y="116">6 Ω</text><text class="t-node" x="292" y="168">0</text><g class="probe"><rect x="15.9" y="6" width="48.2" height="20" rx="4"/><text class="t-probe" x="21.9" y="20">v(in)</text></g><g class="probe"><rect x="105.0" y="6" width="70.0" height="20" rx="4"/><text class="t-probe" x="111.0" y="20">gate(q1)</text></g><g class="probe"><rect x="195.9" y="6" width="48.2" height="20" rx="4"/><text class="t-probe" x="201.9" y="20">v(sw)</text></g><g class="probe"><rect x="243.0" y="95" width="70.0" height="20" rx="4"/><text class="t-probe" x="249.0" y="109">gate(q2)</text></g><g class="probe"><rect x="326.9" y="26" width="66.2" height="20" rx="4"/><rect class="swbg" x="331.9" y="31" width="14" height="10" rx="2"/><line x1="333.9" y1="36" x2="343.9" y2="36" style="stroke:var(--wave-2)" stroke-width="2"/><text class="t-probe" x="350.9" y="40">i(L1)</text></g><g class="probe"><rect x="433.2" y="6" width="73.5" height="20" rx="4"/><rect class="swbg" x="438.2" y="11" width="14" height="10" rx="2"/><line x1="440.2" y1="16" x2="450.2" y2="16" style="stroke:var(--wave-1)" stroke-width="2"/><text class="t-probe" x="457.2" y="20">v(out)</text></g><g class="probe"><rect x="57.9" y="126" width="48.2" height="20" rx="4"/><text class="t-probe" x="63.9" y="140">i(V1)</text></g><text class="t-sig" x="628" y="64" text-anchor="end">v(out)</text><path class="sig" d="M631 60H648"/><path class="arrow" d="M645 56.5l6 3.5-6 3.5z"/><circle class="el" cx="660" cy="60" r="9"/><text class="t-sum" x="660" y="64.5" text-anchor="middle">Σ</text><text class="t-sign" x="643" y="52">−</text><text class="t-sign" x="666" y="82">＋</text><path class="sig" d="M660 90V72"/><path class="arrow" d="M656.5 75l3.5-6 3.5 6z"/><text class="t-val" x="660" y="104" text-anchor="middle"><tspan class="t-name">Vref </tspan>12 V</text><path class="sig" d="M669 60H704"/><path class="arrow" d="M701 56.5l7 3.5-7 3.5z"/><rect class="el box" x="708" y="48" width="64" height="24"/><text class="t-box" x="740" y="64.5" text-anchor="middle">PID</text><text class="t-val" x="708" y="90"><tspan class="t-name">Kp </tspan>0.0117 1/V</text><text class="t-val" x="708" y="106"><tspan class="t-name">Ki </tspan>147 1/(V·s)</text><text class="t-val" x="708" y="122"><tspan class="t-name">Kd </tspan>2.74e-6 s/V</text><text class="t-val" x="708" y="138"><tspan class="t-name">Tf </tspan>2.5 µs</text><text class="t-val" x="708" y="154"><tspan class="t-name">f_ctrl </tspan>100 kHz</text><text class="t-val" x="708" y="170"><tspan class="t-name">d </tspan>0〜0.9</text><path class="sig" d="M772 60H848"/><path class="arrow" d="M845 56.5l7 3.5-7 3.5z"/><path class="lead" d="M812 60V46"/><g class="probe"><rect x="773.4" y="26" width="77.2" height="20" rx="4"/><text class="t-probe" x="779.4" y="40">cmd(duty)</text></g><rect class="el box" x="852" y="48" width="64" height="24"/><text class="t-box" x="884" y="64.5" text-anchor="middle">PWM</text><text class="t-val" x="884" y="92" text-anchor="middle"><tspan class="t-name">f_sw </tspan>100 kHz</text><path class="sig" d="M916 54H930M916 66H930"/><path class="arrow" d="M928 51l6 3-6 3zM928 63l6 3-6 3z"/><text class="t-sig" x="937" y="58">q1</text><text class="t-sig" x="937" y="70">q2</text></svg></div></div>
+<div class="pcard"><div class="rhead"><h2>仕様の値</h2><span class="sum">21 項目 ・ 不足 0</span></div><div class="pvals"><div class="col"><div class="gh">回路</div><div class="r"><span class="s">Vin</span><span class="v">24 V</span></div><div class="r"><span class="s">L</span><span class="v">47 µH</span></div><div class="r"><span class="s">C</span><span class="v">100 µF</span></div><div class="r d"><span class="s">C_esr</span><span class="v">既定値 0 Ω</span></div><div class="r"><span class="s">R_load</span><span class="v">6 Ω</span></div><div class="r d"><span class="s">R_load_step</span><span class="v">なし</span></div><div class="r d"><span class="s">t_load_step</span><span class="v">なし</span></div></div><div class="col"><div class="gh">制御</div><div class="r"><span class="s">f_sw</span><span class="v">100 kHz</span></div><div class="r"><span class="s">f_ctrl</span><span class="v">100 kHz</span></div><div class="r"><span class="s">Vref</span><span class="v">12 V</span></div><div class="r d"><span class="s">Vref_step</span><span class="v">なし</span></div><div class="r d"><span class="s">t_ref_step</span><span class="v">なし</span></div><div class="r"><span class="s">Kp</span><span class="v">0.0117 1/V</span></div><div class="r"><span class="s">Ki</span><span class="v">147 1/(V·s)</span></div><div class="r"><span class="s">Kd</span><span class="v">2.74e-6 s/V</span></div><div class="r"><span class="s">Tf</span><span class="v">2.5 µs</span></div><div class="r"><span class="s">d_min</span><span class="v">0</span></div><div class="r"><span class="s">d_max</span><span class="v">0.9</span></div></div><div class="col"><div class="gh">計算の設定</div><div class="r d"><span class="s">fidelity</span><span class="v">スイッチング</span></div><div class="r d"><span class="s">t_end</span><span class="v">自動 8.62 ms</span></div><div class="r d"><span class="s">h</span><span class="v">自動 50 ns</span></div><div class="r"><span class="s">ステップ数</span><span class="v">172,400</span></div></div></div></div>
+<div class="pfoot"><button class="btn"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h4l1.5 1.5H14v6.5H2z" fill="none"/></svg>開く</button><span class="note">Enter で開きます。開いた後は Ctrl+Enter で実行します。</span></div>
+</section>
+</main></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1920,"height":1080}}'>
+class Component extends DCLogic {
+renderVals() { return {}; }
+}
+</script>
+</body>
+</html>
