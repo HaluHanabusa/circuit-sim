@@ -105,13 +105,20 @@ def test_state_is_continuous_and_every_point_satisfies_the_circuit_equation():
 def test_command_changes_are_counted_once_per_change():
     res = run(TC / 100)
     assert res.stats["command_changes"] == 6 and res.stats["state_changes"] == 0
+    # 上下限のある電源: 数えるのは、上下限で止めた後の「電源の値」が変わった点。指令が変わっても、
+    # 止めた後の値が同じなら（2.0 → 3.0 はどちらも上限の 1、−0.5 → −1.5 はどちらも下限の 0）、
+    # 変わり目ではない
+    values = [0.0, 1.0, 2.0, 3.0, 0.25, -0.5, -1.5, 0.75, 0.75, 0.1]
+    clipped = np.clip(values, 0.0, 1.0)
+    assert np.count_nonzero(np.diff(values)) == 8 and np.count_nonzero(np.diff(clipped)) == 5
     limited = simulate(circuit(lower=0.0, upper=1.0), T_END, TC / 100,
-                       controllers=[hp.Lookup(VALUES, period=TC)])
-    # 上下限で止めた後の値で数える（−0.5 は 0、2.0 は 1 になる。変わるのは 6 回:
-    # 0 → 1、1 → 0.25、0.25 → 0、0 → 0.75、0.75 → 1、1 → 0.1）
-    clipped = np.clip(VALUES, 0.0, 1.0)
-    assert limited.stats["command_changes"] == int(np.count_nonzero(np.diff(clipped)))
+                       controllers=[hp.Lookup(values, period=TC)])
+    assert limited.stats["command_changes"] == 5
     assert np.abs(limited["v(in)"][1:] - G * np.clip(limited["cmd(u)"][:-1], 0.0, 1.0)).max() <= 1e-9
+    # 止めた後の値をそのまま指令にした計算と、回路の変数がビット単位で同じ（余分な不連続点を作っていない）
+    same = simulate(circuit(lower=0.0, upper=1.0), T_END, TC / 100,
+                    controllers=[hp.Lookup(list(clipped), period=TC)])
+    assert limited.x.tobytes() == same.x.tobytes()
 
 
 @pytest.mark.parametrize("signal", ["v(out)", "i(V1)"])
