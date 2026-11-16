@@ -224,13 +224,14 @@
 | 時点 | ruff | pytest |
 |---|---|---|
 | 実装の先頭 `d9e5040` に main を取り込んだだけ（手当ての前） | 指摘なし | 13 件が落ちる、2484 通過、21 スキップ、8 xfail（387 秒）。実装者の報告と同じ 13 件 |
-| 受け入れ試験の手当てと追加の後（`1aeab4f` の内容。この記録を足す前） | 指摘なし | **11 件が落ちる**、2786 通過、21 スキップ、10 xfail（396 秒）。XPASS なし |
+| 受け入れ試験の手当てと追加の後（`1aeab4f`） | 指摘なし | **11 件が落ちる**、2786 通過、21 スキップ、10 xfail（396 秒）。XPASS なし |
+| この記録を足した後（`efbf249`。もう一度流した） | 指摘なし | **12 件が落ちる**、2785 通過、21 スキップ、10 xfail（377 秒）。XPASS なし |
 
-落ちる 11 件は、どれも「いまの実装では落ちるのが正しい」もの。ほかに落ちる試験は無い。
+落ちるのは、どれも「いまの実装では落ちるのが正しい」もの。ほかに落ちる試験は無い。2 回の違い（11 件と 12 件）は、的の試験 `…long_control_period_engine` が、1 回目は通り、2 回目は落ちたため（進み具合の跳びが毎回は出ない条件。中1）。
 
 - 既存の 1 件: `test_e1a_units_limits.py::test_c14_cli_reports_the_limit_in_one_line`（CSV の行数。D-075 で、元の期待のまま残した）
-- 的の 10 件（`test_e1g_review_targets.py`）: 進み具合 4（`…long_control_period_template`、`…controller_takes_time_template`、`…controller_takes_time_engine`、`…setup_block_is_small`）、CSV 3、極端な値 1、あふれの警告 2
-- 的のうち通った 3 件: 直した後も守ること 2 件と、`…long_control_period_engine`（跳びが、この回は出なかった。毎回は出ない条件）
+- 的の 10〜11 件（`test_e1g_review_targets.py`）: 進み具合 4〜5（`…long_control_period_template`、`…long_control_period_engine`（落ちたり通ったり）、`…controller_takes_time_template`、`…controller_takes_time_engine`、`…setup_block_is_small`）、CSV 3、極端な値 1、あふれの警告 2
+- 的のうち、いまも通る 2 件: 直した後も守ること（注意が無ければ注意のファイルを作らない、`--csv` が無ければファイルを書かない）
 
 途中で、私の受け入れ試験のファイル名 2 つ（`test_e1g_divergence.py`、`test_e1g_messages.py`）が、`tests/` にある実装者の試験と同じ名前で、pytest が試験を集める段階でエラーになった（全体が 1 件も走らない）。`test_e1g_divergence_independent.py`、`test_e1g_message_codes.py` に改めた。`tests/` と `tests/acceptance/` に同じ名前の試験のファイルは置けない（道具の側で先に気づけるとよい）。
 
