@@ -1,20 +1,23 @@
-"""A0 の独立検証（verifier、3回目）: 最後の修正（70a1e1d）の4件のうち、ブラウザの要らない3件。
+"""A0 の独立検証（verifier、3回目に作り、4回目に書き直した）: ブラウザの要らない3件。
 
-記録は docs/verification/A0-verifier-3.md。ブラウザも Node.js も要らない（POの Windows の PC でも動く）。
+記録は docs/verification/A0-verifier-3.md（作ったとき）と A0-verifier-4.md（書き直したとき）。ブラウザも
+Node.js も要らない（POの Windows の PC でも動く）。
 
 - 止めるとき: 読むのが遅い相手（受け取りの量 4096 バイト）に、画面のファイル（約 300 KB）が最後まで届く。
-  1) 製品のまま（POSIX は RST の印を付けない）。アプリ本体を別のプロセスで起動し、SIGINT で止める。
-     読む速さを変える（POSIX だけ。Windows の止め方は Ctrl+Break で、実装の試験が見ている）。
-  2) RST の印を付ける分岐（Windows だけで効く）を、どの OS でも強制して同じことを確かめる。RST（SO_LINGER
-     0 秒）で閉じると、OS の送りの待ちに残るデータは捨てられる（Windows も同じ: closesocket の hard close）。
-     transport の送りの待ちが空でも、OS が受け取って相手がまだ読んでいない分が残るので、Linux では届かない
-     （軽微。製品の不具合なので xfail。Windows で OS が受け取る量は確かめていない）。
+  3回目のときは、Windows だけ待ちの接続を RST（SO_LINGER 0 秒）で閉じていて、OS の送りの待ちに残る分が
+  捨てられた（軽微）。4回目の対象（56c95fc、D-061）は RST をやめ、どの OS でもふつうに FIN で閉じる。
+  1) 製品のまま。アプリ本体を別のプロセスで起動し、SIGINT で止める。読む速さを変える（POSIX だけ。Windows の
+     止め方は Ctrl+Break で、実装の試験が見ている）。
+  2) Windows の経路（cli.WINDOWS を真にする。待ち受けに SO_REUSEADDR を付けない結び方）を、どの OS でも
+     強制して同じことを確かめる。強制が効いたことを、待ち受けのソケットの設定で確かめる。止める手順に
+     Windows だけの分岐（RST の印など）がまた入ると、Linux でもここで落ちる。
 - 「使い終わった URL」の案内: 使い終わった番号の URL を、ブラウザがページとして開いた要求（Sec-Fetch-Mode:
   navigate）でだけ端末に出す。画像・スクリプト・cors・道具（ヘッダーなし）では出さない。アプリ本体を別の
   プロセスで起動し、端末の出力で見る（対照: navigate なら出る）。
 - SDDL の解析（Windows の ACL の判定のうち、OS に依らない部分）: 継承するだけの項目（IO）、条件つきの項目
   （XA、ZA）、オブジェクト型（OA）を、本人だけと誤らない。期待値は SDDL の書式（MS-DTYP 2.5.1）から自分で
-  決めた。条件の文字列の中に `)` があると、後ろの項目を読み落として本人だけと誤る（軽微。xfail）。
+  決めた。条件の文字列の中に `)` があっても、後ろの項目を読み落とさない（3回目は軽微で xfail。4回目の対象で
+  直ったので、印を外した）。
 
 時間の基準は無い（待つ時間の上限は、混んだ機械で落ちないように長めにとった。合否には使わない）。
 製品の不具合で落ちる試験は xfail(strict=True)。直ったら XPASS で落ちるので、印を外す。
@@ -172,21 +175,27 @@ def test_slow_reader_gets_the_whole_asset_when_the_app_is_stopped(tmp_path, paus
         app.stop()
 
 
-def test_slow_reader_gets_the_whole_asset_with_the_windows_reset_branch(tmp_path, monkeypatch):
-    """RST の印を付ける分岐を強制して、読むのが遅い相手に最後まで届くかを見る（Windows では、ふだんの形）。"""
+@pytest.mark.parametrize("pause", [0.0, 0.002])
+def test_slow_reader_gets_the_whole_asset_with_the_windows_path(tmp_path, monkeypatch, pause):
+    """Windows の経路を強制して、読むのが遅い相手に最後まで届くかを見る（Windows では、ふだんの形）。
+
+    4回目の書き直し: 3回目は RST の印の関数（reset_idle_connections）を windows=True で差し替えていた。
+    D-061 でその関数が無くなったので、Windows の分かれ目（cli.WINDOWS）そのものを強制する。"""
     import uvicorn
 
     from circuit_sim.app import cli
     from circuit_sim.app.config import Settings
     from circuit_sim.app.server import Launches, Workspace, create_app
 
-    # 実装の直し（RST をやめた）で reset_idle_connections は無くなった。Windows の経路（結び方）を強制する
     monkeypatch.setattr(cli, "WINDOWS", True)
     asset = big_asset()
     workspace = Workspace()
     app = create_app(token="v" * 43, settings=Settings(tmp_path / "config"), workspace=workspace,
                      launches=Launches())
     sock = cli.bind(0)
+    # 強制が効いている（Windows の結び方: SO_REUSEADDR を付けない）。効いていなければ、この試験は POSIX の
+    # 経路を2回見ているだけになる
+    assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
     port = sock.getsockname()[1]
     server = cli.GuardedServer(uvicorn.Config(app, log_level="warning", access_log=False, lifespan="off",
                                               timeout_graceful_shutdown=2),
@@ -205,7 +214,7 @@ def test_slow_reader_gets_the_whole_asset_with_the_windows_reset_branch(tmp_path
         time.sleep(1.0)  # 読まない
         server.should_exit = True
         time.sleep(1.0)  # 止める手順が進む間も読まない
-        data, error = read_response(conn, 0.0)
+        data, error = read_response(conn, pause)
         assert error is None, (error, len(body_of(data)), asset.stat().st_size)
         assert body_of(data) == asset.read_bytes()
     finally:
@@ -300,6 +309,27 @@ SDDL_PAREN_IN_STRING = [
      f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == "R)D"))(A;;FA;;;WD)', False, False),
     ("条件の拒否の文字列に ) があり、後ろに Everyone（場所の形）",
      BASE + f'(XD;;FA;;;{OTHER};(@User.x == "a)b"))(A;OICI;FA;;;WD)', False, False),
+    # 4回目に足した: 文字列の読み方の角と、項目の並びの後ろの読み残し（どれも Windows の出さない形を含む）
+    ("文字列に ) が2つ", f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == "))"))(A;;FA;;;WD)', False, False),
+    ("文字列に )(", f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == ")("))(A;;FA;;;WD)', False, False),
+    ("文字列に ( が3つ", f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == "((("))(A;;FA;;;WD)', False, False),
+    ("文字列が2つ、どちらにも )",
+     f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == "a)" && @User.E == ")b"))(A;;FA;;;WD)', False, False),
+    ("文字列の中に、項目に見える並び",
+     f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == ")(A;;FA;;;SY"))(A;;FA;;;WD)', False, False),
+    ("文字列に ) の項目が最後で、相手が Everyone", f'D:P(A;;FA;;;{ME})(XA;;FA;;;WD;(@User.D == "R)D"))',
+     False, False),
+    ("文字列に ) があり、後ろは本人だけ（対照）", f'D:P(XA;;FA;;;SY;(@User.D == "R)D"))(A;;FA;;;{ME})',
+     True, False),
+    ("引用符が閉じない", f'D:P(A;;FA;;;{ME})(XA;;FA;;;SY;(@User.D == "R)D))(A;;FA;;;WD)', False, False),
+    ("項目のあいだに余計な文字", f"D:P(A;;FA;;;{ME})x(A;;FA;;;WD)", False, False),
+    ("項目の後ろに余計な文字", f"D:P(A;;FA;;;{ME})junk", False, False),
+    ("項目の後ろに閉じかっこ", f"D:P(A;;FA;;;{ME}))(A;;FA;;;WD)", False, False),
+    ("フラグの後ろに余計な文字", "D:Pjunk", False, False),
+    ("後ろに O: と G:（対照）", f"D:P(A;;FA;;;{ME})O:{ME}G:SY", True, False),
+    ("後ろに文字列に ) のある SACL（対照）",
+     f'D:P(A;;FA;;;{ME})(A;;FA;;;SY)S:(XU;SA;FA;;;WD;(@User.x == "a)b"))', True, False),
+    ("付ける形の後ろに空白（対照）", BASE + "  ", True, True),
 ]
 
 
@@ -322,6 +352,7 @@ def test_sddl_is_not_mistaken_for_private(name, sddl, file_ok, folder_ok):
 @pytest.mark.parametrize(("name", "sddl", "file_ok", "folder_ok"), SDDL_PAREN_IN_STRING,
                          ids=[c[0] for c in SDDL_PAREN_IN_STRING])
 def test_sddl_with_parenthesis_inside_a_condition_string(name, sddl, file_ok, folder_ok):
+    """文字列の中の括弧を数えない。読み残しがあれば「本人だけ」とみなさない（4回目に、読み残しの例を足した）。"""
     from circuit_sim.app.config import folder_dacl_is_private
 
     assert folder_dacl_is_private(sddl, ME) is folder_ok
