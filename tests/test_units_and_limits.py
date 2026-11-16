@@ -362,4 +362,4 @@ def test_cli_prints_unit_conversion_notes(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "R: 1 kohm を 1000 ohm に換算した" in out
     assert "C: 1 uF を 1e-06 F に換算した" in out
-    assert "使わない項目を無視した: ['Rload']" in out
+    assert "使わない項目を無視した: Rload" in out

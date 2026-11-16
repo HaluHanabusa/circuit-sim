@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from . import MissingValueError, Spec, expand, simulate
+from . import MissingValueError, Spec, expand
 from .simulate import StepLimitError
 
 # 端末の文字コードで表せない文字の置き換え。単位の文字は、同じ意味の英数字にする（表に無い文字は ?）。
@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(f"仕様JSONの形が正しくありません。{problems}")
     try:
         ex = expand(spec)
-        res = simulate(ex.netlist, ex.t_end, ex.h)
+        res = ex.run()
     except MissingValueError as exc:
         return _fail(f"計算できません。{exc}")
     except StepLimitError as exc:
