@@ -17,7 +17,7 @@ import numpy as np
 
 from . import kernel
 from .control import Controller, Pwm
-from .ir import DC, Netlist, Sine, Step
+from .ir import DC, Command, Netlist, Sine, Step
 from .mna import CircuitError, System, build_system, describe_state, state_conductance
 
 DEFAULT_STEPS_PER_PERIOD = 200   # 搬送波1周期の分割数の既定値
@@ -66,7 +66,9 @@ class Result:
     devices: list[str] = field(default_factory=list)               # S と D の素子ID（状態の符号のビット順）
     sample_state: np.ndarray | None = None    # 各時刻の値と整合する回路状態の符号（S と D の電流に使う）
     stats: dict[str, int] = field(default_factory=dict)            # 用意した回路状態の数など
-    # stats の欄: states（用意した回路状態の数）、state_changes（不連続点として扱ったステップ）、
+    # stats の欄: states（用意した回路状態の数）、state_changes（回路状態が変わったステップと、時刻で決まる
+    #   電源の不連続点の数）、command_changes（指令で決まる電源の値が変わった制御周期の頭の数。
+    #   state_changes とは別に数える。どちらも、その直後を減衰ステップにする不連続点として扱う）、
     #   retries（捨てた試行）、rescues_at_start（t = 0 でダイオードの状態が落ち着かず、違反が丸め誤差の
     #   幅の中の状態を採った（救済した）なら 1。_initial_state を参照）
 
@@ -121,6 +123,7 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
     """電源を時間格子上の配列にする。戻り値: u_start, u_end, event, u_last
 
     u_last は、最後の格子点でちょうど電源がステップするときの、ステップした後の値（無ければ None）。
+    指令で決まる電源（Command）の列は 0 のまま返す（制御周期ごとに _simulate_switched が埋める）。
     """
     m = len(system.sources)
     t = h * np.arange(n_steps + 1)
@@ -158,6 +161,8 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
                 event[ks] = True
             if ks == n_steps and w.final != w.initial:
                 last_step[j] = w.final
+        elif isinstance(w, Command):
+            pass
         else:  # pragma: no cover
             raise CircuitError(f"{cid}: 未対応の波形 {type(w).__name__}")
     u_last = None
@@ -626,6 +631,11 @@ def simulate(
             netlist, t_end, h, gates, controllers, steps_per_period, damping_steps, max_steps
         )
 
+    commanded = [c.id for c in netlist.components if isinstance(c.waveform, Command)]
+    if commanded:
+        raise ValueError(
+            f"指令で値が決まる電源 {commanded} がある。指令を出す制御器（controllers）を渡す"
+        )
     if h is None:
         raise ValueError("スイッチの無い回路では時間刻み h が必要")
     if steps_per_period is not None:
@@ -858,7 +868,9 @@ def _simulate_switched(
     notes: list[str] = []
 
     # --- ゲート信号と時間刻み -------------------------------------------------
-    gate_names = [g.name for g in gates]
+    # ゲート信号の出力。相補のゲートがあるPWMは2つ出す（反転の印つき）
+    gate_names = [name for g in gates for name in g.outputs]
+    gate_source = [(i, j == 1) for i, g in enumerate(gates) for j in range(len(g.outputs))]
     dup = sorted({n for n in gate_names if gate_names.count(n) > 1})
     if dup:
         raise ValueError(f"ゲート信号の名前が重複している: {dup}")
@@ -886,13 +898,18 @@ def _simulate_switched(
     system = build_system(netlist)
     n = len(system.unknowns)
     n_sw, n_dev = system.n_switches, len(system.devices)
-    switch_gate = [gate_names.index(netlist.component(cid).gate) for cid in system.devices[:n_sw]]
+    # 各スイッチを動かすゲート: （PWMの番号、反転するか）
+    switch_gate = [
+        gate_source[gate_names.index(netlist.component(cid).gate)] for cid in system.devices[:n_sw]
+    ]
     _check_result_size(
-        n_steps, n, max_steps, len(system.sources), switched=True, n_gates=len(gates),
+        n_steps, n, max_steps, len(system.sources), switched=True, n_gates=len(gate_names),
         n_commands=sum(len(c.outputs) for c in controllers if isinstance(c, Controller)), n_devices=n_dev,
     )
     u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
     u_mid = 0.5 * (u_start + u_end)
+    source_event = event.copy()                          # 時刻で決まる電源の不連続点（指令によるものを除く）
+    command_event = np.zeros(n_steps + 1, dtype=bool)    # 指令で決まる電源の値が変わった点
 
     # --- 制御器と指令 ---------------------------------------------------------
     cmd_names: list[str] = []
@@ -927,6 +944,17 @@ def _simulate_switched(
             gate_cmd.append(cmd_names.index(g.duty))
         else:
             gate_cmd.append(-1)
+    # 指令で決まる電源: （電源の列、指令の番号、波形）
+    commanded = []
+    for j, cid in enumerate(system.sources):
+        w = netlist.component(cid).waveform
+        if isinstance(w, Command):
+            if w.command not in cmd_names:
+                raise ValueError(
+                    f"{cid}: 電源の値を決める指令 '{w.command}' を出す制御器が無い。"
+                    f"制御器が出す指令: {cmd_names}"
+                )
+            commanded.append((j, cmd_names.index(w.command), w))
 
     def commands(c: Controller, values, t: float, n_out: int) -> np.ndarray:
         """制御器が返した指令を配列にして確かめる。"""
@@ -971,9 +999,19 @@ def _simulate_switched(
                 latched[g] = counts[-1]
             gate_out[k0:k1, g] = pwm.pattern(k, n_div, n_on)
         code = np.zeros(k1 - k0, dtype=np.int64)
-        for j, g in enumerate(switch_gate):
-            code |= gate_out[k0:k1, g].astype(np.int64) << j
+        for j, (g, inverted) in enumerate(switch_gate):
+            on = ~gate_out[k0:k1, g] if inverted else gate_out[k0:k1, g]
+            code |= on.astype(np.int64) << j
         sw_code[k0:k1] = code
+        # 指令で決まる電源は、区間のあいだ一定。前の区間と値が変わったら、その点を電源の不連続点にする
+        for j, c, w in commanded:
+            value = w.value(float(active[c]))
+            if k0 > 0 and value != u_end[k0 - 1, j]:
+                event[k0] = True
+                command_event[k0] = True
+            u_start[k0:k1, j] = value
+            u_end[k0:k1, j] = value
+            u_mid[k0:k1, j] = value
 
     # --- 初期値 ---------------------------------------------------------------
     def next_stop(k: int) -> int:
@@ -1054,8 +1092,8 @@ def _simulate_switched(
 
     # --- 結果 -----------------------------------------------------------------
     signals: dict[str, np.ndarray] = {}
-    for g, name in enumerate(gate_names):
-        signals[f"gate({name})"] = gate_out[:, g].astype(float)
+    for name, (g, inverted) in zip(gate_names, gate_source, strict=True):
+        signals[f"gate({name})"] = (~gate_out[:, g] if inverted else gate_out[:, g]).astype(float)
     for j, name in enumerate(cmd_names):
         signals[f"cmd({name})"] = cmd_out[:, j].copy()
     for j, cid in enumerate(system.devices):
@@ -1063,6 +1101,9 @@ def _simulate_switched(
     sample_state = np.empty(n_steps + 1, dtype=np.int64)
     sample_state[0] = code0
     sample_state[1:] = code_out[:n_steps]
+    # 核は「回路状態が変わる、または電源が不連続」のステップを数える。指令の変化だけによるものを分けて数える
+    state_changed = code_out[:n_steps] != sample_state[:n_steps]
+    only_command = command_event[:n_steps] & ~source_event[:n_steps] & ~state_changed
 
     return Result(
         t=h * np.arange(n_steps + 1),
@@ -1076,7 +1117,8 @@ def _simulate_switched(
         sample_state=sample_state,
         stats={
             "states": table.count,
-            "state_changes": int(ctl[kernel.CTL_CHANGES]),
+            "state_changes": int(ctl[kernel.CTL_CHANGES]) - int(np.count_nonzero(only_command)),
+            "command_changes": int(np.count_nonzero(command_event)),
             "retries": int(ctl[kernel.CTL_RETRIES]),
             "rescues_at_start": int(rescued_at_start),
         },
