@@ -159,7 +159,7 @@
 | `test_e1a_units_limits.py::test_c14_slowly_decaying_oscillation_…` | 「計算時間」→「終了時刻」 | 通る |
 | `test_e1b_extreme_inputs.py::test_huge_load_agrees_with_150_digit_reference`（6 件） | 正規表現の「閉ループの極の半径」→「閉ループ極の絶対値の最大」 | 通る |
 | `test_e1b_near_unit_circle.py::test_radius_shown_as_below_one_…` | 「極の半径」→「閉ループ極の絶対値の最大」 | 通る |
-| `test_e1c_followups.py` の `interruption_notes`（3 件が使う） | 注意を探す言葉「行き場」→「還流経路」 | 1 件は通る。1 件（`…normal_turn_off…`）は元の xfail に戻った |
+| `test_e1c_followups.py` の `interruption_notes`（2 件が使う） | 注意を探す言葉「行き場」→「還流経路」 | 1 件は通る。1 件（`…normal_turn_off…`）は元の xfail に戻った |
 | `test_e1c_recheck.py::test_leakage_through_low_off_resistance_…` | 同じ | 元の xfail に戻った |
 
 - xfail に戻った 2 件は、`--runxfail` で流して、元の理由（製品の軽微な不具合で、遮断の注意が出る）で落ちることを確かめた。印は外していない。
