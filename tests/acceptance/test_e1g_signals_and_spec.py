@@ -187,6 +187,19 @@ def test_buck_result_names_split_into_shown_and_internal_exactly_as_the_tables(
     assert {s.name for s in ex.signals} == set(res.names)
 
 
+def test_a_name_the_template_did_not_declare_is_treated_as_internal():
+    """テンプレートが決め忘れた名前は、内部の信号として扱う（黙って画面に足さない。画面仕様 付録A.4）。"""
+    ex = expand(hp.buck_spec("average", sim={"t_end": 2e-4}))
+    ex.signals = [s for s in ex.signals if s.name not in ("v(sw)", "v(sw_avg)")]
+    res = ex.run()
+    assert set(res.signal_info) == set(res.names)
+    for name in ("v(sw)", "v(sw_avg)"):
+        assert res.signal_info[name].internal and not res.signal_info[name].shown
+        assert name in res.internal_names and name not in res.display_names
+        assert res.unit_of(name) == "V"                           # 単位は、決め忘れても返る
+    assert res.display_names == ["v(out)", "i(L1)", "cmd(duty)", "i(Vleg)"]
+
+
 def test_buck_current_directions_agree_with_the_waveforms():
     sw = expand(hp.buck_spec("switching", sim={"t_end": 3e-3})).run()
     assert sw.signal_info["i(L1)"].positive == ("sw", "out") and sw["i(L1)"][-2000:].mean() > 1.5

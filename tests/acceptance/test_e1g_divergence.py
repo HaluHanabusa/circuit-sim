@@ -113,6 +113,27 @@ def test_reported_point_does_not_depend_on_the_chunking(steps):
     assert err.to_dict() == reference.to_dict()
 
 
+def test_when_several_variables_cross_at_the_same_point_the_first_one_is_named():
+    """同じ格子点で、いくつもの変数が大きさを超えるとき: 知らせるのは、結果の名前の順で最初の変数
+    （basic-design.md 6.7 の決まり。決まっていれば、同じ入力で必ず同じ変数になる）。
+
+    帰還の利得を 1e20 にする。時刻 Tc の測定（vC = 0.63 V）から作った指令は、1 制御周期遅れて 3 つ目の
+    周期（k = 200 から）で使われる。その最初の格子点（k = 201）で、v(in)、v(out)、i(V1) がいっせいに
+    大きさを超える（変わり目の点 k = 200 そのものは、変わる直前の値なので超えない）。
+    """
+    with pytest.raises(DivergenceError) as info:
+        simulate(feedback_rc(), T_END, H, controllers=[hp.Feedback(1e20, period=TC)])
+    p = info.value.params
+    u = 1e20 * 0.1 * G * (1 - math.exp(-TC / TAU))                # 3 つ目の周期の指令（厳密解）
+    v_in, v_out = G * u, G * u * (1 - math.exp(-H / TAU))         # k = 201 の値（v(out) は 1 刻み分の充電）
+    i_scale = G / R
+    v_scale = max(G, i_scale * R, i_scale * T_END / C)
+    assert v_in > FACTOR * v_scale and v_out > FACTOR * v_scale and v_in / R > FACTOR * i_scale
+    assert p["k"] == 201 and p["signal"] == "v(in)"
+    assert p["value"].value == pytest.approx(v_in, rel=1e-3) and p["value"].unit == "V"
+    assert p["limit"].value == pytest.approx(FACTOR * v_scale, rel=1e-12)
+
+
 def test_growth_below_the_limit_is_not_stopped():
     """決めた大きさ（目安の 1e12 倍）に届かない間は止めない（仕様どおり。不安定の判定は E2a の役目。D-074）。
 
