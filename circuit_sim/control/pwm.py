@@ -1,6 +1,6 @@
 """PWMのゲート信号。
 
-切り替えの時刻は時間刻みの格子点に丸める。搬送波の1周期を N ステップに分けたとき、
+切り替えの時刻は時間刻みの格子点に丸める。キャリアの1周期を N ステップに分けたとき、
 オンにするステップ数は整数なので、1周期のデューティの分解能は 1 / N になる。
 丸めの余りは次の周期に持ち越す（既定）。こうすると、数周期の平均では指令どおりのデューティになり、
 閉ループで積分器が隣り合う2つの値を行き来して出力が振れるのを防げる。
@@ -13,16 +13,18 @@ from typing import Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..messages import CodedError, Value
+
 
 class Pwm(BaseModel):
-    """搬送波とデューティ指令を比べて作るゲート信号。
+    """キャリアとデューティ指令を比べて作るゲート信号。
 
     name      : ゲート信号の名前。スイッチ（S）の gate から参照する。
-    frequency : 搬送波の周波数 [Hz]。周期は時間刻みの整数倍にする。
+    frequency : キャリアの周波数 [Hz]。周期は時間刻みの整数倍にする。
     duty      : デューティ指令。固定値（0〜1）、または制御器が出す指令の名前。
-                指令は 0〜1 の外に出たら 0 と 1 で止める。指令は搬送波の周期の頭で取り込み、
+                指令は 0〜1 の外に出たら 0 と 1 で止める。指令はキャリアの周期の先頭で取り込み、
                 その周期のあいだは変えない。
-    carrier   : "sawtooth" = のこぎり波（周期の頭でオン、duty * 周期 が経ったらオフ）、
+    carrier   : "sawtooth" = のこぎり波（周期の先頭でオン、duty * 周期 が経ったらオフ）、
                 "triangle" = 三角波（オンの区間が周期の中央に来る）。
     carry_remainder : 格子点に丸めた余りを次の周期に持ち越す（既定 True）。False にすると、
                 毎周期 round(duty * N) ステップになる。
@@ -45,18 +47,16 @@ class Pwm(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> Pwm:
         if not math.isfinite(self.frequency):
-            raise ValueError(f"{self.name}: frequency は有限値が必要")
+            raise CodedError("PWM_FREQUENCY_NOT_FINITE", name=self.name)
         if self.complement is not None and (not self.complement or self.complement == self.name):
-            raise ValueError(f"{self.name}: complement には、name と違う空でない名前を付ける")
+            raise CodedError("PWM_COMPLEMENT_NAME", name=self.name)
         if self.dead_time != 0.0:
-            raise ValueError(
-                f"{self.name}: デッドタイム（dead_time={self.dead_time}）はまだ扱えない。0 にする"
-            )
+            raise CodedError("PWM_DEAD_TIME", name=self.name, dead_time=Value(self.dead_time, "s"))
         if isinstance(self.duty, str):
             if not self.duty:
-                raise ValueError(f"{self.name}: duty に指令の名前を使うなら空にしない")
+                raise CodedError("PWM_DUTY_NAME_EMPTY", name=self.name)
         elif not (math.isfinite(self.duty) and 0.0 <= self.duty <= 1.0):
-            raise ValueError(f"{self.name}: duty の固定値は 0〜1 にする（現在 {self.duty}）")
+            raise CodedError("PWM_DUTY_RANGE", name=self.name, duty=Value(self.duty))
         return self
 
     def on_counts(
@@ -100,7 +100,7 @@ def gate_pattern(
 ) -> np.ndarray:
     """ステップ番号 k（配列）の区間 [t[k], t[k+1]) でゲートがオンかどうか。n_on は周期ごとに変えてよい。
 
-    のこぎり波: 周期の頭から n_on ステップがオン。
+    のこぎり波: 周期の先頭から n_on ステップがオン。
     三角波    : 周期の中央に置いた n_on ステップがオン（残りが奇数ステップなら半ステップ前に寄る）。
     """
     phase = k % steps_per_period
@@ -109,4 +109,4 @@ def gate_pattern(
     if carrier == "triangle":
         first = (steps_per_period - n_on) // 2
         return (phase >= first) & (phase < first + n_on)
-    raise ValueError(f"未対応の搬送波 '{carrier}'")
+    raise CodedError("CARRIER_UNKNOWN", carrier=str(carrier))

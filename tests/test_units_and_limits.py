@@ -160,7 +160,7 @@ def test_default_timing_keeps_resolution_for_slowly_decaying_oscillation():
     period = 2 * math.pi * math.sqrt(1e-3 * 10e-6)
     assert ex.h == pytest.approx(period / 200, rel=1e-3)
     assert round(ex.t_end / ex.h) == 20_000
-    assert any("計算時間" in note and "短く" in note for note in ex.notes)
+    assert any("終了時刻" in note and "短く" in note for note in ex.notes)
 
 
 def test_too_many_steps_is_rejected_before_allocating():

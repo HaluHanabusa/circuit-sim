@@ -78,10 +78,14 @@ def test_command_source_matches_piecewise_exponential():
     # 指令は reset の値 → 時刻 jT の演算の値が (j+1)T から。つまり周期 j の値は values[j]
     expected = piecewise_exponential(values, GAIN, n)
     assert np.max(np.abs(res["v(out)"] - expected)) <= 1e-4 * GAIN
-    # 電源の値（v(in)）は、区間 [jT, (j+1)T) で GAIN·values[j]（周期の頭の点は変わった後の値）
+    # 電源の値（v(in)）は、区間 (jT, (j+1)T] で GAIN·values[j]。変わり目 jT の点は、変わる直前の値
+    # （スイッチの切り替え点と同じ記録の決まり。D-048。E1g）
     v_in = res["v(in)"]
     for j in range(n):
-        assert np.allclose(v_in[j * STEPS: (j + 1) * STEPS], GAIN * values[j], rtol=0, atol=1e-12 * GAIN)
+        inside = v_in[j * STEPS + 1: (j + 1) * STEPS + 1]
+        assert np.allclose(inside, GAIN * values[j], rtol=0, atol=1e-12 * GAIN)
+        if j > 0 and values[j] != values[j - 1]:
+            assert v_in[j * STEPS] == pytest.approx(GAIN * values[j - 1], abs=1e-12 * GAIN)
 
 
 def test_command_source_check_detects_one_period_shift():
@@ -102,9 +106,10 @@ def test_command_source_measurement_and_delay():
     res = simulate(rc_netlist(), 6 * T_CTRL, T_CTRL / STEPS, controllers=[ctrl])
     v_in = res["v(in)"]
     tol = 1e-12 * GAIN                                        # v(in) は解いた値（電源の値と丸め誤差だけ違う）
-    assert np.allclose(v_in[:STEPS], 0.0, rtol=0, atol=tol)
-    assert np.allclose(v_in[STEPS: 2 * STEPS], GAIN, rtol=0, atol=tol)       # t = 0 の演算の結果が T から
-    assert np.allclose(v_in[2 * STEPS: -1], 0.0, rtol=0, atol=tol)
+    # t = 0 の演算の結果が T から。変わり目の点は変わる直前の値（D-048）
+    assert np.allclose(v_in[:STEPS + 1], 0.0, rtol=0, atol=tol)
+    assert np.allclose(v_in[STEPS + 1: 2 * STEPS + 1], GAIN, rtol=0, atol=tol)
+    assert np.allclose(v_in[2 * STEPS + 1: -1], 0.0, rtol=0, atol=tol)
     assert np.all(res["cmd(d)"][STEPS: 2 * STEPS] == 1.0)
     for j, (t, measured) in enumerate(ctrl.seen):
         assert t == pytest.approx(j * T_CTRL, rel=1e-9, abs=1e-15)
@@ -117,7 +122,9 @@ def test_command_source_clamps_command():
         rc_netlist(lower=0.0, upper=1.0), 3 * T_CTRL, T_CTRL / STEPS, controllers=[Sequence(values)]
     )
     v_in = res["v(in)"]
-    assert np.allclose(v_in[[0, STEPS, 2 * STEPS]], [GAIN, 0.0, 0.5 * GAIN], rtol=0, atol=1e-12 * GAIN)
+    # 区間の中の点で見る（変わり目の点は変わる直前の値。D-048）
+    inside = v_in[[1, STEPS + 1, 2 * STEPS + 1]]
+    assert np.allclose(inside, [GAIN, 0.0, 0.5 * GAIN], rtol=0, atol=1e-12 * GAIN)
     assert res["cmd(d)"][0] == 2.0                             # 指令そのものは止めない（電源の値だけ止める）
 
 
@@ -276,11 +283,12 @@ def test_average_leg_voltage_is_duty_times_vdc_by_value():
     steps = 10
     for j, d in enumerate(duty):
         dc = min(max(d, 0.0), 1.0)
-        source = res["v(sw_avg)"][j * steps: (j + 1) * steps]
-        out = res["v(sw)"][j * steps: (j + 1) * steps]
+        # 区間 (jT, (j+1)T] の点（変わり目の点 jT は、変わる直前の値。D-048）
+        source = res["v(sw_avg)"][j * steps + 1: (j + 1) * steps + 1]
+        out = res["v(sw)"][j * steps + 1: (j + 1) * steps + 1]
         assert np.allclose(source, dc * VIN, rtol=0, atol=1e-12 * VIN), (j, d)
         assert np.allclose(out, dc * VIN * R_TEST / (R_TEST + leg.r_on), rtol=0, atol=1e-12 * VIN), (j, d)
-        current = res.i("Vleg")[j * steps: (j + 1) * steps]
+        current = res.i("Vleg")[j * steps + 1: (j + 1) * steps + 1]
         assert np.allclose(current, -out / R_TEST, rtol=0, atol=1e-12 * VIN / R_TEST)
 
 

@@ -1,7 +1,10 @@
 """仕様JSON（層A）とネットリスト（層B）のスキーマ。
 
-層A (Spec)    : テンプレート名＋パラメータ＋目標値。AIが出力するのはここだけ。
+層A (Spec)    : テンプレート名＋パラメータ（＋設計目標。予約）。AIが出力するのはここだけ。
 層B (Netlist) : 素子と接続の一覧。層Aからコードが展開し、ソルバが読む。
+
+エラーの文は番号と差し込む値で持つ（messages.CodedError）。pydantic の検証の中で出したエラーは
+ValidationError に包まれるが、元のエラーは messages.message_of(エラー) で取り出せる。
 """
 from __future__ import annotations
 
@@ -9,11 +12,16 @@ import math
 from collections import Counter
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+
+from .messages import CodedError, Names, Value
 
 SCHEMA_VERSION = "0.2"
 SUPPORTED_SCHEMA_VERSIONS = ("0.1", "0.2")
-LEGACY_SOURCE = "記載なし"     # 版 0.1 の control の数値を Quantity にしたときの出どころ
+LEGACY_SOURCE = "記載なし"     # 版 0.1 の control の数値を Quantity にしたときの出典
+MANUAL_SOURCE = "手入力"       # 手で入れた値の出典。読むときは manual も同じに扱い、
+#                                書くときは常にこの形（D-040）
+MANUAL_ALIASES = ("manual",)   # 手入力と同じに扱う書き方（大文字と小文字、前後の空白は問わない）
 
 
 # ---------------------------------------------------------------- 層A: 仕様
@@ -22,7 +30,9 @@ class Quantity(BaseModel):
     """設計書から取り出した1つの値。
 
     value が None のときは「設計書に無かった」ことを表す。AIに値を埋めさせない。
-    source は設計書内の位置ラベル（例: "p.3 表2"、"仕様!B4"）。
+    source は出典: 設計書内の位置ラベル（例: "p.3 表2"、"仕様!B4"）、"手入力"、"記載なし" など。
+    "manual" は "手入力" と同じに扱い、読んだ時点で "手入力" にそろえる（書き出すと "手入力"。D-040）。
+    エンジンは出典を計算に使わない（画面が値の出典として見せる）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -31,9 +41,16 @@ class Quantity(BaseModel):
     unit: str
     source: str | None = None
 
+    @field_validator("source")
+    @classmethod
+    def _same_manual(cls, source: str | None) -> str | None:
+        if source is not None and source.strip().lower() in MANUAL_ALIASES:
+            return MANUAL_SOURCE
+        return source
+
 
 class SimulationSettings(BaseModel):
-    """計算時間と刻み、モデルの精度。省略するとテンプレートが決める。
+    """計算時間と刻み、モデルの種類。省略するとテンプレートが決める。
 
     fidelity: "switching"（スイッチングモデル。スイッチを理想スイッチで計算する）、
               "average"（平均モデル。ブリッジのレグを「指令 × 直流電圧」の電源に置き換える）。
@@ -50,8 +67,17 @@ class SimulationSettings(BaseModel):
 class Spec(BaseModel):
     """仕様（層A）。
 
-    版 0.2: control の値も plant と同じ Quantity（値、単位、出どころ）。
-    版 0.1: control の値は単位の無い数値だった。読むときは、数値（と null）を単位 ""、出どころ
+    欄の扱い（E1g の範囲12。D-067 の (10)）:
+      template、plant、control、simulation : 読む。
+      Quantity.source（出典）: 読む（manual を 手入力 にそろえる）。計算には使わない。
+      targets（設計目標）    : 予約。いまは読まない（計算にも判定にも使わない）。形はゲイン最適化の評価
+                               （E2a）で決める。いまの形（名前 → 数値）は、その時に変わりうる。
+      missing（不足の名前）  : 予約。読まない。値が足りないかは、テンプレートが実際の値（欄が無い、または
+                               value が null）から判断する。AI が書いた missing と実際の値が食い違っても、
+                               実際の値に従う（画面も同じ。screens-v0.1.md 4.2）。
+
+    版 0.2: control の値も plant と同じ Quantity（値、単位、出典）。
+    版 0.1: control の値は単位の無い数値だった。読むときは、数値（と null）を単位 ""、出典
             「記載なし」の Quantity にする（legacy_control() で分かる。単位はテンプレートが SI とみなす）。
     版の欄（schema_version）が無いファイルは、中身から決める: control に Quantity の形でない値
             （数値や null）があれば 0.1、無ければ 0.2。version_inferred が True になる
@@ -93,10 +119,7 @@ class Spec(BaseModel):
                 elif isinstance(value, dict | Quantity):
                     converted[name] = value
                 else:
-                    raise ValueError(
-                        f"仕様の版 0.1 の control.{name} は数値でないので読めない（{value!r}）。"
-                        "版 0.2 の形（value、unit、source）で書く"
-                    )
+                    raise CodedError("SPEC_LEGACY_CONTROL_NOT_NUMBER", name=name, value=repr(value))
             data = {**data, "control": converted}
         spec = handler(data)
         spec._version_inferred = inferred
@@ -112,7 +135,7 @@ class Spec(BaseModel):
         return [name for name, q in self.plant.items() if q.value is None]
 
     def legacy_control(self) -> list[str]:
-        """版 0.1 の数値から作った control の項目（単位 ""、出どころ「記載なし」）の名前。"""
+        """版 0.1 の数値から作った control の項目（単位 ""、出典「記載なし」）の名前。"""
         if self.schema_version != "0.1" or not self.control:
             return []
         return [n for n, q in self.control.items() if q.unit == "" and q.source == LEGACY_SOURCE]
@@ -150,7 +173,7 @@ class Sine(BaseModel):
 class Command(BaseModel):
     """制御器の指令で値が決まる電源: 値 = gain × 指令（lower〜upper で止める）。
 
-    指令は制御器の出力の名前（command）。制御周期の頭で変わり、次に変わるまで一定（区分一定）。
+    指令は制御器の出力の名前（command）。制御周期の先頭で変わり、次に変わるまで一定（区分一定）。
     制御器（simulate の controllers）が無いと計算できない。平均モデルでブリッジのレグを置き換えるのに使う
     （指令 = デューティ、gain = 直流電圧、lower = 0、upper = 1）。
     """
@@ -165,9 +188,8 @@ class Command(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> Command:
         if self.lower is not None and self.upper is not None and self.lower > self.upper:
-            raise ValueError(
-                f"指令 '{self.command}': lower（{self.lower}）は upper（{self.upper}）以下にする"
-            )
+            raise CodedError("COMMAND_LIMITS_ORDER", command=self.command, lower=Value(self.lower),
+                             upper=Value(self.upper))
         return self
 
     def value(self, command: float) -> float:
@@ -214,46 +236,43 @@ class Component(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> Component:
         if self.nodes[0] == self.nodes[1]:
-            raise ValueError(f"{self.id}: 両端が同じ節点 '{self.nodes[0]}' につながっている")
+            raise CodedError("COMPONENT_SAME_NODES", id=self.id, node=self.nodes[0])
         if self.type in ("R", "L", "C"):
             if self.value is None or not math.isfinite(self.value) or self.value <= 0:
-                raise ValueError(f"{self.id}: value は正の有限値が必要（現在 {self.value}）")
+                raise CodedError("COMPONENT_VALUE_NOT_POSITIVE", id=self.id, value=str(self.value))
             if self.waveform is not None:
-                raise ValueError(f"{self.id}: {self.type} に waveform は指定できない")
+                raise CodedError("COMPONENT_WAVEFORM_NOT_ALLOWED", id=self.id, type=self.type)
         elif self.type in ("V", "I"):
             if self.waveform is None:
-                raise ValueError(f"{self.id}: 電源には waveform が必要")
+                raise CodedError("SOURCE_WAVEFORM_REQUIRED", id=self.id)
             if self.value is not None:
-                raise ValueError(f"{self.id}: 電源の値は waveform で指定する")
+                raise CodedError("SOURCE_VALUE_NOT_ALLOWED", id=self.id)
         else:
             self._check_switching()
         if self.type not in ("S", "D") and (self.r_on is not None or self.r_off is not None):
-            raise ValueError(f"{self.id}: r_on / r_off を指定できるのは S と D だけ")
+            raise CodedError("R_ON_OFF_NOT_ALLOWED", id=self.id)
         if self.type != "S" and self.gate is not None:
-            raise ValueError(f"{self.id}: gate を指定できるのは S だけ")
+            raise CodedError("GATE_NOT_ALLOWED", id=self.id)
         if self.ic != 0.0 and self.type not in ("L", "C"):
-            raise ValueError(f"{self.id}: ic を指定できるのは L と C だけ")
+            raise CodedError("IC_NOT_ALLOWED", id=self.id)
         return self
 
     def _check_switching(self) -> None:
         """S と D の検証。オン抵抗とオフ抵抗の既定値もここで入れる。"""
         if self.value is not None or self.waveform is not None:
-            raise ValueError(
-                f"{self.id}: {self.type} に value / waveform は指定できない（r_on / r_off を使う）"
-            )
+            raise CodedError("SWITCH_VALUE_NOT_ALLOWED", id=self.id, type=self.type)
         if self.r_on is None:
             self.r_on = DEFAULT_R_ON
         if self.r_off is None:
             self.r_off = DEFAULT_R_OFF
         for name, r in (("r_on", self.r_on), ("r_off", self.r_off)):
             if not math.isfinite(r) or r <= 0:
-                raise ValueError(f"{self.id}: {name} は正の有限値が必要（現在 {r}）")
+                raise CodedError("SWITCH_R_NOT_POSITIVE", id=self.id, name=name, value=str(r))
         if self.r_on >= self.r_off:
-            raise ValueError(
-                f"{self.id}: r_on（{self.r_on}）は r_off（{self.r_off}）より小さくする"
-            )
+            raise CodedError("SWITCH_R_ORDER", id=self.id, r_on=Value(self.r_on, "ohm"),
+                             r_off=Value(self.r_off, "ohm"))
         if self.type == "S" and not self.gate:
-            raise ValueError(f"{self.id}: スイッチにはゲート信号の名前 gate が必要")
+            raise CodedError("SWITCH_GATE_REQUIRED", id=self.id)
 
 
 class Netlist(BaseModel):
@@ -267,14 +286,14 @@ class Netlist(BaseModel):
         ids = Counter(c.id for c in self.components)
         dup = sorted(i for i, n in ids.items() if n > 1)
         if dup:
-            raise ValueError(f"素子IDが重複している: {dup}")
+            raise CodedError("NETLIST_DUPLICATE_IDS", ids=Names(dup))
 
         degree = Counter(n for c in self.components for n in c.nodes)
         if self.ground not in degree:
-            raise ValueError(f"基準節点 '{self.ground}' につながる素子が無い")
+            raise CodedError("NETLIST_NO_GROUND", ground=self.ground)
         dangling = sorted(n for n, d in degree.items() if d < 2 and n != self.ground)
         if dangling:
-            raise ValueError(f"素子が1つしかつながっていない節点がある: {dangling}")
+            raise CodedError("NETLIST_DANGLING", nodes=Names(dangling))
         return self
 
     def nodes(self) -> list[str]:

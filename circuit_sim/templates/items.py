@@ -5,21 +5,44 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ..ir import Quantity, Spec
+from ..messages import CodedError, Message, Names, Value
+from ..signals import SignalInfo, SignalKind
 from ..units import DIMENSION_LABEL, UnitError, parse_unit, to_si
 
 Section = Literal["plant", "control"]
 
 
-class MissingValueError(ValueError):
-    """仕様に値が入っていないパラメータがある。"""
+class MissingValueError(CodedError):
+    """仕様に値が入っていないパラメータがある（番号 MISSING_VALUES）。
 
-    def __init__(self, names: list[str]):
-        self.names = names
-        super().__init__(f"値が入っていないパラメータ: {names}")
+    names : 足りない名前（必須の項目と、組で入れる項目の足りない側）
+    pairs : 組で入れる項目の足りない側 → 入っている相手（画面のお知らせ N-MISSING-PAIR に使う）
+    """
+
+    def __init__(self, names: list[str], pairs: dict[str, str] | None = None):
+        self.names = list(names)
+        self.pairs = dict(pairs or {})
+        super().__init__("MISSING_VALUES", names=Names(self.names), pairs=dict(self.pairs))
+
+
+def units_error(problems: list[tuple[str, str, str, bool, UnitError]]) -> UnitError:
+    """読めない単位、次元の違う単位の項目をまとめたエラー（番号 UNITS_*）。
+
+    problems: （項目、書かれた単位、項目の SI 単位、読めないか、to_si の UnitError）の並び。
+    """
+    kinds = {unreadable for _, _, _, unreadable, _ in problems}
+    code = {frozenset({True}): "UNITS_UNREADABLE", frozenset({False}): "UNITS_WRONG_DIMENSION"}.get(
+        frozenset(kinds), "UNITS_UNREADABLE_OR_WRONG")
+    items = [
+        Message("UNIT_PROBLEM", key=key, problem=exc.message, written=written, unit=unit,
+                unreadable=unreadable)
+        for key, written, unit, unreadable, exc in problems
+    ]
+    return UnitError(code, problems=items)
 
 
 @dataclass(frozen=True)
@@ -30,7 +53,7 @@ class Item:
     section   : "plant" か "control"
     dimension : 次元（units.py の DIMENSION_LABEL の鍵）
     required  : 必須なら True。省略できるなら False
-    together  : この項目があるときに一緒に要る項目（段差の大きさと時刻など）
+    together  : この項目があるときに一緒に要る項目（ステップの大きさと時刻など）
     element   : 図の素子（無ければ None）
     """
 
@@ -46,45 +69,48 @@ class Item:
         return DIMENSION_LABEL[self.dimension][1]
 
 
-SignalKind = Literal["node_voltage", "element_current", "command", "gate"]
+@dataclass(frozen=True)
+class FixedValue:
+    """仕様の項目でなく、テンプレートが決める値（画面の回路図とツールチップに出す。画面仕様 14章の未決18）。
+
+    key      : 値の名前（"r_on"）
+    value    : 値（SI）
+    unit     : 単位の記号（"ohm" など。Item.si_unit と同じ書き方）
+    elements : その値を持つ図の素子（"S1"、"S2"、"Rleg"）
+    """
+
+    key: str
+    value: float
+    unit: str
+    elements: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
-class SignalInfo:
-    """表示する信号の、構造化した情報。文言は持たない
-    （説明は画面の辞書の signal.<テンプレート>.<名前>.desc）。
+class Display:
+    """テンプレートの表示定義のうち、エンジンの側が決めるもの（画面仕様 付録A.1、12章の D2）。
 
-    name    : Result から取り出す名前（"v(out)"、"i(L1)"、"cmd(duty)"、"gate(q1)"）
-    unit    : 単位の記号（無次元は ""）
-    shown   : 既定で表示するか
-    kind    : "node_voltage"（節点の電圧。基準は節点 0）、"element_current"（素子の電流）、
-              "command"（制御器の指令）、"gate"（PWMのゲート信号。1 = オン）
-    node    : node_voltage の節点
-    element : element_current の素子ID。gate では、そのゲートが動かすスイッチの素子ID
-    positive: element_current の正の向き（素子の中を、1つ目の節点から2つ目の節点へ。素子の nodes と同じ順）
-    command : command の指令の名前
-    gate    : gate のゲート信号の名前
+    文言（表示名、項目と信号の説明）と図の配置は画面の側が持つ。
+    items     : 項目（仕様パネルの行。降圧コンバータだけ。ほかのテンプレートは空）
+    fidelities: 選べるモデルの種類（スイッチの無いテンプレートでは空）。default_fidelity はその既定
+    signals   : モデルの種類ごとの表示する信号（付録A の信号の表の順）。モデルを選べないテンプレートは鍵 None
+    values    : 仕様の値によらない、テンプレートが決める値（降圧コンバータのオン抵抗 r_on）
     """
 
-    name: str
-    unit: str
-    shown: bool
-    kind: SignalKind
-    node: str | None = None
-    element: str | None = None
-    positive: tuple[str, str] | None = None
-    command: str | None = None
-    gate: str | None = None
+    template: str
+    items: tuple[Item, ...] = ()
+    fidelities: tuple[str, ...] = ()
+    default_fidelity: str | None = None
+    signals: dict[str | None, tuple[SignalInfo, ...]] = field(default_factory=dict)
+    values: tuple[FixedValue, ...] = ()
 
-    def __post_init__(self) -> None:
-        expected = {
-            "node_voltage": f"v({self.node})" if self.node else None,
-            "element_current": f"i({self.element})" if self.element and self.positive else None,
-            "command": f"cmd({self.command})" if self.command else None,
-            "gate": f"gate({self.gate})" if self.gate and self.element else None,
-        }.get(self.kind)
-        if expected is None or expected != self.name:
-            raise ValueError(f"信号 {self.name}: 種類 {self.kind} に要る欄が無いか、名前と合わない")
+    def value(self, key: str) -> FixedValue:
+        for v in self.values:
+            if v.key == key:
+                return v
+        raise KeyError(key)
+
+
+__all__ = ["Display", "FixedValue", "Item", "MissingValueError", "SignalInfo", "SignalKind", "read_items"]
 
 
 def _readable(unit: str) -> bool:
@@ -101,61 +127,59 @@ def _quantity(spec: Spec, item: Item) -> Quantity | None:
     return None if q is None or q.value is None else q
 
 
-def read_items(spec: Spec, items: tuple[Item, ...], notes: list[str]) -> dict[str, float]:
+def read_items(spec: Spec, items: tuple[Item, ...], notes: list[Message]) -> dict[str, float]:
     """項目の値を SI単位で取り出す。省略された省略できる項目は、結果に入れない。
 
     足りない値（必須の項目、または一緒に要る項目）は、まとめて MissingValueError にする。
     単位が読めない、または次元が違う項目は、まとめて UnitError にする。
-    版 0.1 の control の数値（単位 ""、出どころ「記載なし」）は、項目の SI単位の値とみなし、注意に書く。
+    版 0.1 の control の数値（単位 ""、出典「記載なし」）は、項目の SI単位の値とみなし、注意に書く。
     """
     present = {it.key for it in items if _quantity(spec, it) is not None}
     missing = [it.key for it in items if it.required and it.key not in present]
+    pairs: dict[str, str] = {}
     for it in items:
         if it.key in present:
-            missing += [k for k in it.together if k not in present and k not in missing]
+            for k in it.together:
+                if k not in present and k not in missing:
+                    missing.append(k)
+                    pairs[k] = it.key
     if missing:
-        raise MissingValueError(missing)
+        raise MissingValueError(missing, pairs)
 
     legacy = set(spec.legacy_control())
     values: dict[str, float] = {}
-    wrong, kinds, legacy_used = [], set(), []
+    problems, legacy_used = [], []
     for it in items:
         if it.key not in present:
             continue
         q = _quantity(spec, it)
         if it.section == "control" and it.key in legacy:
             values[it.key] = float(q.value)
-            legacy_used.append(f"{it.key} [{it.si_unit}]")
+            legacy_used.append((it.key, it.si_unit))
             continue
         try:
             values[it.key] = to_si(float(q.value), q.unit, it.dimension)
         except UnitError as exc:
-            wrong.append(f"{it.key}: {exc}")
-            kinds.add("読めない" if not _readable(q.unit) else "量の種類が違う")
+            problems.append((it.key, q.unit, it.si_unit, not _readable(q.unit), exc))
             continue
         if values[it.key] != q.value:
             # 無次元の量は単位の記号を付けない（「0.9 1」と書かない）
-            si = "" if it.dimension == "ratio" else f" {it.si_unit}"
-            notes.append(f"{it.key}: {q.value:g} {q.unit.strip()} を {values[it.key]:g}{si} に換算した")
-    if wrong:
-        heading = {
-            frozenset({"読めない"}): "単位を読めない項目がある。",
-            frozenset({"量の種類が違う"}): "単位の量の種類が違う項目がある。",
-        }.get(frozenset(kinds), "単位を読めない、または量の種類が違う項目がある。")
-        raise UnitError(heading + "。".join(wrong))
+            written = Value(q.value, q.unit.strip())
+            if it.dimension == "ratio":
+                notes.append(Message("UNIT_CONVERTED_RATIO", key=it.key, value=written,
+                                     si=Value(values[it.key])))
+            else:
+                notes.append(Message("UNIT_CONVERTED", key=it.key, value=written,
+                                     si=Value(values[it.key], it.si_unit)))
+    if problems:
+        raise units_error(problems)
     if legacy_used:
-        why = (
-            "仕様に版（schema_version）が無く、control の値が単位の無い数値なので、版 0.1 として読んだ。"
-            if spec.version_inferred else "仕様の版 0.1 の形なので、"
-        )
-        notes.append(
-            f"{why}control の数値を SI単位の値とみなした（出どころは「記載なし」）: "
-            f"{'、'.join(legacy_used)}。"
-            "単位と出どころを確かめて、版 0.2 の形（value、unit、source）で書き直す"
-        )
+        code = "SPEC_LEGACY_CONTROL_INFERRED" if spec.version_inferred else "SPEC_LEGACY_CONTROL"
+        notes.append(Message(code, items=Names(f"{k} [{u}]" for k, u in legacy_used),
+                             keys=Names(k for k, _ in legacy_used)))
     known = {(it.section, it.key) for it in items}
     unused = [f"plant.{k}" for k in spec.plant if ("plant", k) not in known]
     unused += [f"control.{k}" for k in (spec.control or {}) if ("control", k) not in known]
     if unused:
-        notes.append(f"このテンプレートが使わない項目を無視した: {'、'.join(unused)}")
+        notes.append(Message("UNUSED_ITEMS", items=Names(unused)))
     return values

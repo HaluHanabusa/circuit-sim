@@ -16,8 +16,7 @@
 
 | 対象 | 版 | 文中の書き方 |
 |---|---|---|
-| main | コミット `eca0fbd`（2026-11-16）。読み合わせで `a558ffe` に照らした（その間の変更は文書だけで、コードは同じ） | **実装済み** |
-| ブランチ E1b（降圧コンバータ、離散 PID、初期ゲインの設計、層A の版 0.2） | コミット `20c561d`（読み合わせの時点の先頭 `4955738` もコードは同じ）。5回目の独立検証が不合格（重大1件。初期ゲインの設計で、Vin が大きいときの「安定」の判定）で、修正の最中（D-062）。7.2 の判定と引数の範囲は変わりうる | **統合前（E1b）** |
+| main | コミット `4447f5a`（2026-11-16。E1b（降圧コンバータ、離散 PID、初期ゲインの設計、層A の版 0.2）の統合）。S1 の初版は `eca0fbd` で書き、E1b はブランチのコミット `20c561d` で書いた。E1b の統合で「統合前（E1b）」と書いた節を「実装済み」に直した（E1g の範囲15。D-060）。E1g（エンジンとアプリの口）で変えた節は、E1g のブランチのコードで書き、「実装済み」と書いた（E1g の統合で main に入る） | **実装済み** |
 | ブランチ A0（アプリの骨組み） | コミット `35c8aea` と、作業ツリーの未コミットの変更（2026-11-16 時点。`cli.py`、`config.py`、`server.py`、画面のソース）で書いた。読み合わせで、その変更を入れたコミット `56c95fc`（D-061）に照らした | **統合前（A0）** |
 | 仕様だけがあるもの（`docs/plan/`） | — | **予定（作業単位の ID）** |
 | 確かめられなかったこと | — | **未確認** |
@@ -148,20 +147,20 @@
 
 | # | 機能ブロック | 役割 | 入力 → 出力 | 実装の場所 | 状態 |
 |---|---|---|---|---|---|
-| B01 | 仕様の読み込み | 仕様 JSON を層A として検証する | JSON → `Spec` | `ir.py` | 実装済み（版 0.1）。版 0.2 は統合前（E1b） |
-| B02 | 単位の読み取り | 単位を読み、SI に換算する。次元の違いと読めない単位はエラー | 値と単位 → SI の値 | `units.py` | 実装済み。制御の単位は統合前（E1b） |
-| B03 | テンプレートの展開 | 層A を層B と計算の設定に展開する | `Spec` → `Expanded` | `templates/` | `rc_lowpass`、`rlc_series` は実装済み。`buck_voltage_mode` は統合前（E1b） |
+| B01 | 仕様の読み込み | 仕様 JSON を層A として検証する | JSON → `Spec` | `ir.py` | 実装済み（版 0.1 と 0.2） |
+| B02 | 単位の読み取り | 単位を読み、SI に換算する。次元の違いと読めない単位はエラー | 値と単位 → SI の値 | `units.py` | 実装済み（制御の単位を含む） |
+| B03 | テンプレートの展開 | 層A を層B と計算の設定に展開する | `Spec` → `Expanded` | `templates/` | 実装済み（`rc_lowpass`、`rlc_series`、`buck_voltage_mode`） |
 | B04 | 回路方程式の組み立て | 修正節点解析で `E x' + G x = B u` を作る | `Netlist` → `System` | `mna.py` | 実装済み |
 | B05 | 時間応答の計算（スイッチなし） | 台形則の固定刻みで進める | `Netlist`、`t_end`、`h` → `Result` | `simulate.py`、`kernel.run` | 実装済み |
 | B06 | スイッチング回路の計算 | スイッチとダイオード、スイッチング状態ごとの行列の使い回し | 上に加えてゲート信号と制御器 → `Result` | `simulate.py`、`kernel.run_switched` | 実装済み |
-| B07 | PWM | キャリアとデューティ指令からゲート信号を作る | デューティ → ゲート信号 | `control/pwm.py` | 実装済み。相補のゲートは統合前（E1b） |
+| B07 | PWM | キャリアとデューティ指令からゲート信号を作る | デューティ → ゲート信号 | `control/pwm.py` | 実装済み（相補のゲートを含む） |
 | B08 | 制御器の口 | 離散時間の制御器を制御周期ごとに呼ぶ | 検出値 → 指令 | `control/interface.py`、`simulate.py` | 実装済み |
-| B09 | 制御ブロック | 離散 PID、リミッタ、時刻で決まる値 | 偏差 → 操作量 | `control/blocks.py`、`controllers.py`、`schedule.py` | 統合前（E1b） |
-| B10 | 従属電圧源（指令で値が決まる電源） | 値 = ゲイン × 指令 の電源（状態平均化モデルに使う） | 指令 → 電源の値 | `ir.Command`、`simulate.py` | 統合前（E1b） |
-| B11 | レグ部品とモデルの切り替え | 上下のスイッチを1つの部品として、モデルを選んで展開する | `fidelity` → 素子と PWM | `templates/legs.py` | 統合前（E1b） |
-| B12 | 注意とエラー | 刻みが粗い、値の不足、解けない回路などを知らせる | — → `notes`、例外 | `simulate.py`、`templates/` | 実装済み（日本語の文）。番号つきは予定（E1g） |
-| B13 | 結果と書き出し | 波形を名前で取り出す、CSV に書く | `Result` → 配列、CSV | `simulate.Result` | 実装済み。単位つきの見出しは予定（E1g） |
-| B14 | 初期ゲインの設計 | 解析式で PID の初期値を決め、位相余裕と安定を確かめる | 回路の値 → `PidGains` | `tuning/initial.py` | 統合前（E1b） |
+| B09 | 制御ブロック | 離散 PID、リミッタ、時刻で決まる値 | 偏差 → 操作量 | `control/blocks.py`、`controllers.py`、`schedule.py` | 実装済み |
+| B10 | 従属電圧源（指令で値が決まる電源） | 値 = ゲイン × 指令 の電源（状態平均化モデルに使う） | 指令 → 電源の値 | `ir.Command`、`simulate.py` | 実装済み |
+| B11 | レグ部品とモデルの切り替え | 上下のスイッチを1つの部品として、モデルを選んで展開する | `fidelity` → 素子と PWM | `templates/legs.py` | 実装済み |
+| B12 | 注意とエラー | 刻みが粗い、値の不足、解けない回路、発散などを、番号と差し込む値で知らせる（文面は日英の辞書） | — → `notes`、例外 | `messages.py`、`simulate.py`、`templates/` | 実装済み（E1g） |
+| B13 | 結果と書き出し | 波形を名前で取り出す、信号の情報（単位、正の向き、表示か内部か）、CSV に書く | `Result` → 配列、CSV | `simulate.Result`、`signals.py` | 実装済み（単位つきの見出しと注意の行は E1g） |
+| B14 | 初期ゲインの設計 | 解析式で PID の初期値を決め、位相余裕と安定を確かめる | 回路の値 → `PidGains` | `tuning/initial.py` | 実装済み |
 | B15 | ゲイン最適化 | 設計目標を満たすゲインを探す。未達はそう返す | 仕様と設計目標 → ゲインと達成状況 | `tuning/` | 予定（E2。E1f と E1h が前提） |
 | B16 | 計算のコマンドライン | 仕様 JSON から計算し、要約と CSV を出す | ファイル → 表示、CSV | `__main__.py` | 実装済み |
 | B17 | 起動コマンド | サーバーを起動し、ブラウザを開く。止め方 | 引数 → プロセス | `app/cli.py` | 統合前（A0） |
@@ -184,20 +183,22 @@
 | モジュール | 責務 | 公開する主なもの | 状態 |
 |---|---|---|---|
 | `__init__.py`、`__main__.py` | 公開する名前をまとめる。計算のコマンドライン | `main` | 実装済み |
-| `ir.py` | 層A と層B の形と、形だけで分かる検証（素子の値が正、節点の重複、基準節点） | `Spec`、`Quantity`、`SimulationSettings`、`Netlist`、`Component`、`DC`、`Step`、`Sine`、`SCHEMA_VERSION` | 実装済み。`Command`、`SUPPORTED_SCHEMA_VERSIONS` は統合前（E1b） |
+| `ir.py` | 層A と層B の形と、形だけで分かる検証（素子の値が正、節点の重複、基準節点） | `Spec`、`Quantity`、`SimulationSettings`、`Netlist`、`Component`、`DC`、`Step`、`Sine`、`SCHEMA_VERSION`、`Command`、`SUPPORTED_SCHEMA_VERSIONS` | 実装済み |
 | `units.py` | 単位の文字列を（次元、10 の指数）に分け、SI に換算する | `parse_unit`、`to_si`、`UnitError` | 実装済み |
 | `mna.py` | 行列の組み立て。スイッチング状態ごとのコンダクタンス | `build_system`、`System`、`state_conductance`、`CircuitError` | 実装済み |
 | `kernel.py` | 行列の用意と時間ステップ。最内ループは配列と数値だけ | `prepare`、`consistent_maps`、`natural_rates`、`run`、`run_switched` | 実装済み |
-| `simulate.py` | 入口、電源の配列化、スイッチング状態の表、制御器の呼び出し、注意、上限 | `simulate`、`Result`、`StepLimitError` | 実装済み |
+| `simulate.py` | 入口、電源の配列化、スイッチング状態の表、制御器の呼び出し、注意、上限、区切り（進み具合、中断、発散の確かめ） | `simulate`、`Result`、`StepLimitError`、`DivergenceError`、`render_note_line` | 実装済み |
+| `messages.py` | 注意とエラーの番号と差し込む値、文面の辞書（日英）、画面のお知らせとの対応表 | `Message`、`CodedError`、`SimulationCancelled`、`Value`、`Names`、`MESSAGES`、`SCREEN_NOTICES`、`message_of` | 実装済み（E1g） |
+| `signals.py` | 結果の信号の情報（単位、種類、正の向き、内部の印） | `SignalInfo`、`describe_signals`、`merge_signal_info` | 実装済み（E1g） |
 | `control/interface.py` | 制御器の口（`period`、`inputs`、`outputs`、`reset()`、`step()`） | `Controller` | 実装済み |
 | `control/pwm.py` | ゲート信号。デューティの丸めと余りの持ち越し | `Pwm`、`gate_pattern`、`on_steps` | 実装済み |
-| `control/blocks.py` ほか | 離散 PID、リミッタ、時刻で決まる値、口に合わせた制御器 | `Pid`、`Limiter`、`PidController`、`Schedule`、`ScheduleController` | 統合前（E1b） |
-| `templates/__init__.py` | テンプレートの登録簿 | `TEMPLATES`、`expand`。`TEMPLATE_ITEMS` は統合前（E1b） | 実装済み |
+| `control/blocks.py` ほか | 離散 PID、リミッタ、時刻で決まる値、口に合わせた制御器 | `Pid`、`Limiter`、`PidController`、`Schedule`、`ScheduleController` | 実装済み |
+| `templates/__init__.py` | テンプレートの登録簿 | `TEMPLATES`、`expand`、`TEMPLATE_ITEMS`、`TEMPLATE_DISPLAY`（表示定義のうちエンジンが決めるもの） | 実装済み |
 | `templates/t0.py` | 基礎回路の展開。既定の終了時刻と時間刻み | `rc_lowpass`、`rlc_series`、`Expanded`、`MissingValueError` | 実装済み |
-| `templates/items.py` | 項目と信号の定義、値の読み取り | `Item`、`SignalInfo`、`read_items` | 統合前（E1b） |
-| `templates/legs.py` | レグ部品 | `HalfBridgeLeg` | 統合前（E1b） |
-| `templates/buck.py` | 降圧コンバータ（同期整流、電圧モード PID） | `buck_voltage_mode`、`ITEMS`、`SWITCHING_SIGNALS`、`AVERAGE_SIGNALS` | 統合前（E1b） |
-| `tuning/initial.py` | 初期ゲインの設計と、その確かめ | `buck_voltage_mode_pid`、`PidGains`、`GainDesignError`、`loop_response`、`closed_loop_pole_radius` | 統合前（E1b） |
+| `templates/items.py` | 項目と信号の定義、値の読み取り | `Item`、`SignalInfo`（`signals.py` から）、`Display`、`FixedValue`、`read_items` | 実装済み |
+| `templates/legs.py` | レグ部品 | `HalfBridgeLeg` | 実装済み |
+| `templates/buck.py` | 降圧コンバータ（同期整流、電圧モード PID） | `buck_voltage_mode`、`ITEMS`、`SWITCHING_SIGNALS`、`AVERAGE_SIGNALS` | 実装済み |
+| `tuning/initial.py` | 初期ゲインの設計と、その確かめ | `buck_voltage_mode_pid`、`PidGains`、`GainDesignError`、`loop_response`、`closed_loop_pole_radius` | 実装済み |
 | `app/cli.py` | 起動、ポート、ブラウザ、止め方、端末の文言（日英） | `main` | 統合前（A0） |
 | `app/server.py` | API、画面のファイル、要求の確かめ、起動コード | `create_app`、`Launches`、`Workspace` | 統合前（A0） |
 | `app/config.py` | 設定の場所、合言葉、画面の好み、権限 | `config_dir`、`load_token`、`Settings`、`PREFS` | 統合前（A0） |
@@ -206,12 +207,14 @@
 
 ```
 app ──► templates（TEMPLATES）、ir（Spec）                          統合前（A0）
-templates ──► units、ir。統合前（E1b）で simulate（Expanded.run()）と control（制御ブロック）が加わる
-tuning（initial）──► numpy と scipy だけ（エンジンを呼ばない）        統合前（E1b）
-simulate ──► kernel、mna、ir、control（Controller と Pwm の型）
-kernel ──► mna（CircuitError だけ）
-mna ──► ir
-units、ir ──► ほかのモジュールに依存しない
+templates ──► units、ir、simulate（Expanded.run()）、control（制御ブロック）
+tuning（initial）──► numpy と scipy だけ（エンジンを呼ばない）
+simulate ──► kernel、mna、ir、control（Controller と Pwm の型）、messages、signals
+kernel ──► mna（CircuitError だけ）、messages
+mna ──► ir、messages
+signals ──► ir、messages
+units、ir ──► messages
+messages ──► ほかのモジュールに依存しない
 ```
 
 守る決まり。
@@ -220,7 +223,7 @@ units、ir ──► ほかのモジュールに依存しない
 2. **核（`kernel.py`）の最内ループは配列と数値だけ**（決まり2）。回路の解釈、制御器の呼び出し、指令の考え方は核の外に置く。核が外に戻るのは、用意していないスイッチング状態に出会ったとき、ダイオードの導通が決まらないとき、制御器を呼ぶ区切り（と計算の終わり）だけ。
 3. **単位は層A を読む側だけが扱う**（D-018）。エンジンは SI の値だけを受け取る。
 4. **AI はエンジンを呼ばない。AI が出力するのは層A だけ**（決まり1、3）。予定（I2）。
-5. **文言はエンジンに持たせない**（決まり8）。信号の説明や項目の名前は画面の辞書が持つ。いまの注意とエラーは日本語の文で、番号への置き換えは予定（E1g）。
+5. **文言はエンジンに持たせない**（決まり8）。信号の説明や項目の名前は画面の辞書が持つ。注意とエラーは番号と差し込む値で返す（10章）。コマンドラインの表示と画面の「詳細」に使う文面だけを、`messages.py` の辞書（日英）が持つ。
 6. **判定はエンジンが行い、画面とサーバーが同じ判定を別に持たない**（単位の換算、範囲、ステップ数の上限、刻みの粗さ。`screens-v0.1.md` 12章）。
 
 ## 5. データ設計
@@ -229,16 +232,16 @@ units、ir ──► ほかのモジュールに依存しない
 
 AI と人が書く層。テンプレート名、パラメータ、設計目標を持つ。知らない欄はエラーにする（`extra="forbid"`）。
 
-| 欄 | 型 | 中身 | 版 0.1（実装済み） | 版 0.2（統合前（E1b）） |
+| 欄 | 型 | 中身 | 版 0.1 | 版 0.2 |
 |---|---|---|---|---|
 | `schema_version` | 文字列 | 仕様の版 | `"0.1"` だけ | `"0.1"` と `"0.2"`。省くと中身から決める |
 | `template` | 文字列 | テンプレート名 | `rc_lowpass`、`rlc_series` | 加えて `buck_voltage_mode` |
 | `plant` | 名前 → `Quantity` | 回路の値 | 同じ | 同じ |
 | `control` | 名前 → 値 | 制御の値 | 型を決めていない（任意の値） | 名前 → `Quantity` |
-| `targets` | 名前 → 数値 | 設計目標 | 欄だけある。読むコードは無い。扱いは E1g で決める（範囲12）。使うのは予定（E2） | 同じ |
+| `targets` | 名前 → 数値 | 設計目標 | **予約**。読まない（計算にも判定にも使わない。中身があっても結果は変わらず、注意も出さない）。形はゲイン最適化の評価（E2a）で決める（D-067 の (10)） | 同じ |
 | `simulation.t_end`、`simulation.h` | 正の数値、または省略 | 終了時刻と時間刻み。省くとテンプレートが決める | 同じ | 同じ |
 | `simulation.fidelity` | `"switching"`、`"average"`、または省略 | モデル。省くとテンプレートの既定 | 欄が無い | あり |
-| `missing` | 文字列の並び | 足りない値の名前 | 欄だけある。読むコードは無い。扱いは E1g で決める（範囲12） | 同じ |
+| `missing` | 文字列の並び | 足りない値の名前 | **予約**。読まない。不足は実際の値から判断する（下の「不足の扱い」） | 同じ |
 
 `Quantity` は1つの値。
 
@@ -246,11 +249,13 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 |---|---|---|
 | `value` | 数値または `null` | `null` は「設計書に無かった」。推測で埋めない（決まり4）。無限大と NaN は受け付けない |
 | `unit` | 文字列（必須） | 5.6。値が `null` でも要る |
-| `source` | 文字列または `null` | 出典（いまの画面とコードの表記: 出どころ）。設計書の位置（`p.3 表2`）、`手入力` など。いまのコードは中身を解釈しない。`手入力` と `manual` を同じに扱う処理は予定（E1g。D-040） |
+| `source` | 文字列または `null` | 出典（いまの画面の表記: 出どころ）。設計書の位置（`p.3 表2`）、`手入力`、`記載なし` など。読む: `manual`（大文字と小文字、前後の空白は問わない）は `手入力` と同じに扱い、読んだ時点で `手入力` にそろえる（書き出すと `手入力`。D-040。`ir.Quantity`）。ほかの書き方はそのまま持つ。計算には使わない（画面が値の出典として見せる） |
 
-**不足の扱い。** 足りない値は、テンプレートが実際の値から判断する。必須の項目が無い、または `null` なら、足りない名前をまとめて `MissingValueError` にする。`missing` の欄には頼らない（画面も実際の値から判断する。`screens-v0.1.md` 4.2）。
+**不足の扱い。** 足りない値は、テンプレートが実際の値から判断する。必須の項目が無い、または `null` なら、足りない名前をまとめて `MissingValueError`（番号 `MISSING_VALUES`。組で入れる項目の足りない側は `pairs` に相手の名前）にする。`missing` の欄には頼らない（予約。AI が書いた `missing` と実際の値が食い違っても、実際の値に従う。画面も実際の値から判断する。`screens-v0.1.md` 4.2）。
 
-**版の互換（D-039、D-046）。統合前（E1b）。**
+**欄の扱いの決め（E1g の範囲12）。** 読む欄は `template`、`plant`、`control`、`simulation` と `Quantity` の `value`・`unit`・`source`。予約の欄は `targets` と `missing`（どちらも読まない。`ir.Spec` の説明に同じことを書いてある）。試験は `tests/test_e1g_signals.py`（`targets` と `missing` に中身があっても結果と注意が同じ、`manual` と `手入力` が同じ結果で、書き出すと `手入力`）。
+
+**版の互換（D-039、D-046）。**
 
 - 読める版は `SUPPORTED_SCHEMA_VERSIONS`（`("0.1", "0.2")`）。新しく書く版は `SCHEMA_VERSION`（`"0.2"`）。サーバーは、版の一覧を呼ぶたびに読む（A0 は、この名前が無ければ `SCHEMA_VERSION` だけを読める版とする）。
 - 版 0.1 の `control` の数値は、単位 `""`、出典 `記載なし` の `Quantity` にして読む。値は項目の SI 単位（接頭語なし。V、Hz、無次元）とみなし、注意を出す。
@@ -275,7 +280,7 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 | `dc` | 一定値 | 実装済み |
 | `step` | `t_step` で `initial` から `final` へ。時刻は時間刻みの格子に丸める | 実装済み |
 | `sine` | `offset + amplitude·sin(2π·frequency·t + phase)` | 実装済み |
-| `command` | 従属電圧源（指令で値が決まる電源）。値 = `gain` × 指令（`lower`〜`upper` で止める）。制御周期の先頭で変わり、次まで一定 | 統合前（E1b） |
+| `command` | 従属電圧源（指令で値が決まる電源）。値 = `gain` × 指令（`lower`〜`upper` で止める）。制御周期の先頭で変わり、次まで一定 | 実装済み |
 
 形の検証（`ir.py`）: 素子 ID の重複、両端が同じ節点、基準節点につながる素子が無い、素子が1つしかつながらない節点、`r_on ≥ r_off`、ゲートの無いスイッチ。回路として解けるかどうかは、計算の前に 6.2 の整合の計算で確かめる。スイッチとダイオードは合わせて 62 個まで（`mna.MAX_DEVICES`）。
 
@@ -286,8 +291,8 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 | 欄 | 中身 | 状態 |
 |---|---|---|
 | `netlist`、`t_end`、`h`、`probes`、`notes` | 層B、終了時刻、時間刻み、要約と CSV に出す信号の名前、展開で出た注意（単位の換算、既定の刻みの調整、省いた項目の扱いなど） | 実装済み |
-| `gates`、`controllers`、`fidelity`、`run()` | 計算に渡す PWM と制御器、使ったモデル。`run()` はそれらを `simulate()` に渡して計算する | 統合前（E1b） |
-| `signals` | 表示する信号の情報（`SignalInfo`: 名前、単位、既定で表示するか、種類、節点・素子・正の向き） | 統合前（E1b）。全部の回路に広げるのは予定（E1g） |
+| `gates`、`controllers`、`fidelity`、`run()` | 計算に渡す PWM と制御器、使ったモデル。`run(**kwargs)` はそれらを `simulate()` に渡して計算し、結果の `notes` の先頭に展開の注意を入れ、`signal_info` に表示する信号と内部の信号の区別を重ねる（`progress`、`cancel` などはそのまま `simulate()` に渡す） | 実装済み（注意と区別を結果に入れるのは E1g） |
+| `signals` | 結果の信号の情報（`SignalInfo`: 名前、単位、既定で表示するか、種類、節点・素子・正の向き、内部の印 `internal`）。表示する信号（画面仕様 付録A の信号の表の順）と、画面に出さない内部の信号の両方を、結果の名前に漏れなく並べる。すべてのテンプレート（`rc_lowpass`、`rlc_series`、`buck_voltage_mode`） | 実装済み（全部の回路と内部の印は E1g） |
 
 ### 5.4 結果（`Result`）
 
@@ -296,8 +301,9 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 | `t` | 時刻（ステップ数 + 1 点。等間隔） |
 | `x`、`unknowns` | 回路の変数の波形と名前。節点電圧と、電圧源・インダクタの枝電流 |
 | `signals` | 区間ごとの信号。スイッチを含む計算で入る |
-| `notes` | 計算からの注意（日本語の文の並び） |
-| `stats` | 統計。`states`（用意したスイッチング状態の数）、`state_changes`（不連続点として扱ったステップ）、`retries`（捨てた試行）、`rescues_at_start`（D-035）。統合前（E1b）で `command_changes` が加わる |
+| `notes` | 注意の並び。1つずつが `Message`（番号 `code`、差し込む値 `params`、`text(lang)`、`to_dict()`。`str` の一種で、文字列としての中身は日本語の文面）。`Expanded.run()` の結果では、展開の注意が先頭に入る |
+| `signal_info`、`display_names`、`internal_names` | 名前ごとの信号の情報（`SignalInfo`）。`names` のすべてを漏れなく持つ。`simulate()` は回路から分かる情報（単位: 電圧 V、電流 A、指令・ゲート・導通は無次元 `""`。電流の正の向き: 素子の `nodes` の順）を入れ、`Expanded.run()` がテンプレートの区別を重ねる（テンプレートが決めていない名前は内部とみなす）。`display_names` と `internal_names` を合わせると `names` になる |
+| `stats` | 統計。`states`（用意したスイッチング状態の数）、`state_changes`（不連続点として扱ったステップ）、`retries`（捨てた試行）、`rescues_at_start`（D-035）、`command_changes`（指令で値が決まる電源の値が変わった点） |
 | `netlist`、`h`、`devices`、`sample_state` | 計算した層B、時間刻み、スイッチとダイオードの ID、各時刻のスイッチング状態 |
 
 **信号の名前の決まり。** `Result["名前"]` で配列を取り出す。
@@ -310,13 +316,13 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 | `cmd(名前)` | 制御器の指令（操作量） | 同上 |
 | `on(素子ID)` | スイッチ、ダイオードの導通（1 = オン） | 同上 |
 
-**記録の決まり（D-019）。** スイッチやダイオードが切り替わる格子点には、切り替わる前の値を記録する。電源がステップする格子点には、変わった後の値を記録する。区間の信号の最後の点は、最後の区間の値を繰り返す。指令で値が決まる電源の変わり目を「直前の値」にそろえるのは予定（E1g。D-048）。
+**記録の決まり（D-019、D-048）。** スイッチやダイオードが切り替わる格子点と、指令で値が決まる電源（従属電圧源）の値が変わる格子点には、変わる前の値を記録する（代数的な変数。状態変数は連続）。時刻で決まる電源がステップする格子点には、変わった後の値を記録する（同じ格子点で両方が変わるときも、変わった後の値）。区間の信号の最後の点は、最後の区間の値を繰り返す。制御器が測る値は、記録される値と同じ（切り替えの直前の値。`control/interface.py`）。核は不連続点の印 `event` を `EVENT_SOURCE`（変わった後を記録）と `EVENT_COMMAND`（変わる前を記録）で分ける。台形則の2次の精度は変わらない（指令で値が決まる電源 → R → C で、刻みを半分にしたときの誤差の比 3.92〜3.98。`tests/test_e1g_command_record.py`）。
 
-**表示する信号と内部の信号。** 結果の名前には、画面に出さない内部の信号（`on(S1)`、状態平均化モデルの `v(sw_avg)` など）が混ざる。全部の名前を「表示する」と「内部」に漏れなく分けて返すのは予定（E1g。`screens-v0.1.md` 14章の未決17）。
+**表示する信号と内部の信号（画面仕様 14章の未決17）。** 結果の名前には、画面に出さない内部の信号（スイッチングモデルの `on(S1)`・`on(S2)`、状態平均化モデルの `v(sw_avg)`、負荷ステップを作る `v(ld)`・`gate(q_load)`・`cmd(load)`・`on(S3)`、ESR の内側の `v(cap)`）が混ざる。テンプレートが表示する信号と内部の信号の両方を `Expanded.signals` に決め、`Result.signal_info` の `internal` の印で返す。試験（`tests/test_e1g_signals.py`）が、どのモデルと省略できる項目の組み合わせでも、結果の名前 ＝ テンプレートが決めた名前で、印の無いものが付録A の信号の表と1対1、内部の信号が付録A.4 の内部の信号の表と同じことを確かめる（新しい信号を足して印を付け忘れると落ちる）。CSV の「すべての信号」は `display_names` から選ぶ（内部の信号を入れない。付録A.4）。
 
 ### 5.5 ファイル形式
 
-**仕様 JSON。** UTF-8（先頭の BOM は無視する）。層A そのもの。版 0.2 の例（統合前（E1b）の `examples/buck_voltage_mode.json` からの抜粋。版 0.1 の例は `examples/rlc_series.json`）。
+**仕様 JSON。** UTF-8（先頭の BOM は無視する）。層A そのもの。版 0.2 の例（`examples/buck_voltage_mode.json` からの抜粋。版 0.1 の例は `examples/rlc_series.json`）。
 
 ```json
 {
@@ -342,12 +348,14 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 
 上の `control` は抜粋で、実際の例には `f_ctrl`、`Ki`、`Kd`、`Tf`、`d_min` もある（必須の項目が欠けると値の不足になる）。項目の一覧（必須か、範囲、組で入れる値）は `screens-v0.1.md` 付録A.4 と `templates/buck.py` の `ITEMS`。
 
-**CSV。** `Result.to_csv(path, names)`。UTF-8、1行目が見出し、1列目が時刻 `t`、値は倍精度を失わない桁数（`repr`）。
+**CSV。** `Result.to_csv(path, names, *, units=False, notes=False)`。UTF-8、1行目が見出し、1列目が時刻、値は倍精度を失わない桁数（`repr`）。
 
-| 項目 | いま（実装済み） | 予定（E1g。D-042） |
-|---|---|---|
-| 見出し | `t,v(out),i(L1)`（単位なし） | 単位つき（例 `v(out) [V]`。画面と同じ形） |
-| 列 | コマンドラインは `Expanded.probes` の信号だけ | 画面は信号と時間範囲を選ぶ（`screens-v0.1.md` 8.4。A1） |
+| 項目 | 中身（実装済み。単位と注意の行は E1g） |
+|---|---|
+| 見出し | `units=True` で単位つき（`t [s],v(out) [V],i(L1) [A]`。無次元は `[1]`。画面と同じ形。D-042）。既定（`units=False`）は単位なし（`t,v(out),i(L1)`。E0 の形） |
+| 注意 | `notes=True` で、データの後ろに注意を1つ1行で足す（`# [ESR_OMITTED] 注意: C_esr（…）`）。`#` で始まる行は、`numpy.loadtxt` や表計算ソフトの読み込みで飛ばせる |
+| コマンドライン | `--csv` は `units=True, notes=True`。列は `Expanded.probes` の信号だけ |
+| 画面 | 信号と時間範囲を選ぶ（`screens-v0.1.md` 8.4。A1） |
 
 **設定ファイル（D-050）。統合前（A0）。** 場所は Windows が `%APPDATA%\circuit-sim\`、ほかは `$XDG_CONFIG_HOME/circuit-sim/`（無ければ `~/.config/circuit-sim/`）。環境変数 `CIRCUIT_SIM_CONFIG_DIR` で変えられる（試験は一時フォルダに向ける）。
 
@@ -365,7 +373,7 @@ AI と人が書く層。テンプレート名、パラメータ、設計目標�
 - 層A の単位は必ず読む。読める形は「SI 接頭語 + 単位記号」。大文字と小文字を区別する（`m` はミリ、`M` はメガ）。
 - 接頭語: `f p n u m k M G`。マイクロは `u`、`µ`（U+00B5）、`μ`（U+03BC）の3通り。
 - 単位記号: `V`、`A`、`ohm` / `Ohm` / `Ω`、`H`、`F`、`Hz`、`s`、`W`。
-- 接頭語を付けない単位（統合前（E1b））: `1/V`（比例ゲイン）、`1/(V·s)`（積分ゲイン）、`s/V`（微分ゲイン）、`1`（無次元）、`%`（無次元の 1/100）。空の文字列は読まない（書き忘れと区別できない）。
+- 接頭語を付けない単位: `1/V`（比例ゲイン）、`1/(V·s)`（積分ゲイン）、`s/V`（微分ゲイン）、`1`（無次元）、`%`（無次元の 1/100）。空の文字列は読まない（書き忘れと区別できない）。
 - 次元が項目と違う単位、読めない単位は `UnitError`。`"SI"` のような照合できない文字列も受け付けない。
 - 互換文字（`㎌`、`㏀`、全角の `ｍＨ`）は読まずにエラーにする。正規化するかは、設計書の取り込み（I1）で改めて決める（D-037）。
 - 換算したときは、何を何に換算したかを注意に出す（例: `L: 47 uH を 4.7e-05 H に換算した`）。
@@ -393,12 +401,15 @@ Expanded（層B Netlist、t_end、h、ゲート信号、制御器、注意）
   │    整合の取れた初期値
   │ ④ 時間ステップ                    kernel.run / kernel.run_switched
   │    制御周期ごとに核から戻り、制御器を呼ぶ
+  │    区切りごとに核から戻り（核の外）、発散の確かめ、中断の求め、進み具合の知らせ（6.7）
+  │                                                                    → DivergenceError、SimulationCancelled
   │ ⑤ 注意の判定（刻みの粗さ、電流の遮断など）
   ▼
-Result（時刻、信号、注意、統計）──► 要約の表示、CSV、（予定）画面のスコープ
+Result（時刻、信号、信号の情報、注意、統計）──► 要約の表示、CSV、（予定）画面のスコープ
+                                               Expanded.run() は展開の注意と、表示・内部の区別を重ねる
 ```
 
-計算の経路に AI は入らない。乱数も使わない。同じ入力からは同じ結果になる（決まり1）。
+計算の経路に AI は入らない。乱数も使わない。同じ入力からは同じ結果になる（決まり1）。区切りの位置は計算時間で決まるが、区切っても結果はビット単位で同じ（6.7）。
 
 ### 6.2 数値計算の方式
 
@@ -427,14 +438,14 @@ Result（時刻、信号、注意、統計）──► 要約の表示、CSV、�
 
 減衰ステップの数は `simulate(..., damping_steps=)` で変えられる（既定 2。0 で入れない）。
 
-**スイッチング状態ごとの行列の使い回し。** スイッチング状態は整数の符号で表す（下位ビットがスイッチ、上位がダイオード。1 = オン）。出会った状態だけ行列を用意して表に足す（`_StateTable`）。核は、用意していない状態に出会うと外に戻り（`NEED_STATE`）、外が行列を足して同じステップからやり直す。同期整流の降圧コンバータの例で用意する状態は2つ（統合前（E1b）の例で `stats["states"]` を確かめた）。
+**スイッチング状態ごとの行列の使い回し。** スイッチング状態は整数の符号で表す（下位ビットがスイッチ、上位がダイオード。1 = オン）。出会った状態だけ行列を用意して表に足す（`_StateTable`）。核は、用意していない状態に出会うと外に戻り（`NEED_STATE`）、外が行列を足して同じステップからやり直す。同期整流の降圧コンバータの例で用意する状態は2つ（`stats["states"]` で確かめた）。
 
 **時間刻みと終了時刻の既定。**
 
 | テンプレート | 時間刻み | 終了時刻 |
 |---|---|---|
 | `rc_lowpass`、`rlc_series` | 最も速い極の周期の 1/200 | 最も遅い減衰の時定数の5倍。ステップ数が2万を超えるときは、時間刻みか終了時刻を調整して注意に出す |
-| `buck_voltage_mode`（統合前（E1b）） | スイッチング周期の 1/200（状態平均化モデルは 1/10） | LC の共振周期の20倍（負荷ステップや指令値のステップがあれば、最後のステップの時刻に足す）を、制御周期の整数倍に切り上げ |
+| `buck_voltage_mode` | スイッチング周期の 1/200（状態平均化モデルは 1/10） | LC の共振周期の20倍（負荷ステップや指令値のステップがあれば、最後のステップの時刻に足す）を、制御周期の整数倍に切り上げ |
 
 キャリアの周期と制御周期は、時間刻みの整数倍でなければエラーにする。終了時刻が刻みの整数倍でなければ、近い整数ステップで終えて注意に出す。
 
@@ -448,7 +459,7 @@ Result（時刻、信号、注意、統計）──► 要約の表示、CSV、�
 
 - 切り替えの時刻は時間刻みの格子に丸める。1周期を N ステップ（既定 200）に分けるので、1周期のデューティの分解能は 1/N。丸めの余りは次の周期に持ち越す（D-021）。
 - デューティはキャリアの周期の先頭で取り込み、その周期のあいだ変えない。
-- 相補のゲート（`complement`）は、上のゲートがオフの区間だけオンになる。デッドタイムは 0 だけ（0 以外はエラー）。統合前（E1b）。
+- 相補のゲート（`complement`）は、上のゲートがオフの区間だけオンになる。デッドタイムは 0 だけ（0 以外はエラー）。
 
 **制御器のタイミング。** 制御器は離散時間。制御周期 Ts ごとに核から戻り、次の順で動く（`control/interface.py`、`simulate.py`）。
 
@@ -474,12 +485,12 @@ Result（時刻、信号、注意、統計）──► 要約の表示、CSV、�
 
 ### 6.4 モデルの切り替え（決まり6）
 
-仕様の `simulation.fidelity` で選ぶ。統合前（E1b）。
+仕様の `simulation.fidelity` で選ぶ。
 
 | モデル | 回路 | 使いどころ | 状態 |
 |---|---|---|---|
-| スイッチングモデル（既定） | 上下のスイッチを、オン抵抗 `r_on` の理想スイッチと相補のゲートで計算する。リプルが出る | 最終の確認、リプルと入力電流を見る | 統合前（E1b） |
-| 状態平均化モデル | レグを、電圧源「デューティ × 直流電圧」とオン抵抗の直列に置き換える（従属電圧源）。スイッチング周期の平均を計算する | ゲイン最適化の評価。ステップ数はスイッチングモデルの約 1/20 | 統合前（E1b） |
+| スイッチングモデル（既定） | 上下のスイッチを、オン抵抗 `r_on` の理想スイッチと相補のゲートで計算する。リプルが出る | 最終の確認、リプルと入力電流を見る | 実装済み |
+| 状態平均化モデル | レグを、電圧源「デューティ × 直流電圧」とオン抵抗の直列に置き換える（従属電圧源）。スイッチング周期の平均を計算する | ゲイン最適化の評価。ステップ数はスイッチングモデルの約 1/20 | 実装済み |
 | 理想 | トルク源と、電流応答の1次遅れ | 機構の計算と組むとき | 予定（時期は未定） |
 
 - 降圧コンバータは同期整流にしてある（D-038）。ダイオード整流は軽負荷で電流不連続モードになり、状態平均化モデルが成り立たない。同期整流なら、どの負荷でも両モデルの周期平均が一致する。
@@ -511,15 +522,28 @@ Result（時刻、信号、注意、統計）──► 要約の表示、CSV、�
 | 時間 | 固定刻み。スイッチング周期の 1/200 が既定 | 6.2 |
 | 計算の精度 | 台形則の2次精度（刻み半分で誤差が約 1/4）。解析解との差は RC のステップ応答で入力の 0.003%、直列 RLC で 0.06%。受け入れの基準は解析解との差 1% 以内 | `README.md`、`tests/test_t0.py`、`roadmap.md` |
 | デューティ | 1周期の分解能は 1/N（既定 0.5%）。余りの持ち越しで、数周期の平均は指令どおり。指令値が格子のすぐ近くだと、出力の周期平均の振れが最悪 1.1% 残る。刻みの途中で切り替える方式に直し、振れを指令値の 0.2% 以内にする（E2 で使う整定の許容帯 ±1% の 1/5） | D-021、D-036、D-063、予定（E1f） |
-| モデルの間の一致 | スイッチングモデルの周期平均と状態平均化モデルの差は、基準の回路で指令値の 0.096〜0.116%（基準は 2% 以内） | `docs/verification/E1b-verifier.md`（統合前（E1b）） |
+| モデルの間の一致 | スイッチングモデルの周期平均と状態平均化モデルの差は、基準の回路で指令値の 0.096〜0.116%（基準は 2% 以内） | `docs/verification/E1b-verifier.md` |
 | 検出（測定） | 量子化しない（ADC のビット数、PWM のカウンタはモデルに入っていない）。選べる部品として入れるのは予定（E1h。E2 の前） | 15章、D-063 |
 | 表示 | 画面の桁数と丸めは画面仕様が決める。読み取る値は計算結果そのもの | `screens-v0.1.md` 2章、8.2 |
 
 速度の目安は `architecture.md` 8章（簡易モデルでの実測。この文書では測り直していない）。計測のスクリプトは `benchmarks/bench_switching.py`。
 
+### 6.7 区切り（進み具合、中断、発散の確かめ）。実装済み（E1g）
+
+核の最内ループは配列と数値だけ（決まり2）なので、進み具合、中断、発散の確かめは核の外（`simulate._Monitor`）で、核を呼ぶ単位（区切り）ごとに行う。
+
+- **区切り方。** 核は、次の区切りの点まで（スイッチの無い回路は `kernel.run` を区間ごとに、スイッチを含む回路は `kernel.run_switched` の `k_stop` を区切りの点に）進めて戻る。区切りのステップ数は、1つの区切りの計算時間が `CHUNK_SECONDS`（20 ms）になるように、かかった時間から合わせ直す（最初は 512 ステップ。64〜2^20）。制御器のある回路は、これまでどおり制御周期ごとにも戻る。計算の準備（電源の配列、ゲート信号の配列など）と後処理（注意の判定、信号の配列）も、配列を `SETUP_BLOCK`（2^17 行）ずつ埋め、そのたびに中断の求めを見る（1000 万ステップの計算でも、準備と後処理のあいだ止まらない）。
+- **ビット一致。** 区切っても、区切らないときと同じ演算を同じ順に行う（`kernel.run` は減衰ステップの残りを引き継ぎ、`run_switched` は進行状態 `ctl` から再開する）。区切りの位置は結果に効かない。区切らない計算（区切りの点を無くしたもの）と、いろいろな回路でビット単位で同じ（`tests/test_e1g_progress.py`）。
+- **進み具合。** `simulate(..., progress=関数)`。計算の初めに 0、区切りごとに（`PROGRESS_SECONDS` = 50 ms より短い間隔では呼ばない）単調に増える値、最後に 1 で呼ぶ。準備に 0〜0.02、時間ステップに 0.02〜0.99（計算したステップ数の割合）、後処理に 0.99〜1 を割り当てる。呼ぶのは計算と同じスレッド。
+- **中断。** `simulate(..., cancel=関数)`。区切りごとに呼び、真なら `SimulationCancelled`（番号 `RUN_CANCELLED`。`ValueError` の一種ではない）で終わる。途中の結果は返さない。`threading.Event.is_set` を渡せる。
+- **発散の確かめ。** 区切りごとに、その区切りの回路の変数（`x`）に、有限でない値か、発散とみなす大きさを超える値が無いかを見る。制御器の指令が有限でなくなったとき（`CONTROLLER_COMMAND_NOT_FINITE`）も、先に回路の変数を見て、発散していればそちらを知らせる。見つかったら、その区切りの中で最初の格子点と変数を探し、`DivergenceError`（番号 `RUN_DIVERGED` / `RUN_DIVERGED_NOT_FINITE`。差し込む値は時刻 `t`、変数 `signal`、値 `value`、大きさ `limit`）で止める。画面の N-RUN-DIVERGED に当たる。
+- **発散とみなす大きさ。** 回路の電圧と電流の目安（電源と初期値の大きさを、素子の値で換算して広げたもの。`_divergence_limits`）の `DIVERGENCE_FACTOR`（1e12）倍。根拠は `accuracy-and-resolution.md` 2.7。
+- **費用（`benchmarks/bench_e1g_chunks.py`）。** 区切る計算と区切らない計算の所要時間の差は、降圧（制御器つき）、状態平均化モデル、ダイオード整流（制御器なし）、RC はしごの 20 万〜40 万ステップで ±数%（揺れの幅の中）。E1g の前の版（区切りも発散の確かめも無い）との差も同じ程度。
+- **テンプレートから組んだ降圧コンバータの不安定なゲイン。** デューティが d_min〜d_max（指令で値が決まる電源も 0〜1）で止まるので、閉ループが不安定でも出力は有界のリミットサイクルになり（例: 閉ループ極の絶対値の最大 1.15 のゲインで v(out) は 62 V〜−39 V、i(L1) は最大 85 A）、発散として止めない。不安定かどうかの判定は E2 の評価（閉ループ極の絶対値の最大）で行う。
+
 ## 7. 制御とゲイン設計
 
-### 7.1 離散 PID（`control/blocks.py`）。統合前（E1b）
+### 7.1 離散 PID（`control/blocks.py`）
 
 並列形。1回の `update()` が1サンプル（周期 Ts）。
 
@@ -537,7 +561,7 @@ u[k] = clip(P[k] + I[k] + D[k], 下限, 上限)
 - 微分フィルタの時定数 Tf（不完全微分）を省いたときは 0.25·Ts を入れ、Kd > 0 なら注意を出す（D-045）。
 - `PidController` が制御器の口に合わせる。指令値は数値か、時刻で決まる区分一定の値（`Schedule`）。
 
-### 7.2 初期ゲインの設計（`tuning/initial.py`）。統合前（E1b）
+### 7.2 初期ゲインの設計（`tuning/initial.py`）
 
 `buck_voltage_mode_pid(v_in, inductance, capacitance, r_load, f_ctrl, ...)` が、電圧モードの降圧コンバータの PID の初期値を解析式で決める。ゲイン最適化（E2）の出発点。
 
@@ -549,13 +573,13 @@ u[k] = clip(P[k] + I[k] + D[k], 下限, 上限)
 | 確かめること | 決まり | 決定 |
 |---|---|---|
 | 位相余裕 | ゲインが 1 を横切るすべての点の余裕の最小が、目標 − 1e-6° 以上。位相は低い周波数から連続に取る（主値で取ると、不安定なゲインを大きな余裕と読む） | D-057 |
-| 安定 | 離散時間の閉ループ極の絶対値の最大が 1 − 1e-9 以下のときだけ「安定」と言う。境目は `no_stability_margin` で断る。E1b の5回目の検証で、D-059 の範囲の端（Vin が大きい）では丸めがこの幅を超え、境目の設計を成功として返す例が見つかった（修正の最中） | D-057、D-062 |
-| 引数の範囲 | 実用の範囲の外側に3桁以上の余裕を取った範囲で受ける。外、NaN、無限大は `invalid_argument`。D-062 で「受け付ける範囲 ＝ 検証で確かめた範囲」にそろえる（範囲は統合までに変わりうる） | D-059、D-062 |
-| 零点の範囲 | 零点の比 κ は 1 以下、減衰 ζz は 2 以下（κ > 1 は条件つき安定の設計になる） | D-057 |
+| 安定 | 離散時間の閉ループ極の絶対値の最大が 1 − 1e-9 以下のときだけ「安定」と言う。境目は `no_stability_margin` で断る。E1b の5回目の検証で見つかった丸め（Vin が大きいと、境目の設計を成功として返した）は、尺度をそろえた計算（正規化。`architecture.md` 5章）で直した | D-057、D-062、D-065 |
+| 引数の範囲 | 受け付ける範囲 ＝ 検証で確かめた範囲（`ARGUMENT_RANGES` と、組み合わせの Q ≥ 1e-3、f_ctrl/f0 ≤ 1e11）。外、NaN、無限大（無負荷を除く）は `invalid_argument`。範囲の外の文は、原因と直し方を添える（E1g） | D-059、D-062、D-065、D-066 |
+| 零点の範囲 | 零点の比 κ は 1e-9 以上 1 以下、減衰 ζz は 1e-6 以上 2 以下（κ > 1 は条件つき安定の設計になる） | D-057、D-066 |
 | 探索の上限 | ナイキスト周波数の手前に制限し、制限したことを結果と文に残す | D-057 |
 
 「達成したか」の印を戻り値に持たせず、未達を例外にしてあるのは、印を見ずに不安定なゲインが使われるのを防ぐため（決まり4）。
-基準の回路（24 V、47 µH、100 µF、6 Ω、100 kHz）での結果は、Kp 0.01174 1/V、Ki 147.1 1/(V·s)、Kd 2.736e-6 s/V、ゲイン交差周波数 3.58 kHz、位相余裕 55.0°、閉ループ極の絶対値の最大 0.967（2026-11-16 に E1b のコードで計算）。同梱の例の値（Kp 0.0117、Ki 147、Kd 2.74e-6）は、これを3桁に丸めた値と一致する。
+基準の回路（24 V、47 µH、100 µF、6 Ω、100 kHz）での結果は、Kp 0.01174 1/V、Ki 147.1 1/(V·s)、Kd 2.736e-6 s/V、ゲイン交差周波数 3.58 kHz、位相余裕 55.0°、閉ループ極の絶対値の最大 0.967（2026-11-16 に main のコード `4447f5a` で計算）。同梱の例の値（Kp 0.0117、Ki 147、Kd 2.74e-6）は、これを3桁に丸めた値と一致する。
 
 ### 7.3 ゲイン最適化。予定（E2）
 
@@ -602,7 +626,7 @@ u[k] = clip(P[k] + I[k] + D[k], 下限, 上限)
 | 設計目標と結果、レポート、取り込み | — | 予定（A2、A3） |
 
 - 文言は直書きしない（決まり8）。辞書の元は画面仕様の文言の表だけで、`frontend/tools/strings_from_spec.py` が表から日英の辞書を作る。表と辞書の食い違いは試験が見つける。
-- 画面は、テンプレートごとの「表示定義」（項目、信号、図、モデル）から、仕様パネルの行、回路図、スコープの信号を作る（`screens-v0.1.md` 付録A.1）。エンジンの側の定義は `templates/items.py` の `Item` と `SignalInfo`（統合前（E1b））。サーバーから画面へ渡す口は予定（E1g、A1）。
+- 画面は、テンプレートごとの「表示定義」（項目、信号、図、モデル）から、仕様パネルの行、回路図、スコープの信号を作る（`screens-v0.1.md` 付録A.1）。エンジンの側の定義は `templates.TEMPLATE_DISPLAY`（`Display`: 項目 `Item`、選べるモデルと既定、モデルごとの表示する信号 `SignalInfo`、仕様の値によらずテンプレートが決める値 `FixedValue`。降圧コンバータのオン抵抗 r_on は `values` の `r_on`。画面仕様 12章の D2、14章の未決18）。E1g で用意した。サーバーから画面へ渡す口は予定（A1）。
 - 使えないものを先に置かない（`app-design.md` 3章）。
 
 ### 8.2 画面の状態遷移
@@ -644,13 +668,14 @@ u[k] = clip(P[k] + I[k] + D[k], 下限, 上限)
 
 | 項目 | 内容 |
 |---|---|
-| 引数 | `spec`（仕様 JSON。必須）、`--csv`（波形の書き出し先） |
-| 標準出力 | テンプレート名、終了時刻（いまの出力の表記: 計算時間）・時間刻み・ステップ数、`probes` の信号ごとの最終値・最大・最小、注意（展開の注意と計算の注意） |
+| 引数 | `spec`（仕様 JSON。必須）、`--csv`（波形の書き出し先。見出しに単位、データの後ろに注意。5.5） |
+| 標準出力 | テンプレート名、終了時刻・時間刻み・ステップ数、`probes` の信号ごとの最終値・最大・最小、注意（展開の注意と計算の注意。1つ1行で、番号を前に置く: `  [ESR_OMITTED] 注意: C_esr（…）`） |
 | 標準エラー | 失敗の理由を1行（「計算できません。…」など） |
-| 終了コード | 0 = 計算できた。2 = 計算できなかった（ファイルが読めない、仕様の形の誤り、値の不足、読めない単位、解けない回路、ステップ数の上限、引数の誤り） |
+| 終了コード | 0 = 計算できた。2 = 計算できなかった（ファイルが読めない、仕様の形の誤り、値の不足、読めない単位、解けない回路、ステップ数の上限、発散、引数の誤り） |
+| 文面 | エンジンの注意とエラーと同じ辞書（`messages.py`）から日本語で作る（`__main__.LANG`。英語の文面も辞書にあるが、コマンドラインで選ぶ引数はまだ無い） |
 | 文字コード | 仕様は UTF-8（BOM は無視）。UTF-8 でない端末（日本語 Windows の cp932）では、表せない文字を置き換えて出す（`µ` → `u`、`Ω` → `ohm`） |
 
-出力の例（`examples/rlc_series.json` の2行目）: `計算時間: 0.01 s / 刻み: 3.14169e-06 s / ステップ数: 3183`。
+出力の例（`examples/rlc_series.json` の2行目）: `終了時刻: 0.01 s / 刻み: 3.14169e-06 s / ステップ数: 3183`（E1g の前の表記は「計算時間」。glossary 9章の3）。
 
 **起動: `circuit-sim [--port ポート] [--no-browser]`。統合前（A0）。**
 
@@ -702,19 +727,23 @@ from circuit_sim import Spec, expand, simulate
 spec = Spec.model_validate_json(text)           # 層A の検証
 ex = expand(spec)                               # 層A → 層B と計算の設定
 res = simulate(ex.netlist, ex.t_end, ex.h)      # 実装済み（スイッチの無いテンプレート）
-res = ex.run()                                  # 統合前（E1b）。ゲート信号と制御器も渡す
-res["v(out)"], res.t, res.notes                 # 波形（NumPy の配列）、時刻、注意
+res = ex.run()                                  # ゲート信号と制御器も渡す
+res["v(out)"], res.t, res.notes                 # 波形（NumPy の配列）、時刻、注意（Message の並び）
+res.signal_info, res.display_names              # 信号の情報（単位、正の向き、内部の印）
+[n.to_dict() for n in res.notes]                # 画面に渡す形 {"code": 番号, "params": {...}}
 
 simulate(netlist, t_end, h=None, *, gates=(), controllers=(),
-         steps_per_period=None, damping_steps=2, max_steps=None) -> Result
+         steps_per_period=None, damping_steps=2, max_steps=None,
+         progress=None, cancel=None) -> Result
 ```
 
 - `h`: 時間刻み。スイッチの無い回路では必須。省くと、最も速いキャリアの周期を `steps_per_period`（既定 200）で割る。
 - `gates`: PWM の並び（スイッチの `gate` から名前で引く）。`controllers`: 制御器の並び（`Controller` の口）。
 - `damping_steps`、`max_steps`: 6.2。
 
-例外はどれも `ValueError` の一種（10章）。制御器の形が口に合わないときだけ `TypeError`。
-進み具合を知らせる口と中断の口は予定（E1g）。区切りは核の外に置き、区切っても結果がビット一致することを基準にする。
+- `progress`: 進み具合（0〜1）を受け取る関数。`cancel`: 中断するなら真を返す引数なしの関数（6.7）。
+
+例外は、中断の `SimulationCancelled` を除いて `ValueError` の一種（10章）。制御器の形が口に合わないとき、`progress` か `cancel` が関数でないときは `TypeError`。どれも番号つき（`code`、`params`、`text(lang)`、`to_dict()`）。
 
 ### 9.4 AI のプロバイダ層。予定（I2）
 
@@ -739,48 +768,82 @@ simulate(netlist, t_end, h=None, *, gates=(), controllers=(),
 | 種類 | いまの形 | 出す場所 | 状態 |
 |---|---|---|---|
 | 仕様の形の誤り | `pydantic.ValidationError` | `ir.py` | 実装済み |
-| 値の不足 | `MissingValueError`（`names` に足りない名前） | `templates/` | 実装済み |
+| 値の不足 | `MissingValueError`（`names` に足りない名前、`pairs` に組の相手） | `templates/` | 実装済み |
 | 単位の誤り | `UnitError` | `units.py`、`templates/` | 実装済み |
-| 値が範囲の外、未対応のテンプレート、周期が刻みの整数倍でない | `ValueError` | `templates/`、`simulate.py` | 実装済み |
-| 解けない回路、ダイオードの状態が決まらない | `CircuitError` | `kernel.py`、`simulate.py` | 実装済み |
+| 値が範囲の外、未対応のテンプレート、周期が刻みの整数倍でない、引数の誤り | `CodedError`（`ValueError` の一種） | `templates/`、`simulate.py`、`ir.py`、`control/` | 実装済み |
+| 解けない回路、ダイオードの状態が確定しない | `CircuitError` | `kernel.py`、`mna.py`、`simulate.py` | 実装済み |
 | 計算が大きすぎる | `StepLimitError` | `simulate.py` | 実装済み |
-| ゲインの設計の未達、引数の誤り | `GainDesignError`（`reason`、`target_deg`、`best`） | `tuning/initial.py` | 統合前（E1b） |
-| 展開の注意 | `Expanded.notes`（日本語の文） | `templates/` | 実装済み。`Result.notes` と CSV に入れるのは予定（E1g） |
-| 計算の注意 | `Result.notes`（日本語の文） | `simulate.py` | 実装済み |
+| 計算の途中の発散（回路の変数、制御器の指令） | `DivergenceError` | `simulate.py` | 実装済み（E1g） |
+| 中断 | `SimulationCancelled`（`ValueError` の一種でない） | `simulate.py` | 実装済み（E1g） |
+| 結果に無い名前 | `CodedKeyError`（`KeyError` の一種） | `simulate.Result` | 実装済み |
+| ゲインの設計の未達、引数の誤り | `GainDesignError`（`reason`、`target_deg`、`best`）。文は日本語だけ（番号は `reason`。辞書にするのは画面に出す E2） | `tuning/initial.py` | 実装済み |
+| 展開の注意 | `Expanded.notes`（`Message` の並び）。`Expanded.run()` の結果の `notes` の先頭にも入る | `templates/` | 実装済み（結果に入れるのは E1g） |
+| 計算の注意 | `Result.notes`（`Message` の並び） | `simulate.py` | 実装済み |
 | 仕様が開けない | `notice`（`N-OPEN-*`） | `app/server.py`、画面 | 統合前（A0） |
 
-### 10.3 番号の付け方。予定（E1g）
+### 10.3 番号の付け方。実装済み（E1g）
 
-いまエンジンが返すのは日本語の文。E1g で、番号（例 `STEP_COARSE`）と差し込む値（数値は単位つき）の組に替える。
+エンジン（`ir`、`units`、`mna`、`kernel`、`simulate`、`signals`）、テンプレート（`templates/`）、制御ブロックと PWM（`control/`）が出す注意とエラーは、すべて番号と差し込む値の組（`messages.py`）。
 
-- 日本語と英語の文面は辞書から作る。いまの日本語の文面は、辞書の日本語として残す（受け入れ試験が見ている文面を変えない）。
-- エンジンとテンプレートが出す注意とエラーのすべてに番号を付け、番号の無い文が出ないことを試験で確かめる。
-- コマンドラインは同じ辞書で表示する。
-- エンジンの番号と、画面のお知らせの番号（`screens-v0.1.md` 付録B）の対応表を作る。
+- **番号**: 英大文字とアンダースコア（`STEP_COARSE`、`MISSING_VALUES`）。一覧と日英の文面は `messages.MESSAGES`（番号 → （日本語、英語））。文面の書式は `str.format`。差し込む値は、単位つきの数値 `Value`（`{"value": 数値, "unit": "s"}`。文面には数値だけを書き、単位は文面が書く）、名前の並び `Names`、スイッチング状態 `SwitchState`、文の部品の `Message`（とその並び）、文字列、整数。
+- **注意**: `Message`。`str` の一種で、文字列としての中身は日本語の文面（E1g の前の文と同じ。例外は glossary 9章の用語の是正だけ）。`code`、`params`、`text("en")`、`to_dict()`。
+- **エラー**: `Coded` を持つ例外（`CodedError`、`CircuitError`、`UnitError`、`MissingValueError`、`StepLimitError`、`DivergenceError`、`CodedTypeError`、`CodedKeyError`、`SimulationCancelled`）。`str(エラー)` は日本語の文面。`code` と `params` は番号と差し込む値。文全体が、番号の文に手がかりを足したもの（解けない回路の「決まらない変数」など）のときも、`code` は元の番号で、手がかりは `params` の `hints` に入る。pydantic の検証の中で出したエラーは `ValidationError` に包まれるが、`messages.message_of(エラー)` で取り出せる。別のプロセスへ渡せる（pickle）。
+- **番号の無い文が出ないこと**: 試験（`tests/test_e1g_messages.py`）が、ソースを読んで文字列をそのまま渡す `raise` と `notes.append` が無いこと、いろいろな仕様と回路で出た注意とエラーがすべて番号つきで、英語の文面も作れることを確かめる。辞書の日英で差し込む値の名前がそろうこと、辞書の番号がすべて使われていることも確かめる。
+- **コマンドライン**: 同じ辞書から日本語で表示する（9.1）。注意は `  [番号] 注意: 文` の形。CSV にも `# [番号] 注意: 文` の形で入る。
+- **範囲の外**: 初期ゲインの設計（`tuning/initial.py`）は番号の対象の外（理由の番号 `reason` を持つ）。用語の是正（ゲイン交差周波数、閉ループ極の絶対値の最大）と、範囲の外の文の原因と直し方（負荷の Q、f_ctrl/f0）は E1g で直した。
 
 ### 10.4 画面のお知らせとの対応
 
-画面のお知らせは `N-` で始まる番号を持ち、段階（エラー、不足、注意）と種類（出来事、状態）に分かれる（`frontend/src/notices.ts`。統合前（A0））。下の表は、エンジンのいまの条件と付録B の番号を突き合わせたもの。正式な対応表は E1g が作り、エンジンから番号で受け取れるようになるのも E1g から。
+画面のお知らせは `N-` で始まる番号を持ち、段階（エラー、不足、注意）と種類（出来事、状態）に分かれる（`frontend/src/notices.ts`。統合前（A0））。エンジンの番号から画面のお知らせへの対応は `messages.SCREEN_NOTICES`（下の表と同じ。試験 `tests/test_e1g_messages.py` が、表と `SCREEN_NOTICES` が同じこと、N-… がすべて付録B にあることを確かめる）。画面は、対応するお知らせの文面（画面の辞書）で見せ、差し込む値はエンジンの `params` から取る（付録B の差し込む値の名前と同じ名前にしてある: `t`、`signal`、`h`、`tau`、`h_suggest`、`id`、`t_grid`、`steps`、`limit`、`t_max`、`h_min`、`symbol`、`value`、`low`、`high`、`t_end`、`t_sw`、`template`）。表に無い番号は、画面の決まり（`screens-v0.1.md` 12章）どおり、注意は N-RUN-NOTE-OTHER、エラーは N-RUN-INTERNAL として、エンジンの文面（`text(lang)`）を「詳細」に入れる。2つ書いた行は、計算の前に分かるとき（左。D3）と、実行の結果（右）。
 
-| エンジンの条件 | いまの形 | 画面のお知らせ（付録B） |
-|---|---|---|
-| JSON として読めない、版が読めない、形が合わない、テンプレートが無い | サーバーが判定（統合前（A0）） | N-OPEN-SYNTAX、N-OPEN-VERSION、N-OPEN-SCHEMA、N-OPEN-TEMPLATE |
-| 値の不足、組で入れる値の片方だけ | `MissingValueError` | N-MISSING、N-MISSING-PAIR |
-| 値が範囲の外 | `ValueError` | N-INVALID |
-| 単位の次元が違う、読めない | `UnitError` | N-UNIT-WRONG |
-| 単位を換算した | 展開の注意 | N-UNIT-CONVERTED |
-| 使わない項目がある | 展開の注意 | N-UNUSED |
-| 版 0.1 の `control` を数値で読んだ | 展開の注意（統合前（E1b）） | N-OPEN-LEGACY |
-| ステップ数の上限 | `StepLimitError` | N-STEPS-LIMIT（実行の前）、N-RUN-STEPS（実行の後） |
-| 刻みが粗い | 計算の注意 | N-STEP-COARSE（実行の前）、N-RUN-NOTE-STEP（結果） |
-| 電源のステップ時刻を丸めた | 計算の注意 | N-RUN-NOTE-ROUND |
-| 回路が解けない | `CircuitError` | N-RUN-CIRCUIT |
-| ダイオードの状態が決まらない | `CircuitError` | N-RUN-SWITCH |
-| 制御器の指令が有限値でない | `ValueError`。回路の変数そのものの発散を調べる処理は、いまは無い（予定（E1g の範囲11）。15.3） | N-RUN-DIVERGED |
-| 番号の無い注意、上のどれでもない失敗 | — | N-RUN-NOTE-OTHER、N-RUN-INTERNAL（内部の文を「詳細」に入れる） |
+| エンジンの番号 | 画面のお知らせ（付録B） |
+|---|---|
+| `SINE_UNDERSAMPLED` | N-RUN-NOTE-STEP |
+| `STEP_TIME_ROUNDED` | N-RUN-NOTE-ROUND |
+| `STEPS_OVER_LIMIT` | N-STEPS-LIMIT、N-RUN-STEPS |
+| `MEMORY_OVER_LIMIT` | N-RUN-MEMORY |
+| `STEP_COARSE` | N-STEP-COARSE、N-RUN-NOTE-STEP |
+| `STEP_COARSE_OVER_LIMIT` | N-STEP-COARSE、N-RUN-NOTE-STEP |
+| `STEP_COARSE_OVER_LIMIT_NO_IDS` | N-STEP-COARSE、N-RUN-NOTE-STEP |
+| `STEP_COARSE_UNDAMPED` | N-STEP-COARSE、N-RUN-NOTE-STEP |
+| `STEP_COARSE_RINGING` | N-STEP-COARSE、N-RUN-NOTE-STEP |
+| `CIRCUIT_UNSOLVABLE` | N-RUN-CIRCUIT |
+| `MATRIX_SINGULAR` | N-RUN-CIRCUIT |
+| `MATRIX_SINGULAR_DETAIL` | N-RUN-CIRCUIT |
+| `TOO_MANY_DEVICES` | N-RUN-CIRCUIT |
+| `DIODES_NOT_SETTLED_AT_START` | N-RUN-SWITCH |
+| `DIODES_NOT_SETTLED` | N-RUN-SWITCH |
+| `RUN_DIVERGED` | N-RUN-DIVERGED |
+| `RUN_DIVERGED_NOT_FINITE` | N-RUN-DIVERGED |
+| `CONTROLLER_COMMAND_NOT_FINITE` | N-RUN-DIVERGED |
+| `TEMPLATE_UNKNOWN` | N-OPEN-TEMPLATE |
+| `MISSING_VALUES` | N-MISSING、N-MISSING-PAIR |
+| `UNIT_CONVERTED` | N-UNIT-CONVERTED |
+| `UNIT_CONVERTED_RATIO` | N-UNIT-CONVERTED |
+| `UNITS_UNREADABLE` | N-UNIT-WRONG |
+| `UNITS_WRONG_DIMENSION` | N-UNIT-WRONG |
+| `UNITS_UNREADABLE_OR_WRONG` | N-UNIT-WRONG |
+| `SPEC_LEGACY_CONTROL` | N-OPEN-LEGACY |
+| `SPEC_LEGACY_CONTROL_INFERRED` | N-OPEN-LEGACY |
+| `UNUSED_ITEMS` | N-UNUSED |
+| `VALUES_NOT_POSITIVE` | N-INVALID |
+| `VALUES_OUT_OF_RANGE` | N-INVALID |
+| `DUTY_LIMITS_ORDER` | N-INVALID |
+| `FSW_NOT_MULTIPLE` | N-INVALID |
+| `LOAD_STEP_SAME` | N-INVALID |
+| `LOAD_STEP_TOO_SMALL` | N-INVALID |
+| `LOAD_STEP_SNAPPED` | N-STEP-SNAP |
+| `REFERENCE_OUT_OF_RANGE` | N-REF-RANGE |
+| `STEP_AFTER_END` | N-STEP-AFTER-END |
+| `SPEC_LEGACY_CONTROL_NOT_NUMBER` | N-OPEN-SCHEMA |
+| `ESR_OMITTED` | （お知らせに出さない。行の見え方で示す。付録A.4） |
+| `TF_DEFAULTED` | （お知らせに出さない。行の見え方で示す。付録A.4） |
 
-`C_esr` と `Tf` を省いたときの注意は、画面ではお知らせに出さず、行の値と出典（既定値、自動）で示す（`screens-v0.1.md` 付録A.4）。
-A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好みを設定ファイルに書けなかった）がある。画面仕様への追記は未了（A1 で入れる。15.3）。
+- JSON として読めない、版が読めない、形が合わない（`ir.py` の検証を含む）、テンプレートが無いは、サーバーが判定する（N-OPEN-SYNTAX、N-OPEN-VERSION、N-OPEN-SCHEMA、N-OPEN-TEMPLATE。統合前（A0））。
+- 中断（`RUN_CANCELLED`）は、お知らせではなく実行の状態「中断した」（`screens-v0.1.md` 7.3）。
+- 状態平均化モデルで計算した旨（`AVERAGE_MODEL_USED`）は、付録B に番号が無いので N-RUN-NOTE-OTHER になる。毎回出る注意なので、`C_esr` と同じく行の見え方で示すかを A1 で決める（15.3）。
+- `C_esr` と `Tf` を省いたときの注意（`ESR_OMITTED`、`TF_DEFAULTED`）は、画面ではお知らせに出さず、行の値と出典（既定値、自動）で示す（`screens-v0.1.md` 付録A.4）。
+- A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好みを設定ファイルに書けなかった）がある。画面仕様への追記は未了（A1 で入れる。15.3）。
 
 ## 11. 安全の設計
 
@@ -812,7 +875,7 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 ### 12.1 テンプレートを足す
 
-テンプレートは、層A を層B と計算の設定に展開する関数。新しいテンプレートを足すときに触る場所（統合前（E1b）の形に沿う）。
+テンプレートは、層A を層B と計算の設定に展開する関数。新しいテンプレートを足すときに触る場所。
 
 1. `circuit_sim/templates/<名前>.py`: 項目の定義（`Item`: 名前、`plant` か `control` か、次元、必須か、組で入れる相手、図の素子）、展開の関数（`Spec` → `Expanded`）、表示する信号（`SignalInfo`）。値は `read_items` で読む（不足と単位の誤りをまとめて報告する）。
 2. `circuit_sim/templates/__init__.py`: `TEMPLATES` と `TEMPLATE_ITEMS` に登録する。
@@ -889,24 +952,24 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 | # | 機能ブロック | UC | FR | モジュール | 試験の場所 | 状態 |
 |---|---|---|---|---|---|---|
-| B01 | 仕様の読み込み | 02、11、13 | 05、07 | `ir.py` | `tests/test_t0.py`、`tests/acceptance/test_e0.py`、`test_e0_verifier_b.py`。版 0.2 は `tests/test_e1b_buck.py` | 実装済み / 統合前（E1b） |
+| B01 | 仕様の読み込み | 02、11、13 | 05、07 | `ir.py` | `tests/test_t0.py`、`tests/acceptance/test_e0.py`、`test_e0_verifier_b.py`。版 0.2 は `tests/test_e1b_buck.py` | 実装済み |
 | B02 | 単位の読み取り | 02、11、13 | 04 | `units.py` | `tests/test_units_and_limits.py`、`tests/acceptance/test_e1a_units_limits.py` | 実装済み |
-| B03 | テンプレートの展開 | 01〜03、11、13 | 05、08、11、13 | `templates/` | `tests/test_t0.py`。降圧は `tests/test_e1b_buck.py`、`test_e1b_signals.py`、`tests/acceptance/test_e1b_independent.py`、`test_e1b_recheck.py` | 実装済み / 統合前（E1b） |
+| B03 | テンプレートの展開 | 01〜03、11、13 | 05、08、11、13 | `templates/` | `tests/test_t0.py`。降圧は `tests/test_e1b_buck.py`、`test_e1b_signals.py`、`tests/acceptance/test_e1b_independent.py`、`test_e1b_recheck.py` | 実装済み |
 | B04、B05 | 回路方程式、時間応答 | 03、13、18 | 09、13、40 | `mna.py`、`kernel.py`、`simulate.py` | `tests/test_t0.py`、`tests/test_notes_e1c.py`、`tests/acceptance/test_e0.py`、`test_e0_verifier_b.py` | 実装済み |
 | B06 | スイッチング回路 | 03 | 10 | `simulate.py`、`kernel.py` | `tests/test_switching.py`、`tests/test_three_phase_rectifier.py`、`tests/acceptance/test_e1a_switching.py`、`test_e1c_followups.py`、`test_e1c_recheck.py` | 実装済み |
-| B07 | PWM | 03 | 10、11 | `control/pwm.py` | `tests/test_pwm_and_elements.py`。相補のゲートは `tests/test_e1b_engine.py` | 実装済み / 統合前（E1b） |
-| B08、B09 | 制御器の口、制御ブロック | 03 | 10、11 | `control/` | 口は `tests/test_switching.py`。PID は `tests/test_e1b_pid.py` | 実装済み / 統合前（E1b） |
-| B10、B11 | 指令で値が決まる電源、レグ部品 | 05 | 12 | `ir.py`、`simulate.py`、`templates/legs.py` | `tests/test_e1b_engine.py` | 統合前（E1b） |
-| B12 | 注意とエラー | 02、03、17 | 14、16 | `simulate.py`、`templates/` | `tests/test_units_and_limits.py`、`tests/test_notes_e1c.py`、`tests/acceptance/test_e1c_followups.py` | 実装済み。番号つきは予定（E1g） |
-| B13、B16 | 結果と書き出し、計算のコマンドライン | 06、13、18 | 22、39 | `simulate.py`、`__main__.py` | `tests/test_units_and_limits.py`、`tests/test_console_encoding.py`、`tests/acceptance/test_e0.py`（CSV）、`test_w1_windows.py` | 実装済み |
-| B14 | 初期ゲインの設計 | 07 | 24 | `tuning/initial.py` | `tests/test_e1b_tuning.py`、`tests/acceptance/test_e1b_crossings.py`、`test_e1b_near_unit_circle.py`、`test_e1b_extreme_inputs.py`（5回目の検証。重大1の再現は xfail） | 統合前（E1b） |
+| B07 | PWM | 03 | 10、11 | `control/pwm.py` | `tests/test_pwm_and_elements.py`。相補のゲートは `tests/test_e1b_engine.py` | 実装済み |
+| B08、B09 | 制御器の口、制御ブロック | 03 | 10、11 | `control/` | 口は `tests/test_switching.py`。PID は `tests/test_e1b_pid.py` | 実装済み |
+| B10、B11 | 指令で値が決まる電源、レグ部品 | 05 | 12 | `ir.py`、`simulate.py`、`templates/legs.py` | `tests/test_e1b_engine.py` | 実装済み |
+| B12 | 注意とエラー | 02、03、17 | 14、16 | `messages.py`、`simulate.py`、`templates/` | `tests/test_units_and_limits.py`、`tests/test_notes_e1c.py`、`tests/test_e1g_messages.py`、`tests/test_e1g_divergence.py`、`tests/acceptance/test_e1c_followups.py` | 実装済み |
+| B13、B16 | 結果と書き出し、計算のコマンドライン | 06、13、18 | 22、39 | `simulate.py`、`signals.py`、`__main__.py` | `tests/test_units_and_limits.py`、`tests/test_console_encoding.py`、`tests/test_e1g_signals.py`、`tests/test_e1g_progress.py`、`tests/test_e1g_command_record.py`、`tests/acceptance/test_e0.py`（CSV）、`test_w1_windows.py` | 実装済み |
+| B14 | 初期ゲインの設計 | 07 | 24 | `tuning/initial.py` | `tests/test_e1b_tuning.py`、`tests/acceptance/test_e1b_crossings.py`、`test_e1b_near_unit_circle.py`、`test_e1b_extreme_inputs.py`、`test_e1b_noload_and_combination_range.py`、`test_e1b_zero_damping_floor.py` | 実装済み |
 | B17 | 起動コマンド | 01、14 | 35 | `app/cli.py` | `tests/test_app_cli.py`、`tests/acceptance/test_a0_key_launch_settings.py`、`test_a0_fix3_stop_stale_sddl.py` | 統合前（A0） |
 | B18 | ローカルサーバー | 01、02、14 | 01、36 | `app/server.py` | `tests/test_app_server.py`、`tests/acceptance/test_a0_server_safety.py` | 統合前（A0） |
 | B19 | 設定の場所 | 15 | 37 | `app/config.py` | `tests/test_app_config.py` | 統合前（A0） |
 | B20 | 画面の枠 | 01〜06、11、15、17 | 01、03、16、37、38 | `frontend/src/` | `tests/test_app_browser.py`、`test_app_frontend.py`、`test_app_strings.py`、`test_app_design_tokens.py`、`tests/acceptance/test_a0_browser_checks.py` ほか。部品の試験は `frontend/src/` の `*.test.ts(x)` | 統合前（A0） |
 | — | 配布の形、ライセンス | 14、17 | 41 | `pyproject.toml`、`docs/design/dependencies.md` | `tests/test_app_wheel.py`、`tests/test_app_licenses.py` | 統合前（A0）。仕上げは予定（R1） |
 | B26 | 開発ハーネス | — | —（NFR-15） | `scripts/` | `tests/test_harness.py`、`test_local_ci.py`、`test_dev_tools.py`、`test_claude_guard.py`、`tests/acceptance/test_w1_*.py`、`test_w2_local_ci_gate.py` | 実装済み |
-| B21 | 仕様パネル、回路図、実行、スコープ | 01〜07、11、12 | 02、06、15、17〜21 | — | — | 予定（A1、E1g） |
+| B21 | 仕様パネル、回路図、実行、スコープ | 01〜07、11、12 | 02、06、15、17〜21 | — | — | 予定（A1。エンジンの口は E1g で用意した） |
 | B15 | ゲイン最適化 | 07、08 | 23〜27 | — | — | 予定（E2） |
 | B22〜B24 | 設計目標と結果、レポート、取り込み、AI | 07〜11 | 23、25〜32 | — | — | 予定（A2、A3、I1、I2） |
 | B25 | DC モーター、三相インバータ | 12、16 | 33、34 | — | — | 予定（E3） |
@@ -921,7 +984,7 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 | 項目 | いまの扱い | 予定 |
 |---|---|---|
-| デッドタイム | 0 だけ。相補のゲートに引数の口だけがあり、0 以外はエラー（統合前（E1b）） | 予定（E1i。E1f の後、E3 の前。D-063） |
+| デッドタイム | 0 だけ。相補のゲートに引数の口だけがあり、0 以外はエラー | 予定（E1i。E1f の後、E3 の前。D-063） |
 | ダイオードの順方向電圧、スイッチング損失 | 入れていない。導通の損失はオン抵抗だけ | 未定 |
 | 検出と PWM の量子化（ADC のビット数、PWM のカウンタ） | 入れていない。検出値は倍精度のまま制御器に渡る | 予定（E1h。E2 の前。既定は理想のまま。D-063、`accuracy-and-resolution.md` 3.4） |
 | デューティの分解能 | 1周期の 1/N。余りを持ち越す | 予定（E1f。基準は周期平均の振れが指令値の 0.2% 以内。D-063） |
@@ -939,7 +1002,6 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 | 作業単位 | 中身 |
 |---|---|
-| E1g | 番号つきの注意とエラー、進み具合と中断、信号の単位と内部の印、CSV の見出しに単位、変わり目の記録、回路の変数の発散の検出、層A の `missing`・`targets`・`source` の扱い。A1 の前提 |
 | E1f | デューティの分解能（ゲートの切り替えを刻みの途中で扱う）。E2 の前提 |
 | E1h | 検出と PWM の量子化（ADC のビット数と入力範囲、PWM のカウンタの段数）を、制御器の部品として選べるようにする。既定は理想。E2 の前 |
 | E1i | デッドタイムと、そのときの電流の流れ（還流ダイオード）。E1f が前提。E3 の前 |
@@ -952,15 +1014,15 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 | 点 | 中身 | 直す場所 |
 |---|---|---|
-| 層A の `missing`、`targets`、`source` | 欄はあるが、読むコードが無い。`missing` は実際の値から判断する形になっている。`architecture.md` 3章は「足りない値は `missing` に並べ、人に聞く」と書く。使う欄と使わない欄は E1g で決める（範囲12） | E1g（この文書の 5.1 も直す） |
-| D-040（`手入力` と `manual`）、D-042（CSV の見出しに単位） | 決定は確定。未実装 | E1g |
 | 画面仕様の「合言葉が無い」状態と N-PREFS-SAVE | A0 のコードにあり（文言は、画面仕様の表の外の文言として `frontend/tools/strings_from_spec.py` の `EXTRA` に置いてある）、画面仕様の 1.3 と付録B に無い | A1 の仕様で `screens-v0.1.md` |
 | 書体の同梱 | `app-design.md` 6章、`design-system.md` 10章の6、`requirements.md` NFR-07（初版）は「同梱する」。`design-system.md` 4.1 と A0 の実装は「端末の書体だけを使う」。いまの事実は「端末の書体だけ」で、NFR-07 はそのように書き直した。どうするかは A0r で PO が案を選ぶときに決める（D-055） | A0r の改訂で `app-design.md`、`design-system.md` |
-| `architecture.md` 2章の依存の向き | エンジンが `control` の型（制御器の口と PWM）を使うこと、統合前（E1b）で `templates` が `simulate` と `control` を使うことが書かれていない（この文書の 4.2） | `architecture.md` |
+| `architecture.md` 2章の依存の向き | エンジンが `control` の型（制御器の口と PWM）を使うこと、`templates` が `simulate` と `control` を使うことが書かれていない（この文書の 4.2） | `architecture.md` |
 | `architecture.md` 4章の後退オイラー法の回数 | 「細かく分割した後退オイラーを既定で2回」と書く。スイッチング状態が変わるステップは、分割しない後退オイラー法で1ステップ進め、続く2ステップを減衰ステップにする（`kernel.run_switched`。この文書の 6.2）。計算の先頭と電源の不連続点は減衰ステップ2回だけで、記述と合う | `architecture.md` |
-| E1b の実体の場所 | レグ部品は `templates/legs.py`、制御ブロックは `control/blocks.py`（E1b のブランチで確かめた）。`docs/plan/A4t-buck-averaged-ron.md` の受け入れ基準1の `circuit_sim/control/legs.py` は誤記 | `A4t-buck-averaged-ron.md`（完了した仕様なので、注記で足りる） |
-| 回路の変数の発散 | エンジンは制御器の指令が有限かどうかだけを調べ、回路の変数（電圧、電流）の発散は調べない。画面仕様の N-RUN-DIVERGED に当たるエラーは、いまは出ない（10.4） | E1g（範囲11に追加済み） |
+| E1b の実体の場所 | レグ部品は `templates/legs.py`、制御ブロックは `control/blocks.py`（E1b で確かめた）。`docs/plan/A4t-buck-averaged-ron.md` の受け入れ基準1の `circuit_sim/control/legs.py` は誤記 | `A4t-buck-averaged-ron.md`（完了した仕様なので、注記で足りる） |
 | D-047 の式 | D-047 はずれを ΔI/(16·f·C) と書く。これは D = 0.5 の値で、一般には ΔI·(1 + D)/(24·f·C)（6.4、`accuracy-and-resolution.md` 2.5）。基準の回路（D = 0.5）では同じ | 決定記録は書き換えない。E2 の仕様では一般の式を引く（提案） |
+| 不安定なゲインのリミットサイクル | テンプレートから組んだ降圧コンバータは、デューティの上下限で出力が有界になるので、閉ループが不安定でも発散として止まらない（6.7）。E1g の仕様の受け入れ基準12 は「不安定なゲインの降圧で止まる」と書くが、上下限を外した回路（エンジンの口で組んだもの）で確かめた | E2（評価で閉ループの安定を判定する）。E1g の仕様の基準12 の読み方はオーケストレーターが決める |
+| 状態平均化モデルの注意 `AVERAGE_MODEL_USED` | 画面仕様の付録B に番号が無い（N-RUN-NOTE-OTHER になる）。毎回出る注意 | A1 の仕様（付録B に足すか、行の見え方で示すか） |
+| `architecture.md` 3章の `missing` | 「足りない値は人に聞く（`missing` の欄は予約。扱いは E1g で決める）」と書いていた。E1g で予約と決め、3章を直した | — |
 | 対応するブラウザの範囲、macOS での動作 | 未確認。決まっていない（`requirements.md` 8.2 の U-2、U-3） | — |
 | Windows の実機での `circuit-sim` の起動（A0 の受け入れ基準7） | この文書では未確認 | — |
 
@@ -968,3 +1030,4 @@ A0 のコードには、付録B に無い番号 N-PREFS-SAVE（画面の好み�
 
 - 2026-11-16（オーケストレーター、S1）: 初版。main（`eca0fbd`）、E1b（`20c561d`）、A0（`35c8aea` と未コミットの変更）を読んで書いた。
 - 2026-11-16（ux-designer、S1 の読み合わせ）: 用語を D-063 と `glossary.md` に合わせた（設計目標、出典、ステップ、キャリア（搬送波）、従属電圧源、演算遅れ、周期の先頭、起動コードほか）。1.2 の版を読み合わせの時点に、6.4 の定常のずれの式を一般の形に、6.6・7.3・15.1・15.2 を D-063（E1f の 0.2%、E1h、E1i）に合わせた。7.2 に E1b の5回目の検証の結果（D-062）を書いた。15.3 を「既知の食い違い」にして、5点を足した。
+- 2026-11-16（solver-engineer、E1g）: E1b の統合に合わせて「統合前（E1b）」を「実装済み」に直した（1.2、3章、4章、5章、6章、7章、9章、14章。7.2 の判定と範囲は D-065・D-066 の形に）。E1g の内容を書いた: 4.1・4.2（`messages.py`、`signals.py`、`TEMPLATE_DISPLAY`）、5.1（`targets`・`missing` は予約、`source` の `manual`）、5.3・5.4（信号の情報と内部の印、指令で値が決まる電源の記録の決まり）、5.5（CSV の単位と注意の行）、6.1・6.7（区切り、進み具合、中断、発散）、8.1、9.1、9.3、10.2〜10.4（番号の付け方と対応表）、15.2・15.3。
