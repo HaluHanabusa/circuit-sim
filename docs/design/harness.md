@@ -201,7 +201,8 @@ python scripts/cycle.py record-ci E1a --result <結果のファイル>
     - 最初の起動（`nohup`）は、壊す前の試験が落ちて、何も壊さずに「流せなかった」で終わった（無視の SIGHUP を引き継いだ試験。7章のとおり直した）。
     - 1回目（816 通り）: 落ちた 774、一覧に無い生き残り 42、結果を得られなかった 0、作れなかった 0。42 の内訳: 試験を足して落としたもの 32（Windows の分岐は、模擬で落とす: Ctrl-Break、待ってやり直す秒数）、余分な処理を消したもの 9（`GIT_PREFIX` を除く一覧から外す。git は読まない。`encoding` と重なる `text=True`、英数字だけの形の指定の `ensure_ascii`、数を確かめた後の `zip` の `strict`、もうある場所の `parents=True`、書きかけのファイルの片付けを `discard` にまとめる）、同値として一覧に足したもの 1（Linux / macOS のロックを外す呼び出し。直後にファイルを閉じると外れる）。そのうち3件（`cycle.py`、`doctor.py`、`local_ci.py` が `NoDefaultCurrentDirectoryInExePath` を置くこと）は、試験が呼び出し元の環境の同じ変数で通っていた（試験の環境から外した）。
     - 2回目（806 通り）: 落ちた 805、生き残り 1。落とす試験はあったが、`scripts/check.py` を一時フォルダに写して流す試験なので、通った行の記録に入らず、選ばれていなかった。選び方を直した（9章）。
-    - 3回目（806 通り。同値 1 と別枠 0 は流さない）: （結果を書く）
+    - 3回目（806 通り。同値 1 と別枠 0 は流さない。流した内容は ecf302d、未コミットの変更なし）: 落ちた 806（うち 1 は時間切れ。`retry_while_busy` の `raise` を消すと、書けない状態ファイルをいつまでもやり直す）、一覧に無い生き残り 0、結果を得られなかった 0、作れなかった 0、後で止めた残りのプロセス 0、2770 秒。記録は `.cycle/mutants/result-20261116T133322.json`。D-052 の判定を満たす。
+    - 同値として一覧に残るのは1件（`cycle:unlock_handle:del:2`）。別枠（`[[platform_only]]`）は0件。Windows の分岐は、模擬する試験で、Linux でも落ちる。Windows の実機での壊す確認（`--only` と `--include-equivalent`）は、まだしていない。
 - 未確認（W2）:
   - OSのエラー画面を出さない設定が、Windows の実機で、壊れた `claude.exe` の画面を止めること（`tests/test_error_dialogs.py` の Windows の試験。POのPCで `python scripts\local_ci.py` を実行すると確かめられる。止まらずに、時間切れか合格で終わる）。書き込み中の `claude.exe` を起動できないこと（`test_cli_that_cannot_be_started_is_reported_without_changing_records`）も同じ。
   - Windows の実機での `scripts/local_ci.py`。POのPCで1回実行して確かめる（8章）。Windows の動作は、試験の中で模擬している（改行、置き換えと削除の待ち、実行できる印を信用しない設定、`\` 区切りのパス、空白と日本語を含む一時フォルダ）。
@@ -428,7 +429,7 @@ python scripts/local_ci.py --force          # 同じ内容の結果が既にあ�
 
 ```bash
 python scripts/mutants.py list                       # 壊し方の一覧（番号、場所、壊し方）
-python scripts/mutants.py run                        # 全部を流す（約820通り。Linux の2コアで2〜3時間）
+python scripts/mutants.py run                        # 全部を流す（約810通り。Linux の2コアで1〜2時間。前回落とした試験を先に流すと短くなる）
 python scripts/mutants.py run --sample 160           # 等間隔に選んだ見本だけを流す
 python scripts/mutants.py run --file scripts/doctor.py
 python scripts/mutants.py run --only cycle:git_paths:del:1 hand:lock-shared
