@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 
 import numpy as np
@@ -428,7 +429,7 @@ def test_c14_slowly_decaying_oscillation_shortens_the_default_time_and_says_so()
     period = 2 * math.pi * math.sqrt(1e-3 * 10e-6)
     assert len(res.t) - 1 == DEFAULT_STEP_BUDGET
     assert period / ex.h == pytest.approx(200, rel=0.01)                  # 振動は 1 周期 200 点のまま
-    short = [n for n in ex.notes if "計算時間" in n]
+    short = [n for n in ex.notes if "終了時刻" in n]   # E1g（D-063）: 「計算時間」→「終了時刻」
     assert len(short) == 1 and "simulation.t_end" in short[0] and "減衰が遅い" in short[0]
     v, _ = rlc_exact(res.t, 10.0, 0.01, 1e-3, 10e-6)
     assert max_err(res["v(out)"][:2001], v[:2001], 10.0) < TOL             # 最初の 10 周期は 1% 以内
@@ -526,7 +527,16 @@ def test_c14_cli_reports_the_limit_in_one_line(tmp_path, capsys):
     assert time.perf_counter() - start < 1.0
     out = capsys.readouterr().out
     assert "ステップ数: 20000" in out and out.count("注意:") >= 4          # 換算 3 件 ＋ 刻みを粗くした旨
-    assert len((tmp_path / "out.csv").read_text(encoding="utf-8").splitlines()) == 20002
+    # E1g（基準7）で期待値を改めた: コマンドラインの CSV は、データの後ろに注意を1つ1行で足す
+    # （「# [番号] 注意: 文」）。見出しとデータの行数（1 ＋ 20001）は前と同じ。残りの行は注意だけで、
+    # 画面に出た注意と、数も番号も文も同じ
+    lines = (tmp_path / "out.csv").read_text(encoding="utf-8").splitlines()
+    data, tail = lines[:20002], lines[20002:]
+    assert data[0] == "t [s],v(out) [V],i(L1) [A]"                          # 見出しに単位（D-042）
+    assert all(len([float(x) for x in ln.split(",")]) == 3 for ln in data[1:])   # データの行は数値 3 列だけ
+    shown = [ln.strip() for ln in out.splitlines() if "注意:" in ln]
+    assert len(tail) == len(shown) and tail == ["# " + ln for ln in shown]
+    assert all(re.match(r"# \[[A-Z0-9_]+\] 注意: \S", ln) for ln in tail)
 
 
 # ====================================== 注意（notes）: 出るべきときに出て、出ないべきときに出ない

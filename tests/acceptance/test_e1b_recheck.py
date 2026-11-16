@@ -58,12 +58,23 @@ def pct(x):
 
 def test_average_leg_is_a_command_source_with_the_on_resistance_in_series():
     """平均モデルのレグ: 電圧源の端 v(sw_avg) = Vin·指令、オン抵抗の先 v(sw) = v(sw_avg) − r_on·i(L1)、
-    電圧源の電流 i(Vleg)（素子の中を sw_avg → 0 が正）は −i(L1)。すべての時刻で 1e-9 以内。"""
+    電圧源の電流 i(Vleg)（素子の中を sw_avg → 0 が正）は −i(L1)。すべての時刻で 1e-9 以内。
+
+    E1g（D-048）で期待値を改めた: 指令が変わる格子点では、代数的な変数（v(sw_avg) など）は変わる直前の値
+    （その点までの区間の指令 cmd[k−1] で決まる値）を記録する。cmd[k] は、その点から始まる区間の指令。
+    指令が変わらない点では cmd[k−1] = cmd[k] なので、E1g の前と同じ式 v(sw_avg) = Vin·cmd[k] が成り立つ。"""
     ex = ref.build("average", 2e-3, control={"Vref_step": (10, "V"), "t_ref_step": (1, "ms")})
     res = ex.run()
     v_avg, v_sw, i_l, i_v, cmd = (res[k] for k in ("v(sw_avg)", "v(sw)", "i(L1)", "i(Vleg)", "cmd(duty)"))
     assert np.ptp(cmd) > 0.3 and np.ptp(i_l) > 1.0                     # 指令も電流も実際に動いている
-    assert np.max(np.abs(v_avg - VIN * cmd)) <= 1e-9
+    before = np.concatenate(([cmd[0]], cmd[:-1]))                      # その点までの区間で使われた指令
+    changed = before != cmd                                            # 指令が変わる格子点
+    assert np.count_nonzero(changed) > 150 and np.count_nonzero(~changed) > 1500   # どちらの点も十分にある
+    assert np.max(np.abs(v_avg[~changed] - VIN * cmd[~changed])) <= 1e-9          # 変わらない点: 前と同じ式
+    assert np.max(np.abs(v_avg[changed] - VIN * before[changed])) <= 1e-9         # 変わり目: 変わる直前の値
+    # 変わり目の点は、変わった後の値（E1g の前の記録）とは Vin·|指令の変化| だけ違う。最大は Vref のステップ
+    jump = np.abs(v_avg[changed] - VIN * cmd[changed])
+    assert np.max(np.abs(jump - VIN * np.abs(cmd - before)[changed])) <= 1e-9 and jump.max() > 5.0
     assert np.max(np.abs(v_sw - (v_avg - R_ON * i_l))) <= 1e-9
     assert np.max(np.abs(i_v + i_l)) <= 1e-9
     assert np.max(np.abs(v_sw - VIN * cmd)) > 1e-3                      # オン抵抗の電圧降下が見える大きさ

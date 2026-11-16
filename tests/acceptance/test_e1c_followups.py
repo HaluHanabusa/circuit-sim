@@ -434,7 +434,7 @@ def test_x_accepted_diode_states_are_physical_at_every_sample(vm, which):
 # ================================================================ 仕様に無い角: インダクタ電流の遮断の注意
 
 def interruption_notes(notes: list[str]) -> list[str]:
-    return [n for n in notes if "行き場" in n]
+    return [n for n in notes if "還流経路" in n]      # E1g（D-063）: 「行き場」→「還流経路」
 
 
 def test_x_interruption_example_of_the_review_is_noted():

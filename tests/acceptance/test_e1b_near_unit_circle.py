@@ -259,7 +259,8 @@ def test_radius_shown_as_below_one_when_it_says_below_one():
     plant, f_ctrl = (24.0, 470e-6, 10e-6, 6.0), 15e3
     best, err = _design(plant, f_ctrl, zero_ratio=1e-4)
     assert err is not None and 1.0 - 1e-4 < Ref(best, *plant, f_ctrl).radius() <= 1.0 - STABILITY_EPS
-    m = re.search(r"極の半径 ([\d.]+)（1 未満で安定）", str(err))
+    # E1g（D-063）: 「極の半径」→「閉ループ極の絶対値の最大」
+    m = re.search(r"閉ループ極の絶対値の最大 ([\d.]+)（1 未満で安定）", str(err))
     assert m and float(m.group(1)) < 1.0
 
 
