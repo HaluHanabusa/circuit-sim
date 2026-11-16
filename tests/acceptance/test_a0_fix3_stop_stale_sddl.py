@@ -349,8 +349,20 @@ def test_sddl_is_not_mistaken_for_private(name, sddl, file_ok, folder_ok):
     assert folder_dacl_is_private(sddl, ME) is folder_ok
 
 
-@pytest.mark.parametrize(("name", "sddl", "file_ok", "folder_ok"), SDDL_PAREN_IN_STRING,
-                         ids=[c[0] for c in SDDL_PAREN_IN_STRING])
+# 上の並びと同じ順の、短い ID（5回目の検証で足した。期待は変えていない）。日本語の名前を ID にすると、
+# pytest が1文字を 6 文字（\uXXXX）にするので、ID が 200 文字を超える（最長 254 文字）。名前は、試験に渡る
+# name にそのまま残る
+SDDL_PAREN_IDS = [
+    "close-paren-then-everyone", "deny-close-paren-then-everyone-folder", "two-close-parens",
+    "close-then-open-paren", "three-open-parens", "two-strings-with-close-paren", "ace-like-text-in-string",
+    "close-paren-ace-last-for-everyone", "close-paren-then-owner-only-control", "unclosed-quote",
+    "junk-between-aces", "junk-after-aces", "close-paren-after-aces", "junk-after-flags",
+    "owner-and-group-after-control", "sacl-with-close-paren-after-control", "trailing-spaces-control",
+]
+assert len(SDDL_PAREN_IDS) == len(SDDL_PAREN_IN_STRING) == len(set(SDDL_PAREN_IDS))
+
+
+@pytest.mark.parametrize(("name", "sddl", "file_ok", "folder_ok"), SDDL_PAREN_IN_STRING, ids=SDDL_PAREN_IDS)
 def test_sddl_with_parenthesis_inside_a_condition_string(name, sddl, file_ok, folder_ok):
     """文字列の中の括弧を数えない。読み残しがあれば「本人だけ」とみなさない（4回目に、読み残しの例を足した）。"""
     from circuit_sim.app.config import folder_dacl_is_private

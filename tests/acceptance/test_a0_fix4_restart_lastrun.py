@@ -416,7 +416,7 @@ def test_fifo_record_does_not_hang_the_start(tmp_path):
 @pytest.mark.parametrize(("lang", "expected"), [
     ("ja_JP.UTF-8", "circuit-sim は、起動するときにファイルを受け取りません（examples/rlc_series.json）。"),
     ("en_US.UTF-8", "circuit-sim doesn't take a file when it starts (examples/rlc_series.json)."),
-])
+], ids=["ja", "en"])  # 文を ID にしない（日本語は1文字が 6 文字になり、294 文字の ID になっていた）
 def test_file_argument_is_told_as_a_file_not_an_option(tmp_path, lang, expected):
     env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path / "config"), "LANG": lang, "LC_ALL": lang,
            "PYTHONIOENCODING": "utf-8"}

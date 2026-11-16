@@ -23,7 +23,6 @@ import json
 import os
 import queue
 import re
-import shlex
 import signal
 import socket
 import subprocess
@@ -34,6 +33,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import a0_fake_browser
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,29 +80,34 @@ class App:
             "LANG": "ja_JP.UTF-8",
             "PYTHONIOENCODING": "utf-8",
         }
-        args = [sys.executable, "-m", "circuit_sim.app", "--port", str(self.port)]
         if record is None:
-            args.append("--no-browser")
+            args = [sys.executable, "-m", "circuit_sim.app", "--port", str(self.port), "--no-browser"]
         else:
             recorder = record.with_suffix(".py")
             recorder.write_text(RECORDER, encoding="utf-8")
-            exe = sys.executable.replace("\\", "/")
-            env["BROWSER"] = f"{shlex.quote(exe)} {shlex.quote(str(recorder).replace(chr(92), '/'))} %s"
+            # 偽のブラウザだけで起動する（偽が失敗しても、本物のブラウザへ進まない。a0_fake_browser）
+            args = a0_fake_browser.app_argv("--port", str(self.port))
+            env["BROWSER"] = a0_fake_browser.command(recorder)
             env["A0V2_RECORD"] = str(record)
         self.proc = subprocess.Popen(
             args, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE
         )
-        threading.Thread(target=self._pump, daemon=True).start()
-        self.url, self.number = self.next_url()
-        self.base = f"http://127.0.0.1:{self.port}"
-        deadline = time.monotonic() + WAIT
-        while True:
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
-                break
-            except OSError:
-                assert self.proc.poll() is None and time.monotonic() < deadline, "".join(self.lines)
-                time.sleep(0.05)
+        try:
+            threading.Thread(target=self._pump, daemon=True).start()
+            self.url, self.number = self.next_url()
+            self.base = f"http://127.0.0.1:{self.port}"
+            deadline = time.monotonic() + WAIT
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                    break
+                except OSError:
+                    assert self.proc.poll() is None and time.monotonic() < deadline, "".join(self.lines)
+                    time.sleep(0.05)
+        except BaseException:
+            # 準備の途中で失敗しても、起動したアプリ本体を残さない（呼んだ側の finally には届かない）
+            self.stop()
+            raise
 
     def _pump(self) -> None:
         for raw in self.proc.stdout:
@@ -186,9 +191,10 @@ def app(tmp_path_factory):
 def wait_for_record(record: Path) -> list[str]:
     deadline = time.monotonic() + WAIT
     while not record.exists() or not record.read_text(encoding="utf-8"):
-        assert time.monotonic() < deadline, "ブラウザ（BROWSER）が呼ばれない"
+        assert time.monotonic() < deadline, "ブラウザ（BROWSER）が呼ばれない" + a0_fake_browser.problem()
         time.sleep(0.05)
     time.sleep(0.1)
+    assert a0_fake_browser.read_notes() == [], "偽のブラウザが失敗した、または本物の経路が呼ばれた"
     return json.loads(record.read_text(encoding="utf-8"))["argv"]
 
 

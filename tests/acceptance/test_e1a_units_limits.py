@@ -313,7 +313,7 @@ def test_c13_units_give_the_same_waveform_as_si_values():
     ("C", "uH", "インダクタンス", "キャパシタンス"), ("Vin", "A", "電流", "電圧"),
     ("L", "kHz", "周波数", "インダクタンス"), ("R", "ms", "時間", "抵抗"),
     ("C", "W", "電力", "キャパシタンス"),
-])
+], ids=["R-V", "L-F", "C-uH", "Vin-A", "L-kHz", "R-ms", "C-W"])  # 項目と単位だけ（量の名前は ID に入れない）
 def test_c13_wrong_dimension_is_an_error_naming_item_unit_and_expectation(name, unit, found, expected):
     with pytest.raises(ValueError) as exc:
         _expand_with(name, 1.0, unit)

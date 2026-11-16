@@ -23,6 +23,11 @@ HTTP で直接突く。製品のコードは import しない（期待値を実�
 - 設定の場所に書けないときは、理由を出して終了コード 2
 
 時間の基準は無い（待つ時間の上限は、混んだ機械でも落ちないように長めにとった。合否には使わない）。
+
+5回目の検証（docs/verification/A0-verifier-5.md）で、期待している中身を変えずに直した所:
+- ブラウザを開く起動は、a0_fake_browser を通す（偽のブラウザが失敗しても、本物のブラウザへ進まない）
+- 起動したアプリ本体は、途中で失敗しても必ず止める（App の準備の途中、試験の途中）
+- 壊れた設定ファイルの試験に、短い ID を付けた（pytest は ID を環境変数に入れる。Windows は 32767 文字まで）
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ import json
 import os
 import queue
 import re
-import shlex
 import signal
 import socket
 import stat
@@ -41,6 +45,7 @@ import threading
 import time
 from pathlib import Path
 
+import a0_fake_browser
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -86,27 +91,32 @@ class App:
             "LANG": "ja_JP.UTF-8",
             "PYTHONIOENCODING": "utf-8",
         }
-        args = [sys.executable, "-m", "circuit_sim.app", "--port", str(self.port)]
         if browser is None:
-            args.append("--no-browser")
+            args = [sys.executable, "-m", "circuit_sim.app", "--port", str(self.port), "--no-browser"]
         else:
-            exe = sys.executable.replace("\\", "/")
-            env["BROWSER"] = f"{shlex.quote(exe)} {shlex.quote(str(browser).replace(chr(92), '/'))} %s"
+            # 偽のブラウザだけで起動する（偽が失敗しても、本物のブラウザへ進まない。a0_fake_browser）
+            args = a0_fake_browser.app_argv("--port", str(self.port))
+            env["BROWSER"] = a0_fake_browser.command(browser)
             env["A0V2_RECORD"] = str(record)
         self.proc = subprocess.Popen(
             args, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE
         )
-        threading.Thread(target=self._pump, daemon=True).start()
-        self.url, self.number = self.next_url()
-        deadline = time.monotonic() + WAIT
-        while True:
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
-                break
-            except OSError:
-                assert self.proc.poll() is None, "アプリ本体が起動しない: " + self.out
-                assert time.monotonic() < deadline, "アプリ本体が応えない"
-                time.sleep(0.05)
+        try:
+            threading.Thread(target=self._pump, daemon=True).start()
+            self.url, self.number = self.next_url()
+            deadline = time.monotonic() + WAIT
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                    break
+                except OSError:
+                    assert self.proc.poll() is None, "アプリ本体が起動しない: " + self.out
+                    assert time.monotonic() < deadline, "アプリ本体が応えない"
+                    time.sleep(0.05)
+        except BaseException:
+            # 準備の途中で失敗しても、起動したアプリ本体を残さない（呼んだ側の finally には届かない）
+            self.stop()
+            raise
 
     @property
     def out(self) -> str:
@@ -343,9 +353,12 @@ def test_browser_gets_only_the_location_of_a_private_page(tmp_path):
     try:
         deadline = time.monotonic() + WAIT
         while not record.exists() or not record.read_text(encoding="utf-8"):
-            assert time.monotonic() < deadline, "ブラウザ（BROWSER）が呼ばれない: " + app.out
+            assert time.monotonic() < deadline, (
+                "ブラウザ（BROWSER）が呼ばれない" + a0_fake_browser.problem() + ": " + app.out
+            )
             time.sleep(0.05)
         time.sleep(0.1)
+        assert a0_fake_browser.read_notes() == [], "偽のブラウザが失敗した、または本物の経路が呼ばれた"
         argv = json.loads(record.read_text(encoding="utf-8"))["argv"]
         joined = " ".join(argv)
         assert app.number not in joined and app.token not in joined, argv
@@ -387,16 +400,19 @@ def test_unused_launch_page_is_removed_when_stopped(tmp_path, sig):
     record = tmp_path / "record.json"
     config = tmp_path / "config"
     app = App(config, browser=recorder, record=record)
-    deadline = time.monotonic() + WAIT
-    while not record.exists() or not record.read_text(encoding="utf-8"):
-        assert time.monotonic() < deadline
-        time.sleep(0.05)
-    time.sleep(0.1)
-    pages = list(config.glob("*.html"))
-    assert len(pages) == 1
-    app.proc.send_signal(getattr(signal, sig))
-    app.proc.wait(timeout=20)
-    assert list(config.glob("*.html")) == [], "止めた後も、使われなかった番号の転送用の HTML が残る"
+    try:
+        deadline = time.monotonic() + WAIT
+        while not record.exists() or not record.read_text(encoding="utf-8"):
+            assert time.monotonic() < deadline, "ブラウザ（BROWSER）が呼ばれない" + a0_fake_browser.problem()
+            time.sleep(0.05)
+        time.sleep(0.1)
+        pages = list(config.glob("*.html"))
+        assert len(pages) == 1
+        app.proc.send_signal(getattr(signal, sig))
+        app.proc.wait(timeout=20)
+        assert list(config.glob("*.html")) == [], "止めた後も、使われなかった番号の転送用の HTML が残る"
+    finally:
+        app.stop()  # 途中で失敗しても、待ち時間が切れても、起動したアプリ本体を残さない
 
 
 @pytest.mark.skipif(
@@ -428,7 +444,7 @@ def test_another_user_cannot_read_the_key_launch_page_or_settings(tmp_path):
         assert st == 200
         deadline = time.monotonic() + WAIT
         while not record.exists() or not record.read_text(encoding="utf-8"):
-            assert time.monotonic() < deadline
+            assert time.monotonic() < deadline, "ブラウザ（BROWSER）が呼ばれない" + a0_fake_browser.problem()
             time.sleep(0.05)
         time.sleep(0.1)
         targets = [config / "token", config / "settings.json", *config.glob("*.html")]
@@ -617,7 +633,9 @@ def test_preferences_follow_to_another_port(tmp_path):
         ("too large", b'{"lang": "en", "x": "' + b"a" * 70000 + b'"}'),
         ("deep", b"[" * 30000),
     ],
-    ids=lambda v: v if isinstance(v, str) else None,
+    # 中身（数万バイト）を ID に入れない。pytest は ID を環境変数 PYTEST_CURRENT_TEST に入れ、Windows の
+    # 環境変数は 32767 文字までなので、長い ID の試験は準備の段階でエラーになる
+    ids=["garbage", "array", "bad-utf-8", "too-large", "deep"],
 )
 def test_broken_settings_file_starts_with_defaults(tmp_path, name, content):
     config = tmp_path / "config"
