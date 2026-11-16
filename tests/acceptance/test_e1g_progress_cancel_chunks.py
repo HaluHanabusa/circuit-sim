@@ -213,6 +213,29 @@ def test_cancel_at_every_polling_point_never_returns_a_result(case):
         assert hp.signature(run()) == hp.signature(reference)     # 何度中断した後でも、同じ結果
 
 
+def test_cancel_is_also_polled_while_arrays_are_prepared_and_post_processed():
+    """準備（電源やゲート信号の配列）と後処理のあいだも、中断の求めを見る（1000 万ステップの計算では、
+    準備と後処理だけで 0.2 秒を超えるため）。
+
+    区切らない設定（時間ステップの間は見ない）で、配列を埋める単位を 1 行にする。求めを見る回数が、
+    ステップ数より多くなる。"""
+    counts = {}
+    for name, run, n_steps in (
+            ("linear", lambda **k: simulate(hp.rc(), 5e-3, 1e-5, **k), 500),
+            ("switched", lambda **k: simulate(hp.buck_diode(), 5e-5, gates=hp.gate(), **k), 1000)):
+        with hp.chunk_steps(hp.UNCHUNKED, setup_block=1):
+            polls = 0
+
+            def count():
+                nonlocal polls
+                polls += 1
+                return False
+
+            assert len(run(cancel=count).t) - 1 == n_steps
+            counts[name] = polls
+        assert polls > n_steps, counts
+
+
 def test_cancel_from_another_thread_with_an_event():
     """実際の使い方: 別のスレッドが threading.Event を立てる。"""
     run = LONG["linear_rc_250k"]()
