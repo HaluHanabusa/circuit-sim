@@ -20,6 +20,7 @@
 | `screens-v0.1.md` | 画面仕様（v0.1）。画面ごとの要素、状態、操作、文言（日英。辞書の元になる表）、受け入れ基準（AC-n-n。初版との対応は付録D）、お知らせの一覧、テンプレートの表示定義。リリースごとに `screens-*.md` を足す | ux-designer | あり。第2版（B 案と、降圧コンバータ1つの範囲。D-071、D-072） |
 | `design-system.md` | デザインの基準。色、文字、寸法と密度、基本部品、スコープと回路図の描き方、UX のゲートの見方 | ux-designer | あり。第2版（B 案。D-072） |
 | `mockups/direction-b/` | B 案の見本（PO が見て選んだ3枚）。**参考で、正ではない**（正は `design-system.md` と `screens-v0.1.md`） | ux-designer | A0r で追加 |
+| `mockups/second-edition-trial/` | 第2版で足した設計目標の群と評価の試し描き（見本を元に ux-designer が描いた2枚。寸法が収まるかの確認用）。**参考で、正ではない。PO が選んだものではない** | ux-designer | A0r で追加 |
 | `harness.md` | 開発ハーネス。ゲートの決まり、`scripts/cycle.py` の使い方、OS の違い、手元の確認 | tooling-engineer | あり |
 | `dependencies.md` | 依存とライセンスの一覧 | ui-engineer | 統合前（A0） |
 | `research-ui-v2.md` | 画面の見た目の調査と方向の案 | ux-designer | 統合前（A0r） |
