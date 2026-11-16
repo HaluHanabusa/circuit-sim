@@ -23,11 +23,15 @@
 止めるときは Ctrl+C。保存していない変更があるときは、1回目の Ctrl+C では止めずに知らせ、10 秒以内に
 もう一度押すと止める（画面仕様 14章の未決11。画面からは、アプリ本体を止める操作を防げないため）。
 Windows の Ctrl+Break も、Ctrl+C と同じに扱う（知らせ方も、終了コードも。break_as_interrupt）。
-端末の窓を閉じたときや、OS から止められたとき（SIGTERM）は、知らせずに止まる。
+OS から止められたとき（POSIX の SIGTERM）は、知らせずに止める。
+Windows で端末の窓を閉じたとき（ログオフ、シャットダウンも）は、C ランタイムが Ctrl+Break と同じ合図
+（SIGBREAK）として渡すので、Ctrl+Break と同じ扱いに入るが、OS がすぐにプロセスを終わらせる。保存して
+いない変更の知らせを人が読む時間は無く、後始末まで進むとは限らない（実機では、まだ確かめていない）。
 
-端末の Enter を読み始めるのは、ブラウザを開く呼び出しが戻ってから（open_when_ready の after_open）。
-ブラウザをコマンドで起動するとき（環境変数 BROWSER の指定など）、起動される側は標準入力をアプリ本体と
-共有する。Windows では、共有しているパイプに読み取りの待ちがあると、起動される側が始まれずに止まる。
+端末の Enter は、起動の直後から読む（ブラウザを開く呼び出しが戻るのを待たない）。Windows で標準入力が
+パイプのときは、待たない読み方をする（watch_enter。届いている量を調べて、届いた分だけ読む）。
+パイプを読んで待っていると、同じパイプを標準入力に受け継いだプログラム（環境変数 BROWSER のコマンドなど）が
+始まれないため（実機で確かめた。docs/design/app-design.md の 8.3）。
 
 端末に出す文言は、OS の言語で日本語か英語にする（LC_ALL、LC_MESSAGES、LANG の順。無ければ Windows の
 表示言語。ja で始まれば日本語）。
@@ -417,12 +421,13 @@ def break_as_interrupt(windows: bool) -> Iterator[None]:
     """Windows: Ctrl+Break（SIGBREAK）で止めた後も、Ctrl+C と同じに、main の後始末と「止めました」まで進める。
 
     uvicorn は、止め終えた後に、受け取った合図の扱いを元に戻してから、同じ合図を出し直す
-    （uvicorn.Server.capture_signals の signal.raise_signal）。SIGBREAK の元の扱いは「既定」で、Windows の
-    C ランタイムの raise は、既定の扱いの合図を受けると、その場で終了コード 3 で終わる（_exit(3)。Microsoft の
-    文書 signal: "By default, signal terminates the calling program with exit code 3"）。そのままだと、
-    「止めました」を出さずに終了コード 3 で終わる。
+    （uvicorn.Server.capture_signals の signal.raise_signal）。SIGBREAK の元の扱いは「既定」で、Windows では、
+    既定の扱いの SIGBREAK を出すと、その場で終了コード 3 で終わる（実機で確かめた:
+    signal.raise_signal(signal.SIGBREAK) の後の終了コードは 3。docs/design/app-design.md の 8.1）。
+    そのままだと、「止めました」を出さずに終了コード 3 で終わる（実機で、直す前にそうなった）。
     この中では、元の扱いを Ctrl+C の既定と同じ（KeyboardInterrupt を出す）にしておく。出し直された合図は
     KeyboardInterrupt として呼んだ側に届き、Ctrl+C と同じ終わり方になる。出るときに、扱いを戻す。
+    直した後の動きは、Windows の経路を身代わりの合図で流す試験で確かめた。実機では、まだ確かめていない。
 
     合図の扱いを決められるのは主スレッドだけなので、ほかのスレッドから呼ばれたときは何もしない
     （uvicorn も、主スレッドでなければ合図を受けない）。Windows でないときも、何もしない。"""
@@ -475,21 +480,95 @@ def enter_source(fd: int = 0, windows: bool = WINDOWS) -> str | None:
         return None
 
 
+# Windows のパイプに何も届いていないとき、次に調べるまで眠る時間。Enter を押してから新しい URL が出るまでの
+# 遅れは、長くてもこの時間（設計の原則 5「操作への反応は 0.1 秒以内」に収まる長さ）。調べるのは 1 秒に
+# 20 回で、1回は OS への問い合わせ1つなので、届かない間も CPU をほとんど使わない
+PIPE_POLL_SECONDS = 0.05
+# PeekNamedPipe の失敗のうち、「書く側が閉じた（入力の終わり）」を表すエラーの番号（Microsoft の文書
+# System Error Codes: ERROR_BROKEN_PIPE 109 "The pipe has been ended."、ERROR_PIPE_NOT_CONNECTED 233
+# "No process is on the other end of the pipe."）。CPython も、109 をパイプの終わりとして扱う
+# （Lib/multiprocessing/connection.py）
+ERROR_BROKEN_PIPE = 109
+ERROR_PIPE_NOT_CONNECTED = 233
+PIPE_ENDED = frozenset({ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED})
+
+
+def windows_pipe_ready(fd: int) -> Callable[[], int | None]:
+    """Windows: パイプ fd に届いているバイト数を、読まずに・待たずに調べる関数を作る。
+
+    作った関数は、届いているバイト数（届いていなければ 0）を返す。書く側が閉じていれば None。パイプとして
+    調べられない入力なら OSError。
+
+    調べ方は PeekNamedPipe(ハンドル, NULL, 0, NULL, &届いている量, NULL)（Microsoft の文書 PeekNamedPipe:
+    名前付きパイプにも、無名パイプの読む側にも使える。バッファを渡さなければ読まない。成功は 0 でない値、
+    失敗は 0 で、理由は GetLastError）。CPython の _winapi.PeekNamedPipe も、同じ形で呼ぶ。
+
+    なぜ待たない読み方が要るか: Windows の同期のハンドルは、操作を1つずつしか通さない。アプリ本体が
+    標準入力のパイプを読んで待っている間は、そのパイプを標準入力に受け継いだプログラム（標準入力を
+    差し替えずに起動されるもの。webbrowser がコマンドで起動するブラウザなど）が、起動のときに標準入力を
+    調べる所で止まる（実機で確かめた。docs/design/app-design.md の 8.3）。調べるだけなら、待ちは残らない。"""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                       wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD]
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(fd)
+    available = wintypes.DWORD(0)
+
+    def ready() -> int | None:
+        if kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+            return available.value
+        error = ctypes.get_last_error()
+        if error in PIPE_ENDED:
+            return None
+        raise OSError(errno.EINVAL, f"PeekNamedPipe failed (Windows error {error})")
+
+    return ready
+
+
 def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0,
-                start: bool = True) -> threading.Thread:
+                stop: threading.Event | None = None,
+                ready: Callable[[], int | None] | None = None) -> threading.Thread:
     """Enter を押すたびに on_enter を呼ぶ、別のスレッド（sys.stdin のロックを持たない os.read で読む）。
 
-    start が偽なら、スレッドを作るだけで始めない（呼ぶ側が、読み始めてよい時に start() する。main は、
-    ブラウザを開く呼び出しが戻ってから始める）。合図の扱い（SIGTTIN）は主スレッドでしか決められないので、
-    ここで決めておく。"""
+    読み方は入力で決まる:
+    - Windows のパイプ: 待たない読み方。届いている量を調べ（ready。省くと windows_pipe_ready）、届いた分だけ
+      読む。届いていなければ PIPE_POLL_SECONDS 眠る（stop が立てば、すぐ抜ける）。書く側が閉じたら終わる。
+      読み取りの待ちをパイプに残さないので、アプリ本体が起動するプログラムを止めない
+    - 端末（どの OS でも）と、Windows でない OS のパイプ: 待つ読み方（os.read が戻るまで待つ）
+    ready を渡すと、どの入力でも待たない読み方にする（試験が、Windows でない OS でこの道を流すため）。
+    パイプとして調べられない入力（ready が OSError）は、待つ読み方に戻す。"""
+    stop = stop if stop is not None else threading.Event()
     if source == "tty" and not WINDOWS:
         # 後でバックグラウンドへ回されても止められず、読み取りが失敗して終わるように
         signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+    if ready is None and WINDOWS and source == "pipe":
+        try:
+            ready = windows_pipe_ready(fd)
+        except (OSError, AttributeError, ImportError, ValueError):
+            ready = None  # 調べる用意ができない: 待つ読み方
 
     def loop() -> None:
-        while True:
+        peek = ready
+        while not stop.is_set():
+            size = 1024
+            if peek is not None:
+                try:
+                    count = peek()
+                except OSError:
+                    peek = None  # パイプとして調べられない入力: 待つ読み方に戻す
+                    continue
+                if count is None:
+                    return  # 書く側が閉じた（入力の終わり）
+                if count == 0:
+                    stop.wait(PIPE_POLL_SECONDS)  # 届いていない。短く眠る（止めるときは、すぐ抜ける）
+                    continue
+                size = min(count, size)  # 届いた分だけ読む（待たない）
             try:
-                data = os.read(fd, 1024)
+                data = os.read(fd, size)
             except OSError:
                 data = None
             if not data:
@@ -501,8 +580,7 @@ def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0,
                 on_enter()
 
     thread = threading.Thread(target=loop, name="circuit-sim-enter", daemon=True)
-    if start:
-        thread.start()
+    thread.start()
     return thread
 
 
@@ -577,23 +655,16 @@ def _remove(path: Path | None) -> None:
 
 
 def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable[[str], None], tr: Texts,
-                    used: Callable[[], bool] | None = None, wait: float = BROWSER_CHECK_SECONDS,
-                    after_open: Callable[[], None] | None = None) -> None:
+                    used: Callable[[], bool] | None = None, wait: float = BROWSER_CHECK_SECONDS) -> None:
     """サーバーが受け付けを始めたら、既定のブラウザで target（転送用の HTML の file:// の場所）を開く。
 
     開けなければ、url（端末で開く起動の URL）を出す。開いたのに wait 秒たっても番号が使われなければ
     （used() が偽。HTML がブラウザ以外で開いた、ブラウザがその場所を読めない、など）、
     url を開くよう案内する。
 
-    after_open は、ブラウザを開く呼び出しが戻ったとき（開けても開けなくても）に1回呼ぶ。main は、ここで
-    端末の Enter を読み始める。webbrowser は、コマンドで起動するブラウザ（環境変数 BROWSER の指定など）を、
-    標準入力を差し替えずに起動する（起動される側は、アプリ本体と同じ標準入力を持つ）。その間にアプリ本体が
-    標準入力を読んで待っていると、
-    - Windows では、標準入力がパイプのとき、起動される側が始まれずに止まる（同じパイプへの操作は1つずつ
-      順に処理され、読み取りの待ちが終わるまで次へ進まない。Python は起動のときに標準入力の位置を調べる。
-      CPython の issue 78961）。webbrowser.open が戻らないので、ブラウザは開かず、案内も出ない
-    - どの OS でも、端末で動くブラウザ（w3m など）と、キー入力を取り合う
-    ので、読み始めるのは呼び出しが戻ってから。"""
+    webbrowser.open は、コマンドで起動するブラウザ（環境変数 BROWSER の指定など）が終わるまで戻らない
+    ことがある（Python が名前を知らないコマンドは、終わりを待つ）。その間も、端末の Enter は効く
+    （Enter は別のスレッドが、起動の直後から読んでいる）。"""
     while not server.started and not server.should_exit:
         time.sleep(0.02)
     if server.should_exit:
@@ -602,9 +673,6 @@ def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable
         opened = webbrowser.open(target)
     except Exception:  # ブラウザを起動できない環境（画面の無いサーバーなど）でも、アプリ本体は動かし続ける
         opened = False
-    finally:
-        if after_open is not None:
-            after_open()
     if not opened:
         say(tr("browser.failed", url=url))
         return
@@ -731,33 +799,25 @@ def main(argv: list[str] | None = None) -> int:
     say(tr("url.note", minutes=minutes))
     say(tr(f"url.renew.{renew}"))
     say(tr("how_to_stop"))
-    watcher: threading.Thread | None = None
+    stop_reading = threading.Event()
     if source:
         def renew_url() -> None:
             say(tr("url.new", url=launch_url(base, launches.issue()), minutes=minutes))
 
-        watcher = watch_enter(renew_url, source, start=False)
-
-    def start_watching() -> None:
-        # Enter を読み始める。ブラウザを開くときは、開く呼び出しが戻ってから（open_when_ready の説明）
-        if watcher is not None:
-            watcher.start()
-
-    if args.no_browser:
-        start_watching()
-    else:
+        # Enter は、起動の直後から読む（ブラウザを開く呼び出しが戻るのを待たない）
+        watch_enter(renew_url, source, stop=stop_reading)
+    if not args.no_browser:
         try:
             # ブラウザには、番号を書いた本人だけが読める HTML の場所を渡す（起動の引数に番号を載せない）
             target = pages.write(number, url, settings.read().get("theme")).as_uri()
         except OSError:
             say(tr("browser.failed", url=url))
-            start_watching()
         else:
             def used() -> bool:
                 return not launches.is_open(number)
 
             threading.Thread(target=open_when_ready, args=(server, target, url, say, tr, used),
-                             kwargs={"after_open": start_watching}, daemon=True).start()
+                             daemon=True).start()
             sweeper = threading.Timer(LAUNCH_SECONDS + 1, launches.sweep)  # 期限で HTML を消す
             sweeper.daemon = True
             sweeper.start()
@@ -767,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        stop_reading.set()
         sock.close()
         pages.remove_all()
     say(tr("stopped"))

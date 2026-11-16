@@ -4,6 +4,7 @@ Python の playwright と Chromium 系のブラウザ（Chrome、Edge、playwrig
 無ければ、確かめなかったことをスキップの理由として結果に残す。ブラウザは CIRCUIT_SIM_CHROME で指定できる。
 CIRCUIT_SIM_SHOTS にフォルダを指定すると、確かめた画面の画像をそこに残す（作業ツリーの外に置く）。
 アプリ本体は別のプロセス（python -m circuit_sim.app）で起動し、止めたり起動し直したりする。
+起動したものは控えに入れ（tests/app_procs.py）、試験とモジュールの終わりに動いていたら、止めて失敗にする。
 設定の場所はモジュールごとの一時フォルダ。画面は、起動の URL（一度だけ使える起動の番号つき）から
 開く（D-051）。番号は1回しか使えないので、ブラウザの場を作るたびに、端末に Enter を送って新しい URL を
 出させる（利用者と同じ）。
@@ -22,6 +23,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+import app_procs as procs
 import pytest
 
 from circuit_sim.app import cli
@@ -53,11 +55,43 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-class App:
-    """アプリ本体のプロセス。止めて、同じポートで起動し直せる。設定の場所（合言葉、画面の好み）は config。"""
+# モジュールの間だけ動かすアプリ本体（app フィクスチャ）の、いまのプロセスの番号。試験の終わりには止めない
+# （試験の中で止めて起動し直したものも、次の試験へ持ち越す）。モジュールの終わりには止める
+KEPT: set[int] = set()
 
-    def __init__(self, config: Path, port: int | None = None) -> None:
+
+@pytest.fixture(scope="module", autouse=True)
+def no_process_left_after_the_module():
+    """このモジュールが起動したプロセスが、モジュールの終わりに動いていたら、止めて（子も）失敗にする。"""
+    start = procs.mark()
+    yield
+    KEPT.clear()
+    left = procs.reap(start)
+    if left:
+        pytest.fail("このモジュールが起動したプロセスが、モジュールの終わりにも動いていた（止めた）:\n"
+                    + "".join(f"  {line}\n" for line in left), pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def no_process_left_behind(no_process_left_after_the_module):
+    """その試験が起動したプロセス（app フィクスチャのものを除く）が、試験の終わりに動いていたら、止めて
+    その試験を失敗にする。"""
+    start = procs.mark()
+    yield
+    left = procs.reap(start, keep=KEPT)
+    if left:
+        pytest.fail("この試験が起動したプロセスが、試験の終わりにも動いていた（止めた）。試験の中で必ず止める:\n"
+                    + "".join(f"  {line}\n" for line in left), pytrace=False)
+
+
+class App:
+    """アプリ本体のプロセス。止めて、同じポートで起動し直せる。設定の場所（合言葉、画面の好み）は config。
+
+    keep が真なら、モジュールの間だけ動かすもの（試験の終わりの見張りは、止めない）。"""
+
+    def __init__(self, config: Path, port: int | None = None, keep: bool = False) -> None:
         self.config = config
+        self.keep = keep
         self.port = port or free_port()
         self.url = f"http://127.0.0.1:{self.port}/"
         self.token = load_token(config)  # アプリ本体と同じ合言葉（同じ設定の場所から読む。API を呼ぶため）
@@ -78,21 +112,29 @@ class App:
                 return m.group(0)
 
     def start(self) -> None:
+        """起動して、応えるまで待つ。応えないまま落ちるときは、起動したものを止めてから落ちる。"""
         env = {**os.environ, "CIRCUIT_SIM_CONFIG_DIR": str(self.config), "PYTHONIOENCODING": "utf-8"}
-        self.proc = subprocess.Popen(
+        self.proc = procs.spawn(
             [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(self.port)],
             cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
         )
-        self.lines = queue.Queue()
-        threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
-        deadline = time.monotonic() + 15
-        while True:
-            try:
-                self.api("api/health")
-                return
-            except OSError:
-                assert time.monotonic() < deadline, "アプリ本体が起動しない"
-                time.sleep(0.05)
+        if self.keep:
+            KEPT.add(self.proc.pid)
+        try:
+            self.lines = queue.Queue()
+            threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    self.api("api/health")
+                    return
+                except OSError:
+                    assert self.proc.poll() is None, "アプリ本体が終わった"
+                    assert time.monotonic() < deadline, "アプリ本体が起動しない"
+                    time.sleep(0.05)
+        except BaseException:
+            self.stop()
+            raise
 
     @staticmethod
     def _read(proc: subprocess.Popen, lines: queue.Queue) -> None:
@@ -100,9 +142,10 @@ class App:
             lines.put(raw.decode("utf-8", "replace"))
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait(timeout=10)
+        """止める（子も）。もう終わっていても、起動していなくても呼べる。"""
+        if self.proc is not None:
+            procs.kill_tree(self.proc)
+            KEPT.discard(self.proc.pid)
 
     def api(self, path: str, body: dict | None = None, method: str = "GET") -> dict:
         data = None if body is None else json.dumps(body).encode()
@@ -119,10 +162,12 @@ class App:
 
 @pytest.fixture(scope="module")
 def app(tmp_path_factory):
-    running = App(tmp_path_factory.mktemp("app-config"))
-    running.start()
-    yield running
-    running.stop()
+    running = App(tmp_path_factory.mktemp("app-config"), keep=True)
+    running.start()  # 応えないときは、start が止めてから落ちる
+    try:
+        yield running
+    finally:
+        running.stop()
 
 
 @pytest.fixture(scope="module")
@@ -606,9 +651,10 @@ def test_settings_survive_a_port_change_in_the_same_browser_profile(browser, tmp
     config = tmp_path / "config"
     first = App(config)
     first.start()
-    context = browser.new_context(viewport={"width": 1280, "height": 720}, locale="ja-JP",
-                                  color_scheme="light")
+    context = None
     try:
+        context = browser.new_context(viewport={"width": 1280, "height": 720}, locale="ja-JP",
+                                      color_scheme="light")
         page = context.new_page()
         page.goto(first.login_url)
         page.wait_for_selector("[data-testid=start]")
@@ -652,7 +698,8 @@ def test_settings_survive_a_port_change_in_the_same_browser_profile(browser, tmp
         finally:
             second.stop()
     finally:
-        context.close()
+        if context is not None:
+            context.close()
         first.stop()
 
 

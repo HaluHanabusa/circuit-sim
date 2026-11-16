@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path, PureWindowsPath
 
+import app_procs
 import pytest
 
 from circuit_sim.app.config import (
@@ -33,6 +34,17 @@ from circuit_sim.app.config import (
 )
 
 WINDOWS = os.name == "nt"
+
+
+@pytest.fixture(autouse=True)
+def no_process_left_behind():
+    """その試験が起動したプロセスが、試験の終わりに動いていたら、止めて、その試験を失敗にする。"""
+    start = app_procs.mark()
+    yield
+    left = app_procs.reap(start)
+    if left:
+        pytest.fail("この試験が起動したプロセスが、試験の終わりにも動いていた（止めた）:\n"
+                    + "".join(f"  {line}\n" for line in left), pytrace=False)
 
 
 def test_tests_never_touch_the_real_config():
@@ -153,14 +165,20 @@ def test_first_starts_at_the_same_time_share_one_key(tmp_path):
     for round_ in range(3):
         folder, go = tmp_path / f"c{round_}", tmp_path / f"go{round_}"
         ready = [tmp_path / f"ready{round_}-{i}" for i in range(8)]
-        procs = [subprocess.Popen([sys.executable, "-I", str(script), str(folder), str(go), str(CONFIG_PY),
-                                   str(r)], stdout=subprocess.PIPE, text=True) for r in ready]
-        deadline = time.monotonic() + 30
-        while not all(r.exists() for r in ready):
-            assert time.monotonic() < deadline and all(p.poll() is None for p in procs)
-            time.sleep(0.01)
-        go.write_text("go", encoding="utf-8")
-        tokens = {proc.communicate(timeout=30)[0].strip() for proc in procs}
+        procs: list[subprocess.Popen] = []
+        try:
+            for r in ready:
+                procs.append(app_procs.spawn([sys.executable, "-I", str(script), str(folder), str(go),
+                                              str(CONFIG_PY), str(r)], stdout=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + 30
+            while not all(r.exists() for r in ready):
+                assert time.monotonic() < deadline and all(p.poll() is None for p in procs)
+                time.sleep(0.01)
+            go.write_text("go", encoding="utf-8")
+            tokens = {proc.communicate(timeout=30)[0].strip() for proc in procs}
+        finally:
+            for proc in procs:  # 途中で落ちても、合図を待ち続けるプロセスを残さない
+                app_procs.kill_tree(proc)
         assert all(proc.returncode == 0 for proc in procs)
         assert len(tokens) == 1, tokens
         assert tokens == {(folder / TOKEN_FILE).read_text(encoding="ascii").strip()}
@@ -172,7 +190,7 @@ def test_threads_starting_together_share_one_key(tmp_path):
     results: list[str] = []
 
     def run():
-        barrier.wait()
+        barrier.wait(timeout=30)
         results.append(load_token(tmp_path / "c"))
 
     threads = [threading.Thread(target=run) for _ in range(16)]

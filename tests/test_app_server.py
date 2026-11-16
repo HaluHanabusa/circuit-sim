@@ -61,11 +61,18 @@ class Running:
         self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [self.sock]}, daemon=True)
 
     def start(self) -> Running:
+        """別のスレッドで動かし、受け付けを始めるまで待つ（プロセスは起動しない）。
+
+        始まらないまま落ちるときは、止めてから落ちる。"""
         self.thread.start()
         deadline = time.monotonic() + 10
-        while not self.server.started:
-            assert time.monotonic() < deadline, "サーバーが起動しない"
-            time.sleep(0.02)
+        try:
+            while not self.server.started:
+                assert time.monotonic() < deadline, "サーバーが起動しない"
+                time.sleep(0.02)
+        except BaseException:
+            self.stop()
+            raise
         return self
 
     def stop(self) -> None:
@@ -105,8 +112,10 @@ class Running:
 @pytest.fixture(scope="module")
 def srv(tmp_path_factory):
     running = Running(tmp_path_factory.mktemp("config")).start()
-    yield running
-    running.stop()
+    try:
+        yield running
+    finally:
+        running.stop()
 
 
 def test_health_returns_instance_that_changes_per_start(srv, tmp_path):

@@ -4,11 +4,18 @@
 起動したときの URL（/?k=…）に載るのは、一度だけ使える起動の番号（合言葉ではない）。試験も画面と同じく、
 その URL を1回開いてクッキーを受け取る。2つ目の URL が要るときは、端末に Enter を送って出させる。
 
-ブラウザを開く起動（--no-browser を付けない起動）は、必ず launch_with_fake_browser で起動する。偽のブラウザが
-失敗しても、OS の既定のブラウザ（本物）へ進ませない見張りを付けて起動する（BROWSER_GUARD の説明）。
+起動の決まり（tests/app_procs.py）:
+- アプリ本体は launch（--no-browser つき）か launch_with_fake_browser で起動する。どちらも、起動したものを
+  控えに入れる。試験の終わりに動いていたら、見張り（no_process_left_behind）が止めて、その試験を失敗にする。
+  「起動に失敗して終わるはず」の起動は run_to_end で流す（終わらなければ、止めてから落とす）。
+- ブラウザを開く起動（--no-browser を付けない起動）は、必ず launch_with_fake_browser。偽のブラウザが
+  失敗しても、OS の既定のブラウザ（本物）へ進ませない見張りを付けて起動する（BROWSER_GUARD の説明）。
+  launch は、--no-browser の無い起動を断る。
+- 端末の出力は、待つ上限つきで読む（proc.next_line、proc.wait_line）。製品が何も出さなくなる後退が入っても、
+  試験は止まらずに落ちる。
 
-Windows だけの分岐を、OS の呼び出しを差し替えて Linux でも流す試験は、差し替える値を実機の値に合わせる。
-出どころは、それぞれの試験に書く（CPython 3.13 のソース、Microsoft の文書、PO の PC での結果）。
+Windows だけの分岐を、OS の呼び出しを差し替えて Linux でも流す試験は、差し替える値を実機の値か、
+Microsoft の文書・CPython のソースの値に合わせる。出どころは、それぞれの試験に書く。
 """
 from __future__ import annotations
 
@@ -16,7 +23,6 @@ import errno
 import http.cookiejar
 import json
 import os
-import queue
 import re
 import shlex
 import signal
@@ -26,11 +32,13 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import app_procs as procs
 import pytest
 
 from circuit_sim.app import cli
@@ -54,20 +62,43 @@ START_LIMIT_S = 5.0
 URL_RE = re.compile(r"http://127\.0\.0\.1:(\d+)/(\?k=[A-Za-z0-9_-]+)?")
 
 
+@pytest.fixture(autouse=True)
+def no_process_left_behind():
+    """その試験が起動したプロセスが、試験の終わりに動いていたら、止めて（子も）、その試験を失敗にする。"""
+    start = procs.mark()
+    yield
+    left = procs.reap(start)
+    if left:
+        pytest.fail("この試験が起動したプロセスが、試験の終わりにも動いていた（止めた）。試験の中で必ず止める:\n"
+                    + "".join(f"  {line}\n" for line in left), pytrace=False)
+
+
+def app_env(config: Path, lang: str = "ja_JP.UTF-8", extra: dict | None = None) -> dict[str, str]:
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config), "LC_ALL": lang,
+            **(extra or {})}
+
+
 def launch(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None = None,
-           stdin=subprocess.DEVNULL) -> subprocess.Popen:
-    full_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config),
-                "LC_ALL": lang, **(env or {})}
-    return subprocess.Popen(
-        [sys.executable, "-m", "circuit_sim.app", *args],
-        cwd=ROOT,
-        env=full_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=stdin,
-        text=True,
-        encoding="utf-8",
-    )
+           stdin=subprocess.DEVNULL, creationflags: int = 0) -> procs.Launched:
+    """アプリ本体を起動する（python -m circuit_sim.app）。ブラウザを開かない起動だけ。
+
+    引数の誤りや --help で終わるはずの起動にも --no-browser を付ける（製品が起動してしまっても、本物の
+    ブラウザが、生きている起動の番号を持つ HTML を開かないように）。"""
+    assert "--no-browser" in args, "ブラウザを開く起動は、launch_with_fake_browser で起動する"
+    return procs.Launched([sys.executable, "-m", "circuit_sim.app", *args], cwd=ROOT,
+                          env=app_env(config, lang, env), stdin=stdin, creationflags=creationflags)
+
+
+def run_to_end(*args: str, config: Path, lang: str = "ja_JP.UTF-8", env: dict | None = None,
+               timeout: float = 30.0) -> tuple[int, str]:
+    """終わるはずの起動（--help、引数の誤り、起動に失敗する起動）を流し、（終了コード、出力）を返す。
+
+    timeout 秒たっても終わらなければ（期待と違って、起動に成功して待ち受けている）、止めてから落とす。"""
+    proc = launch(*args, config=config, lang=lang, env=env)
+    try:
+        return proc.end(timeout)
+    finally:
+        proc.stop()
 
 
 # ブラウザを開く起動のときの見張り（アプリ本体を始める前に流す。製品のコードは変えない）。
@@ -105,36 +136,29 @@ else:
 """
 
 
-def browser_command(script: Path) -> str:
+def browser_command(script: Path, background: bool = False) -> str:
     """BROWSER に渡す、偽のブラウザのコマンド（%s に開く場所が入る）。
 
     webbrowser は、%s を含む指定を shlex（POSIX の決まり）で分けるので、\\ は / に直し（Windows の API は
-    どちらも受ける）、空白を含む場所は引用符で包む。"""
-    return " ".join(shlex.quote(part.replace("\\", "/")) for part in (sys.executable, str(script))) + " %s"
+    どちらも受ける）、空白を含む場所は引用符で包む。background が真なら、終わりに & を付ける（webbrowser は、
+    起動してすぐ戻る。付けなければ、コマンドが終わるまで待つ）。"""
+    parts = " ".join(shlex.quote(part.replace("\\", "/")) for part in (sys.executable, str(script)))
+    return parts + " %s" + (" &" if background else "")
 
 
-def fake_browser_env(script: Path) -> dict[str, str]:
+def fake_browser_env(script: Path, background: bool = False) -> dict[str, str]:
     """偽のブラウザ script を BROWSER に置く環境変数。偽が失敗した記録は script と同じ場所の .failed。"""
-    return {"BROWSER": browser_command(script),
+    return {"BROWSER": browser_command(script, background),
             "CIRCUIT_SIM_TEST_BROWSER_FAILED": str(script.with_suffix(".failed"))}
 
 
-def launch_with_fake_browser(script: Path, *, config: Path, lang: str = "ja_JP.UTF-8",
-                             stdin=subprocess.DEVNULL) -> subprocess.Popen:
+def launch_with_fake_browser(script: Path, *args: str, config: Path, lang: str = "ja_JP.UTF-8",
+                             stdin=subprocess.DEVNULL, background: bool = False,
+                             entry: str = BROWSER_GUARD) -> procs.Launched:
     """ブラウザを開く起動（--no-browser 無し）。ブラウザは偽の script だけ（見張りつき。BROWSER_GUARD）。"""
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config), "LC_ALL": lang,
-           **fake_browser_env(script)}
+    env = app_env(config, lang, fake_browser_env(script, background))
     env.pop("CIRCUIT_SIM_TEST_BROWSER_OPEN", None)
-    return subprocess.Popen(
-        [sys.executable, "-c", BROWSER_GUARD],
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=stdin,
-        text=True,
-        encoding="utf-8",
-    )
+    return procs.Launched([sys.executable, "-c", entry, *args], cwd=ROOT, env=env, stdin=stdin)
 
 
 def fake_browser_failure(script: Path) -> str | None:
@@ -143,53 +167,25 @@ def fake_browser_failure(script: Path) -> str | None:
     return failed.read_text(encoding="utf-8") if failed.exists() else None
 
 
-def read_lines_until_url(proc: subprocess.Popen, timeout: float = 15) -> tuple[str, list[str]]:
+def read_lines_until_url(proc: procs.Launched, timeout: float = 15) -> tuple[str, list[str]]:
+    """起動した場所（URL）の行までを読む。timeout 秒のうちに出なければ、それまでの出力を添えて落とす。"""
     deadline = time.monotonic() + timeout
     lines: list[str] = []
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline()
+    while True:
+        try:
+            line = proc.next_line(deadline - time.monotonic())
+        except AssertionError as exc:
+            raise AssertionError(f"起動した場所の表示が無い。{exc}") from None
         lines.append(line)
         m = URL_RE.search(line)
         if m:
             return m.group(0), lines
-        if proc.poll() is not None and not line:
-            break
-    raise AssertionError(f"起動した場所の表示が無い: {lines}")
 
 
-def pump_lines(proc: subprocess.Popen) -> tuple[queue.Queue, threading.Thread]:
-    """端末の出力の残りを、別のスレッドで読み続ける（行が出ないときに、試験が待ち続けないように）。
-
-    始めた後は、proc.stdout をほかから読まない（止めるときは kill と wait。communicate は使わない）。"""
-    lines: queue.Queue = queue.Queue()
-
-    def loop() -> None:
-        try:
-            for line in proc.stdout:
-                lines.put(line)
-        except ValueError:
-            pass  # 読んでいる間に閉じられた
-        lines.put(None)
-
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
-    return lines, thread
-
-
-def wait_for_line(lines: queue.Queue, start: str, timeout: float) -> str:
-    """start で始まる行が出るまで待つ。timeout 秒のうちに出なければ、それまでの行を添えて落とす。"""
+def next_lines(proc: procs.Launched, count: int, timeout: float = 10.0) -> list[str]:
+    """続きの count 行（起動の案内の残りなど）。"""
     deadline = time.monotonic() + timeout
-    seen: list[str] = []
-    while True:
-        try:
-            line = lines.get(timeout=max(0.01, deadline - time.monotonic()))
-        except queue.Empty:
-            raise AssertionError(f"{start!r} で始まる行が {timeout} 秒たっても出ない: {seen}") from None
-        if line is None:
-            raise AssertionError(f"{start!r} で始まる行が出ないまま、アプリ本体が終わった: {seen}")
-        seen.append(line)
-        if line.startswith(start):
-            return line
+    return [proc.next_line(deadline - time.monotonic()) for _ in range(count)]
 
 
 class Client:
@@ -241,11 +237,9 @@ def token_of(config: Path) -> str:
     return (config / "token").read_text(encoding="ascii").strip()
 
 
-def stop(proc: subprocess.Popen) -> str:
-    if proc.poll() is None:
-        proc.kill()
-    out, _ = proc.communicate(timeout=10)
-    return out
+def stop(proc: procs.Launched) -> str:
+    """止める（子も）。出力の全部を返す。"""
+    return proc.stop()
 
 
 def test_starts_and_serves_page_quickly(tmp_path):
@@ -312,16 +306,18 @@ def test_default_port_falls_back_to_the_next(tmp_path):
     except OSError:
         holder.close()
         holder = None  # ほかのプログラムが使っている（それでも、次を試すことは確かめられる）
-    proc = launch("--no-browser", config=tmp_path)
     try:
-        url, lines = read_lines_until_url(proc)
-        port = int(URL_RE.match(url).group(1))
-        assert port != DEFAULT_PORT
-        assert port in FALLBACK_PORTS or all(_busy(p) for p in FALLBACK_PORTS)
-        notice = f"ポート {DEFAULT_PORT} が使えないため、ポート {port} で起動します。"
-        assert any(notice in ln for ln in lines), lines
+        proc = launch("--no-browser", config=tmp_path)
+        try:
+            url, lines = read_lines_until_url(proc)
+            port = int(URL_RE.match(url).group(1))
+            assert port != DEFAULT_PORT
+            assert port in FALLBACK_PORTS or all(_busy(p) for p in FALLBACK_PORTS)
+            notice = f"ポート {DEFAULT_PORT} が使えないため、ポート {port} で起動します。"
+            assert any(notice in ln for ln in lines), lines
+        finally:
+            stop(proc)
     finally:
-        stop(proc)
         if holder:
             holder.close()
 
@@ -344,10 +340,8 @@ def test_busy_port_is_reported_and_exits_2(tmp_path, lang, expected):
         busy.bind(("127.0.0.1", 0))
         busy.listen(1)
         port = busy.getsockname()[1]
-        proc = launch("--no-browser", "--port", str(port), config=tmp_path, lang=lang)
-        proc.wait(timeout=20)
-        out = proc.communicate()[0]
-    assert proc.returncode == 2
+        code, out = run_to_end("--no-browser", "--port", str(port), config=tmp_path, lang=lang)
+    assert code == 2
     assert expected.format(port=port) in out
 
 
@@ -445,8 +439,11 @@ def test_explicit_port_is_retried_when_it_was_the_previous_one():
 
 def test_pid_alive_tells_running_and_finished_processes_apart():
     assert cli.pid_alive(os.getpid())
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait(timeout=20)
+    proc = procs.spawn([sys.executable, "-c", "pass"])
+    try:
+        proc.wait(timeout=20)
+    finally:
+        procs.kill_tree(proc)
     assert not cli.pid_alive(proc.pid)
     assert not cli.pid_alive(0)
 
@@ -462,14 +459,10 @@ def test_restart_returns_to_the_previous_port_with_a_browser_still_connected(tmp
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
-           "LC_ALL": "ja_JP.UTF-8"}
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0
 
-    def start(*args: str) -> subprocess.Popen:
-        return subprocess.Popen([sys.executable, "-m", "circuit_sim.app", "--no-browser", *args], cwd=ROOT,
-                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=flags)
+    def start(*args: str) -> procs.Launched:
+        return launch("--no-browser", *args, config=tmp_path, creationflags=flags)
 
     proc = start("--port", str(port))
     conns = []
@@ -512,14 +505,16 @@ def test_explicit_port_is_the_only_one_tried():
 
 
 def winerror(code: int) -> OSError:
-    """Windows のソケットのエラー code（WSAGetLastError の値）を、Python が Windows で作るのと同じ形にする。
+    """Windows のソケットのエラー code（WSAGetLastError の値）の身代わり。CPython のソースの決まりの形で作る。
 
-    Python は、ソケットの失敗を OSError(errno, 文, None, winerror) にする（Modules/socketmodule.c の
+    CPython は、ソケットの失敗を OSError(errno, 文, None, winerror) にする（Modules/socketmodule.c の
     set_error → PyErr_SetExcFromWindowsErr）。errno は PC/errmap.h の winerror_to_errno が決める:
     - WSAEACCES（10013）は 10000 を引いた 13（EACCES）。例外の型は PermissionError
     - WSAEADDRINUSE（10048）などは、そのまま 10048（Windows の errno.EADDRINUSE も 10048。
       Modules/errnomodule.c が、errno.h の値ではなく WSA の値を使う）
-    winerror の項目は、Windows でない OS の Python では作られないので、後から足す。"""
+    winerror の項目は、Windows でない OS の Python では作られないので、後から足す。
+    Windows の実物の OSError が同じ組になることは、下の Windows の試験が確かめる
+    （test_real_bind_errors_on_windows_have_the_numbers_of_the_stand_ins）。"""
     posix_like = {10004: 4, 10009: 9, 10013: 13, 10014: 14, 10022: 22, 10024: 24}  # winerror_to_errno の表
     exc = OSError(posix_like.get(code, code), "windows")
     exc.winerror = code
@@ -538,11 +533,44 @@ def test_bind_errors_are_told_apart(exc, kind):
     assert port_problem(exc) == kind
 
 
-def test_windows_errors_in_the_tests_have_the_shape_python_gives_them():
-    """差し替えに使う Windows のエラーが、実機の形（errno と winerror の組）になっている。"""
+def test_stand_in_windows_errors_follow_the_cpython_error_table():
+    """身代わりの Windows のエラーが、CPython のソースの決まり（winerror の説明）の組になっている。
+
+    手で写した表との突き合わせで、実物との突き合わせではない（実物は、下の Windows の試験）。"""
     denied, in_use = winerror(10013), winerror(10048)
     assert (denied.errno, denied.winerror) == (13, 10013) and isinstance(denied, PermissionError)
     assert (in_use.errno, in_use.winerror) == (10048, 10048)
+
+
+@pytest.mark.skipif(not WINDOWS,
+                    reason="Windows の、結べないときの実物のエラー（POのPCの local_ci で流れる）")
+def test_real_bind_errors_on_windows_have_the_numbers_of_the_stand_ins(record_property):
+    """Windows で実際に結び損ねたときの OSError の（errno、winerror）が、身代わりと同じ組になる。
+
+    - 使用中: 製品の結び方（何も付けない）で結んだポートを、同じ結び方でもう一度結ぶ → WSAEADDRINUSE
+    - 許されない: SO_EXCLUSIVEADDRUSE で結んだポートを、SO_REUSEADDR で結ぶ → WSAEACCES
+    （Microsoft の文書 Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE の表: 1つ目が既定で 2つ目も既定なら
+    INUSE、1つ目が SO_EXCLUSIVEADDRUSE で 2つ目が SO_REUSEADDR なら ACCESS）。
+    実物の組は、結果のファイル（JUnit XML の properties）に残す。"""
+    first = cli.bind(0)
+    try:
+        with pytest.raises(OSError) as busy:
+            cli.bind(first.getsockname()[1]).close()
+    finally:
+        first.close()
+    with socket.socket() as exclusive, socket.socket() as reuse:
+        exclusive.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        exclusive.bind(("127.0.0.1", 0))
+        reuse.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        with pytest.raises(OSError) as refused:
+            reuse.bind(("127.0.0.1", exclusive.getsockname()[1]))
+    seen = {"in_use": (busy.value.errno, busy.value.winerror),
+            "denied": (refused.value.errno, refused.value.winerror)}
+    record_property("bind_errors", repr(seen))
+    assert seen["in_use"] == (winerror(10048).errno, 10048) == (10048, 10048), seen
+    assert seen["denied"] == (winerror(10013).errno, 10013) == (13, 10013), seen
+    assert isinstance(refused.value, PermissionError)
+    assert port_problem(busy.value) == "in_use" and port_problem(refused.value) == "denied"
 
 
 @pytest.mark.parametrize("lang", ["ja", "en"])
@@ -561,9 +589,8 @@ def test_each_bind_error_has_its_own_guidance(lang):
 @pytest.mark.skipif(WINDOWS or os.geteuid() == 0,
                     reason="POSIX の一般の利用者でだけ、1024 未満のポートが拒まれる")
 def test_privileged_port_is_reported_as_denied(tmp_path):
-    proc = launch("--no-browser", "--port", "1", config=tmp_path)
-    out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 2
+    code, out = run_to_end("--no-browser", "--port", "1", config=tmp_path)
+    assert code == 2
     assert "ポート 1 は使えません" in out
 
 
@@ -624,9 +651,12 @@ def shown_bind_result(port: int, administered: bool, exc: OSError | None) -> str
 def test_windows_excluded_port_range_is_reported_as_denied(tmp_path, record_property):
     """OS に拒まれる（WSAEACCES 10013）予約のポートは、「使えません」と netsh の確かめ方で案内する。
 
-    netsh に出る範囲のすべてが拒まれるわけではない。* の印の範囲（管理者が足した除外）は、動的なポートの
-    割り当てから外すだけで、決めて結ぶことはできる（PO の PC では、50000 が「使用中」と案内された）。
-    だから、拒まれるかどうかは、製品と同じ結び方で実際に結んで確かめてから選ぶ。"""
+    netsh に出る範囲のすべてが拒まれるわけではない。* の印の範囲（管理者が足した除外）は、結べる。
+    PO の PC の範囲は「50000 50059 *」で、直す前のこの試験は、先頭の 50000 を渡して起動した。起動は成功し、
+    試験は止めずに終わったので、アプリ本体が 50000 で待ち受けたまま残った（流し直しで「ほかのプログラムが
+    使っています」と出たのは、その残りがポートを持っていたため）。
+    だから、拒まれるかどうかは、製品と同じ結び方で実際に結んで確かめてから選び、起動は run_to_end で流す
+    （終わらなければ、止めてから落とす）。"""
     probed = windows_reserved_ports()
     shown = "、".join(shown_bind_result(*item) for item in probed) or "予約の範囲が無い"
     record_property("reserved_ports", shown)
@@ -634,9 +664,9 @@ def test_windows_excluded_port_range_is_reported_as_denied(tmp_path, record_prop
     if not refused:
         pytest.skip(f"この PC には、OS に拒まれる（10013）予約のポートが無い: {shown}")
     port = refused[0]
-    proc = launch("--no-browser", "--port", str(port), config=tmp_path)
-    out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 2
+    # 先の確かめと起動のあいだにポートが空くと、起動に成功する。run_to_end は、そのとき止めてから落とす
+    code, out = run_to_end("--no-browser", "--port", str(port), config=tmp_path)
+    assert code == 2
     assert f"ポート {port} は使えません" in out and "netsh" in out
 
 
@@ -658,9 +688,8 @@ def test_windows_reserved_ports_are_reported_as_the_os_answers(tmp_path, record_
         expected = {"in_use": f"ポート {port} は、ほかのプログラムが使っています",
                     "denied": f"ポート {port} は使えません",
                     "other": f"ポート {port} で待ち受けられませんでした"}[port_problem(exc)]
-        proc = launch("--no-browser", "--port", str(port), config=tmp_path / str(port))
-        out = proc.communicate(timeout=20)[0]
-        assert proc.returncode == 2, (shown, out)
+        code, out = run_to_end("--no-browser", "--port", str(port), config=tmp_path / str(port))
+        assert code == 2, (shown, out)
         assert expected in out, (shown, out)
         code = getattr(exc, "winerror", None)
         assert (code == 10048) == ("ほかのプログラムが使っています" in out), (shown, out)
@@ -671,11 +700,10 @@ def test_windows_reserved_ports_are_reported_as_the_os_answers(tmp_path, record_
     ("ja_JP.UTF-8",
      ["使い方:", "オプション", "待ち受けるポート", "ブラウザを開かない", "この説明を出して終わる"]),
     ("en_US.UTF-8", ["usage:", "options", "port to listen on", "don't open a browser", "show this help"]),
-])
+], ids=["ja", "en"])
 def test_help_is_in_one_language(tmp_path, lang, words):
-    proc = launch("--help", config=tmp_path, lang=lang)
-    out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 0
+    code, out = run_to_end("--no-browser", "--help", config=tmp_path, lang=lang)
+    assert code == 0
     for word in words:
         assert word in out, (word, out)
     if lang.startswith("en"):
@@ -713,10 +741,10 @@ def test_help_is_in_one_language(tmp_path, lang, words):
 def test_bad_arguments_are_explained_in_one_language(tmp_path, args, lang, text):
     """引数の誤りの行に、argparse の英語（argument --port:、unrecognized arguments など）を残さない。
 
-    （UX の改善5）"""
-    proc = launch(*args, config=tmp_path, lang=lang)
-    out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 2 and text in out, out
+    （UX の改善5）。どの起動にも、頭に --no-browser を付ける（誤った引数で起動してしまう後退が入っても、
+    本物のブラウザが開かないように。誤りの見分けと文は、付けても変わらない）。"""
+    code, out = run_to_end("--no-browser", *args, config=tmp_path, lang=lang)
+    assert code == 2 and text in out, out
     for english in ("argument ", "unrecognized", "expected one", "ignored explicit", "invalid"):
         assert english not in out, out
     if lang.startswith("ja"):
@@ -816,11 +844,15 @@ def test_terminal_language_on_windows_follows_the_display_language(tmp_path):
     assert terminal_lang({}, windows=True) == expected
     env = {k: v for k, v in os.environ.items() if k.upper() not in ("LC_ALL", "LC_MESSAGES", "LANG")}
     env.update(PYTHONIOENCODING="utf-8", CIRCUIT_SIM_CONFIG_DIR=str(tmp_path))
-    done = subprocess.run([sys.executable, "-m", "circuit_sim.app", "--help"], cwd=ROOT, env=env,
-                          capture_output=True, text=True, encoding="utf-8", timeout=60)
-    assert done.returncode == 0, done.stderr
-    assert ("使い方:" in done.stdout) == (expected == "ja"), (hex(langid), done.stdout)
-    assert ("usage:" in done.stdout) == (expected == "en"), (hex(langid), done.stdout)
+    done = procs.Launched([sys.executable, "-m", "circuit_sim.app", "--no-browser", "--help"], cwd=ROOT,
+                          env=env)
+    try:
+        code, out = done.end(60)
+    finally:
+        done.stop()
+    assert code == 0, out
+    assert ("使い方:" in out) == (expected == "ja"), (hex(langid), out)
+    assert ("usage:" in out) == (expected == "en"), (hex(langid), out)
 
 
 def test_terminal_texts_exist_in_both_languages():
@@ -858,17 +890,17 @@ def recording_browser(folder: Path, before: str = "") -> tuple[Path, Path]:
     return script, record
 
 
-def wait_for_browser_record(record: Path, script: Path, proc: subprocess.Popen, timeout: float) -> list[str]:
+def wait_for_browser_record(record: Path, script: Path, proc: procs.Launched, timeout: float) -> list[str]:
     """偽のブラウザが控えた引数。呼ばれなければ、偽のブラウザが失敗していたかどうかを添えて落とす。"""
     deadline = time.monotonic() + timeout
     while not record.exists():
         if time.monotonic() > deadline:
             failed = fake_browser_failure(script)
             raise AssertionError(
-                "偽のブラウザが呼ばれない（ブラウザを開く呼び出しが戻っていない）" if failed is None
+                "偽のブラウザが呼ばれない（ブラウザのコマンドが始まっていない）" if failed is None
                 else f"偽のブラウザが失敗した（渡された場所: {failed.strip()}）"
             )
-        assert proc.poll() is None, "アプリ本体が終わった"
+        assert proc.poll() is None, "アプリ本体が終わった: " + proc.out
         time.sleep(0.05)
     return json.loads(record.read_text(encoding="utf-8"))
 
@@ -882,9 +914,10 @@ def test_browser_gets_only_the_location_of_a_private_page(tmp_path, stdin):
     出した URL へ移るだけ。番号が使われたら消える。
 
     stdin-pipe は、アプリ本体が標準入力のパイプから Enter を読む起動（ほかのプログラムから起動された形）。
-    Windows では、アプリ本体がパイプを読んで待っている間に起動されたブラウザのコマンドは、始まれずに止まる
-    （POのPCで、受け入れ試験の偽のブラウザが 30 秒たっても呼ばれなかった）。読み始めるのを、ブラウザを開く
-    呼び出しが戻った後にしたので、どちらの入力でも START_LIMIT_S のうちに呼ばれる。Windows でも流れる。"""
+    Windows では、アプリ本体がパイプを読んで待っていると、その間に起動されたブラウザのコマンドが始まれない
+    （PO の PC で、受け入れ試験の偽のブラウザが 30 秒たっても呼ばれなかった。仕組みも実機で確かめた）。
+    製品は、Windows のパイプを待たない読み方にしたので、どちらの入力でも START_LIMIT_S のうちに呼ばれるはず
+    （Windows でも流れる。直した後の Windows での結果は、まだ無い。Linux では、直す前から通る）。"""
     script, record = recording_browser(tmp_path)
     config = tmp_path / "config"
     proc = launch_with_fake_browser(script, config=config, stdin=stdin)
@@ -903,7 +936,7 @@ def test_browser_gets_only_the_location_of_a_private_page(tmp_path, stdin):
             assert stat.S_IMODE(config.stat().st_mode) == 0o700
         assert url in page.read_text(encoding="utf-8")
         wait_up(url.split("?")[0], START_LIMIT_S)
-        lines += [proc.stdout.readline() for _ in range(3)]
+        lines += next_lines(proc, 3)
         assert not any(token in line for line in lines), lines
         # ブラウザが HTML から移ったのと同じに、番号を1回使う。HTML は消える。2回目は使えない
         first, second = Client(url), Client(url)
@@ -955,57 +988,6 @@ def test_open_when_ready_passes_a_file_location_and_tells_when_nothing_opened(tm
     assert not page.exists()
 
 
-@pytest.mark.parametrize("outcome", ["opened", "not-opened", "raised"])
-def test_open_when_ready_tells_when_the_browser_call_has_returned(monkeypatch, outcome):
-    """after_open は、ブラウザを開く呼び出しが戻った後に1回だけ呼ばれる（開けても、開けなくても、例外でも）。
-
-    main は、ここで端末の Enter を読み始める。呼び出しの最中には呼ばれない。"""
-    events: list[str] = []
-
-    def fake_open(target):
-        events.append("open-start")
-        if outcome == "raised":
-            raise RuntimeError("no display")
-        events.append("open-end")
-        return outcome == "opened"
-
-    monkeypatch.setattr(cli.webbrowser, "open", fake_open)
-    said: list[str] = []
-    cli.open_when_ready(FakeServer(), "file:///x.html", "http://u", said.append, Texts("en"), lambda: True,
-                        wait=0.3, after_open=lambda: events.append("after"))
-    assert events[0] == "open-start" and events[-1] == "after" and events.count("after") == 1
-    assert bool(said) == (outcome != "opened")
-
-
-def test_open_when_ready_does_not_start_reading_when_the_app_is_already_stopping(monkeypatch):
-    class Stopping:
-        started = False
-        should_exit = True
-
-    monkeypatch.setattr(cli.webbrowser, "open", lambda target: pytest.fail("止めている最中に開いた"))
-    called: list[str] = []
-    cli.open_when_ready(Stopping(), "file:///x.html", "http://u", called.append, Texts("en"),
-                        after_open=lambda: called.append("after"))
-    assert called == []
-
-
-def test_watch_enter_can_be_created_first_and_started_later():
-    """Enter を読むスレッドは、作るだけにして、後から始められる（start=False）。始めるまでは読まない。"""
-    r, w = os.pipe()
-    got = threading.Event()
-    try:
-        thread = cli.watch_enter(got.set, "pipe", fd=r, start=False)
-        os.write(w, b"\n")
-        assert not thread.is_alive() and not got.wait(0.2), "始める前に読んでいる"
-        thread.start()
-        assert got.wait(5), "始めた後、先に送っておいた Enter を読まない"
-    finally:
-        os.close(w)  # 入力の終わりで、読むスレッドが終わる
-        thread.join(timeout=5)
-        os.close(r)
-    assert not thread.is_alive()
-
-
 def test_open_when_ready_is_quiet_once_the_number_is_used(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.webbrowser, "open", lambda target: True)
     said: list[str] = []
@@ -1039,29 +1021,102 @@ def test_unused_launch_page_is_removed_when_stopped_by_sigterm(tmp_path):
     assert fake_browser_failure(script) is None
 
 
-def test_enter_is_read_only_after_the_browser_call_returns(tmp_path):
-    """端末の Enter を読み始めるのは、ブラウザを開く呼び出しが戻ってから。
+# ------------------------------------------------------------------ 端末の Enter と、ブラウザのコマンド
 
-    偽のブラウザを 1 秒待たせ、その間に Enter を送っておく。新しい URL が出るのは、偽のブラウザが終わった後
-    （先に読み始めると、Windows では標準入力を共有するブラウザのコマンドが始まれず、どの OS でも、端末で動く
-    ブラウザとキー入力を取り合う）。送っておいた Enter は捨てない（後で読んで、新しい URL を出す）。"""
-    script, record = recording_browser(tmp_path, before="time.sleep(1.0)")
-    proc = launch_with_fake_browser(script, config=tmp_path / "config", stdin=subprocess.PIPE)
-    pump = None
+# 終わるまで戻らないブラウザの身代わり: 呼ばれたことを控え（started）、止める印（stop）が置かれるまで動く
+# （置かれなくても 30 秒で自分で終わる。試験が落ちても、残り続けない）。標準入力は読まない
+SLOW_BROWSER = """\
+import os, sys, time
+
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "started.part"), "w", encoding="utf-8") as f:
+    f.write(sys.argv[-1])
+os.replace(os.path.join(here, "started.part"), os.path.join(here, "started"))
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline and not os.path.exists(os.path.join(here, "stop")):
+    time.sleep(0.05)
+with open(os.path.join(here, "done"), "w", encoding="utf-8") as f:
+    f.write("done")
+"""
+
+
+@pytest.mark.parametrize("background", [False, True], ids=["waits-for-the-command", "returns-at-once"])
+def test_enter_gives_a_new_url_while_the_browser_command_is_running(tmp_path, background):
+    """ブラウザのコマンドが動いている間も、端末の Enter で新しい URL が出る。コマンドは、ちゃんと始まる。
+
+    BROWSER のコマンドは、Python の webbrowser が終わりを待つ形（waits-for-the-command。名前を知らない
+    コマンド）と、起動してすぐ戻る形（returns-at-once。終わりに & を付けた指定）の両方。
+    - Enter は、ブラウザを開く呼び出しが戻るのを待たずに読む（待つ形でも、ブラウザを閉じる前に効く）。
+    - コマンドは、アプリ本体が標準入力（パイプ）の Enter を待っている最中に起動されても、始まる。
+      Windows では、パイプを読んで待っていると始まれないので、待たない読み方をしている（すぐ戻る形は、
+      「開く呼び出しが戻ってから読み始める」やり方では守れない見込みだった。読み始めた後に、コマンドの
+      起動が続くため）。"""
+    script = tmp_path / "slow_browser.py"
+    script.write_text(SLOW_BROWSER, encoding="utf-8")
+    proc = launch_with_fake_browser(script, config=tmp_path / "config", stdin=subprocess.PIPE,
+                                    background=background)
     try:
         url, _ = read_lines_until_url(proc)
+        deadline = time.monotonic() + START_LIMIT_S + 5
+        while not (tmp_path / "started").exists():
+            assert time.monotonic() < deadline, "ブラウザのコマンドが始まらない: " + proc.out
+            assert proc.poll() is None, "アプリ本体が終わった: " + proc.out
+            time.sleep(0.05)
         proc.stdin.write("\n")
         proc.stdin.flush()
-        lines, pump = pump_lines(proc)
-        line = wait_for_line(lines, "新しい URL", START_LIMIT_S + 5)
-        assert record.exists(), "偽のブラウザが終わる前に、Enter を読んでいる"
+        line = proc.wait_line("新しい URL", timeout=5)
+        assert not (tmp_path / "done").exists(), "ブラウザのコマンドが終わってから、新しい URL が出た"
         assert URL_RE.search(line).group(0) != url
     finally:
-        proc.kill()
-        proc.wait(timeout=10)
-        if pump is not None:
-            pump.join(timeout=10)
+        (tmp_path / "stop").write_text("stop", encoding="utf-8")
+        stop(proc)
     assert fake_browser_failure(script) is None
+
+
+# 転送用の HTML を書けない起動の入口（製品のコードは変えない。起動の前に2つ差し替える）:
+# - LaunchPages.write を、書けなかったとき（空きが無い）と同じ OSError にする
+# - webbrowser.open を、呼ばれたら控えるだけのものにする（呼ばれないはず。呼ばれても、本物は開かない）
+NO_LAUNCH_PAGE_ENTRY = """\
+import errno, os, sys
+
+from circuit_sim.app import cli
+
+
+def cannot_write(self, number, url, theme=None):
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def must_not_open(target, *args, **kwargs):
+    with open(os.environ["CIRCUIT_SIM_TEST_BROWSER_FAILED"], "a", encoding="utf-8") as f:
+        f.write("opened " + str(target) + "\\n")
+    return True
+
+
+cli.LaunchPages.write = cannot_write
+cli.webbrowser.open = must_not_open
+raise SystemExit(cli.main(sys.argv[1:]))
+"""
+
+
+def test_enter_works_when_the_launch_page_cannot_be_written(tmp_path):
+    """転送用の HTML を書けなかった起動でも、URL を案内し、端末の Enter で新しい URL を出す。
+
+    ブラウザは開かない（開く場所が無い）。「ブラウザを開けませんでした」と、端末で開く URL を出す。"""
+    script, _record = recording_browser(tmp_path)
+    proc = launch_with_fake_browser(script, config=tmp_path / "config", stdin=subprocess.PIPE,
+                                    entry=NO_LAUNCH_PAGE_ENTRY)
+    try:
+        url, _ = read_lines_until_url(proc)
+        failed = proc.wait_line("ブラウザを開けませんでした", timeout=START_LIMIT_S)
+        assert url in failed
+        wait_up(url.split("?")[0], START_LIMIT_S)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        line = proc.wait_line("新しい URL", timeout=5)
+        assert URL_RE.search(line).group(0) != url
+    finally:
+        stop(proc)
+    assert fake_browser_failure(script) is None, "転送用の HTML が無いのに、ブラウザを開こうとした"
 
 
 @pytest.mark.parametrize(("code", "failed"), [(0, False), (1, True)], ids=["fake-ok", "fake-fails"])
@@ -1074,14 +1129,432 @@ def test_fake_browser_guard_never_falls_through_to_the_real_browser(tmp_path, co
     script.write_text(f"import sys\nsys.exit({code})\n", encoding="utf-8")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", **fake_browser_env(script),
            "CIRCUIT_SIM_TEST_BROWSER_OPEN": "file:///circuit-sim-test/never-opened.html"}
-    done = subprocess.run([sys.executable, "-c", BROWSER_GUARD], cwd=ROOT, env=env, capture_output=True,
-                          text=True, encoding="utf-8", stdin=subprocess.DEVNULL, timeout=60)
-    assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == "True"  # 次の候補（OS の既定のブラウザ）へ進まない
+    done = procs.Launched([sys.executable, "-c", BROWSER_GUARD], cwd=ROOT, env=env)
+    try:
+        returncode, out = done.end(60)
+    finally:
+        done.stop()
+    assert returncode == 0, out
+    assert out.strip() == "True"  # 次の候補（OS の既定のブラウザ）へ進まない
     if failed:
         assert fake_browser_failure(script) == "file:///circuit-sim-test/never-opened.html\n"
     else:
         assert fake_browser_failure(script) is None
+
+
+# ------------------------------------------------------------ Enter の読み方（待つ読み方、待たない読み方）
+
+
+def posix_pipe_ready(fd: int):
+    """Windows の PeekNamedPipe の身代わり（POSIX の本物のパイプで、待たない読み方の道を流すため）。
+
+    届いているバイト数（FIONREAD）。届いていなくて、書く側が閉じていれば None。windows_pipe_ready が作る
+    関数と同じ約束。"""
+    import array
+    import fcntl
+    import select
+    import termios
+
+    def ready() -> int | None:
+        count = array.array("i", [0])
+        fcntl.ioctl(fd, termios.FIONREAD, count)
+        if count[0]:
+            return count[0]
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        closed = any(event & select.POLLHUP for _, event in poller.poll(0))
+        return None if closed else 0
+
+    return ready
+
+
+def pipe_reader(fd: int):
+    """この OS で、パイプ fd を待たない読み方で読むための ready。
+
+    Windows は None（製品が、本物の PeekNamedPipe を使う）。ほかの OS は身代わり。"""
+    return None if WINDOWS else posix_pipe_ready(fd)
+
+
+def test_watch_enter_reads_a_pipe_and_ends_when_the_writer_closes():
+    """パイプの Enter を読む。書く側が閉じたら（入力の終わり）、読むスレッドは終わる。
+
+    Windows では、製品の待たない読み方（本物の PeekNamedPipe）で流れる。ほかの OS は、待つ読み方。"""
+    r, w = os.pipe()
+    count = []
+    got = threading.Event()
+
+    def on_enter() -> None:
+        count.append(1)
+        got.set()
+
+    try:
+        thread = cli.watch_enter(on_enter, "pipe", fd=r)
+        assert not got.wait(0.3), "何も送っていないのに、Enter を受けた"
+        os.write(w, b"abc")  # Enter でない文字は数えない
+        assert not got.wait(0.3)
+        os.write(w, b"\n")
+        assert got.wait(5), "送った Enter を読まない"
+        got.clear()
+        os.write(w, b"\r\n")
+        assert got.wait(5)
+    finally:
+        os.close(w)  # 入力の終わり
+    thread.join(timeout=5)
+    os.close(r)
+    assert not thread.is_alive(), "書く側が閉じても、読むスレッドが終わらない"
+    assert len(count) == 2
+
+
+def test_polling_reader_reads_only_what_has_arrived_and_never_waits(monkeypatch):
+    """待たない読み方: 届いている量を調べ、届いた分だけ読む。届いていない間は、読みに行かない。
+
+    本物のパイプで流す（Windows は本物の PeekNamedPipe、ほかの OS は身代わりの ready）。os.read を見張り、
+    読みに行くたびに、その時点で届いていた量を控える: 0 のときに読みに行けば、そこで待ってしまう。"""
+    r, w = os.pipe()
+    arrived = pipe_reader(r) or cli.windows_pipe_ready(r)
+    real_read = os.read
+    reads: list[tuple[int, int]] = []
+
+    def watched_read(fd, size):
+        if fd == r:
+            reads.append((arrived(), size))
+        return real_read(fd, size)
+
+    monkeypatch.setattr(cli.os, "read", watched_read)
+    got = threading.Event()
+    stop_reading = threading.Event()
+    try:
+        thread = cli.watch_enter(got.set, "pipe", fd=r, stop=stop_reading, ready=pipe_reader(r))
+        time.sleep(0.4)  # 何も届かない間
+        assert reads == [], "届いていないのに、読みに行った（そこで待つ）"
+        os.write(w, b"x" * 3000 + b"\n")  # 1回で読む量（1024）より多い
+        assert got.wait(5)
+        time.sleep(0.3)
+        assert reads and all(0 < size <= available for available, size in reads), reads
+        assert sum(size for _, size in reads) == 3001
+    finally:
+        stop_reading.set()
+        thread.join(timeout=5)
+        stopped = not thread.is_alive()  # パイプを閉じる前に見る（閉じると、入力の終わりでも終わる）
+        os.close(w)
+        os.close(r)
+    assert stopped, "止める合図で、読むスレッドが終わらない"
+
+
+def test_polling_reader_ends_when_the_writer_closes():
+    """待たない読み方: 書く側が閉じたら（入力の終わり）、止める合図が無くても、読むスレッドは終わる。
+
+    先に届いていた分は、読んでから終わる。本物のパイプで流す（Windows は本物の PeekNamedPipe）。"""
+    r, w = os.pipe()
+    got = threading.Event()
+    try:
+        thread = cli.watch_enter(got.set, "pipe", fd=r, ready=pipe_reader(r))
+        time.sleep(0.2)
+        assert thread.is_alive()
+        os.write(w, b"\n")
+    finally:
+        os.close(w)
+    thread.join(timeout=5)
+    ended = not thread.is_alive()
+    os.close(r)
+    assert ended, "書く側が閉じても、読むスレッドが終わらない"
+    assert got.is_set(), "閉じる前に届いていた Enter を、読まずに終わった"
+
+
+def test_polling_reader_follows_what_the_check_answers():
+    """待たない読み方の分かれ目を、調べた結果を差し替えて流す（どの OS でも）。
+
+    答えは windows_pipe_ready が作る関数の約束どおり: 0（届いていない）、正の数（届いている量）、
+    None（書く側が閉じた）、OSError（パイプとして調べられない）。
+    - 0 の間は読まず、PIPE_POLL_SECONDS おきに調べ直すだけ（回り続けない）
+    - 正の数なら、その分だけ読む
+    - None なら、読むのをやめる
+    - OSError なら、待つ読み方に戻す（パイプでない入力でも、Enter は読める）"""
+    r, w = os.pipe()
+    answers: list = [0, 0, 0, 2, 0, None]
+    asked: list[float] = []
+
+    def scripted():
+        asked.append(time.monotonic())
+        return answers.pop(0) if answers else 0  # 終わりの後も聞かれたら、届いていないと答え続ける
+
+    count = []
+    try:
+        os.write(w, b"\n\n")
+        thread = cli.watch_enter(lambda: count.append(1), "pipe", fd=r, ready=scripted)
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "None（書く側が閉じた）で終わらない"
+        assert len(asked) == 6, "None（書く側が閉じた）の後も、調べ続けた"
+        assert len(count) == 1  # 1回の読み取りに Enter が2つ入っていても、1回
+        gaps = [b - a for a, b in zip(asked, asked[1:], strict=False)]
+        assert gaps[0] >= cli.PIPE_POLL_SECONDS * 0.8 and gaps[1] >= cli.PIPE_POLL_SECONDS * 0.8, gaps
+
+        def cannot_check():
+            raise OSError(errno.EINVAL, "PeekNamedPipe failed (Windows error 1)")
+
+        got = threading.Event()
+        thread = cli.watch_enter(got.set, "pipe", fd=r, ready=cannot_check)
+        os.write(w, b"\n")
+        assert got.wait(5), "調べられない入力で、待つ読み方に戻らない"
+    finally:
+        os.close(w)
+        thread.join(timeout=5)
+        os.close(r)
+    assert not thread.is_alive()
+
+
+def test_polling_reader_does_not_spin_while_nothing_arrives():
+    """何も届かない間、待たない読み方は CPU を使い続けない。
+
+    2 秒のあいだ何も送らず、調べた回数と、このプロセスが使った CPU の時間を見る。調べるのは
+    PIPE_POLL_SECONDS おき（2 秒で 40 回ほど）。CPU の時間の上限 0.5 秒は、回り続けたとき（2 秒近くになる）と
+    見分けるための大きめの値。Windows では、本物の PeekNamedPipe で流れる。"""
+    r, w = os.pipe()
+    inner = pipe_reader(r) or cli.windows_pipe_ready(r)
+    asked = []
+
+    def counted():
+        asked.append(1)
+        return inner()
+
+    stop_reading = threading.Event()
+    try:
+        thread = cli.watch_enter(lambda: None, "pipe", fd=r, stop=stop_reading, ready=counted)
+        used = time.process_time()
+        time.sleep(2.0)
+        used = time.process_time() - used
+        checks = len(asked)
+    finally:
+        stop_reading.set()
+        thread.join(timeout=5)
+        stopped = not thread.is_alive()
+        os.close(w)
+        os.close(r)
+    assert stopped, "止める合図で、読むスレッドが終わらない"
+    assert 5 <= checks <= 2.0 / cli.PIPE_POLL_SECONDS + 5, checks
+    assert used < 0.5, f"何も届かない 2 秒の間に、CPU を {used:.2f} 秒使った（調べた回数 {checks}）"
+
+
+class FakePeekNamedPipe:
+    """kernel32.PeekNamedPipe の身代わり。呼ばれ方を控え、決めた答えを返す（ctypes の関数と同じに、引数と
+    戻り値の型を後から決められる）。
+
+    答えは Microsoft の文書の約束: 成功は 0 でない値で、届いている量を 5 番目の引数の先に書く。失敗は 0 で、
+    理由は GetLastError（ここでは error）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.available: int | None = 0  # None なら失敗
+        self.error = 0
+        self.argtypes: list | None = None
+        self.restype: object = None
+
+    def __call__(self, handle, buffer, size, read, available, left) -> int:
+        self.calls.append((handle, buffer, size, read, left))
+        if self.available is None:
+            return 0
+        available._obj.value = self.available  # ctypes.byref で渡された DWORD
+        return 1
+
+
+def test_windows_pipe_ready_calls_peek_named_pipe_as_documented(monkeypatch):
+    """windows_pipe_ready が、PeekNamedPipe を文書どおりに呼び、答えを約束どおりに読む。
+
+    Windows の API を差し替えて流す（どの OS でも）。差し替える値の出どころ（Microsoft の文書）:
+    - PeekNamedPipe(hNamedPipe, lpBuffer, nBufferSize, lpBytesRead, lpTotalBytesAvail,
+      lpBytesLeftThisMessage): バッファは NULL でよい（読まない）。成功は 0 でない値、失敗は 0 で、
+      理由は GetLastError
+    - System Error Codes: ERROR_BROKEN_PIPE 109（The pipe has been ended.）、ERROR_PIPE_NOT_CONNECTED 233
+      （No process is on the other end of the pipe.）、ERROR_INVALID_FUNCTION 1、ERROR_INVALID_HANDLE 6
+    本物の呼び出しは、Windows の試験（パイプを使う上の試験と、下の「子が始まれる」試験）で流れる。"""
+    import ctypes
+    from ctypes import wintypes
+
+    peek = FakePeekNamedPipe()
+    kernel32 = types.SimpleNamespace(PeekNamedPipe=peek)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: kernel32, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: peek.error, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: 4000 + fd))
+    ready = cli.windows_pipe_ready(7)
+    assert peek.argtypes == [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD,
+                             wintypes.LPDWORD, wintypes.LPDWORD] and peek.restype is wintypes.BOOL
+    assert ready() == 0
+    peek.available = 5
+    assert ready() == 5
+    assert peek.calls[-1] == (4007, None, 0, None, None), "ハンドルのほかは、量を受け取る所だけを渡す"
+    peek.available = None
+    for ended in (109, 233):
+        peek.error = ended
+        assert ready() is None, f"エラー {ended} は、書く側が閉じた（入力の終わり）"
+    for other in (1, 6):
+        peek.error = other
+        with pytest.raises(OSError, match=f"Windows error {other}"):
+            ready()
+    assert cli.PIPE_ENDED == {109, 233} == {cli.ERROR_BROKEN_PIPE, cli.ERROR_PIPE_NOT_CONNECTED}
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows の本物の PeekNamedPipe（POのPCの local_ci で流れる）")
+def test_windows_pipe_ready_on_a_real_pipe():
+    """本物のパイプで: 届いていなければ 0、届いた量、読んだ後は 0、書く側が閉じたら None。"""
+    r, w = os.pipe()
+    try:
+        ready = cli.windows_pipe_ready(r)
+        assert ready() == 0
+        os.write(w, b"abc")
+        assert ready() == 3
+        assert os.read(r, 2) == b"ab"
+        assert ready() == 1
+        assert os.read(r, 1) == b"c"
+        assert ready() == 0
+        os.close(w)
+        w = None
+        assert ready() is None
+    finally:
+        if w is not None:
+            os.close(w)
+        os.close(r)
+
+
+# 「標準入力（パイプ）の Enter を待っている間に、標準入力を差し替えずに起動した子が、始まれるか」を確かめる
+# 入口（PO の PC で確かめた形と同じ。docs/design/app-design.md の 8.3）。最初の引数で、待ち方を選ぶ:
+#   product    製品の読み方（cli.watch_enter）で待つ
+#   blocking   読んで待つ（os.read が戻るまで待つ。直す前の読み方）
+# 子（python -c pass）が 10 秒のうちに終われば started、終わらなければ HANG を出す。その後、標準入力が閉じる
+# まで待つ（Enter を受けたら enter を出す）
+CHILD_WHILE_WAITING_ENTRY = """\
+import os, subprocess, sys, threading, time
+
+from circuit_sim.app import cli
+
+got = threading.Event()
+if sys.argv[1] == "product":
+    cli.watch_enter(got.set, "pipe")
+else:
+    def blocking():
+        while os.read(0, 1024):
+            got.set()
+
+    threading.Thread(target=blocking, daemon=True).start()
+time.sleep(1.0)     # 待ちに入るまで
+child = subprocess.Popen([sys.executable, "-c", "pass"])    # 標準入力を差し替えない（webbrowser と同じ）
+try:
+    child.wait(timeout=10)
+    print("started", flush=True)
+except subprocess.TimeoutExpired:
+    print("HANG", flush=True)
+    child.kill()
+    child.wait(timeout=10)
+print("enter" if got.wait(20) else "no-enter", flush=True)
+"""
+
+
+def child_while_waiting(tmp_path: Path, mode: str) -> tuple[str, str]:
+    """（子が始まれたか started / HANG、その後に送った Enter を受けたか enter / no-enter）。"""
+    proc = procs.Launched([sys.executable, "-c", CHILD_WHILE_WAITING_ENTRY, mode], cwd=ROOT,
+                          env=app_env(tmp_path), stdin=subprocess.PIPE)
+    try:
+        child = proc.next_line(40).strip()
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        enter = proc.next_line(40).strip()
+        return child, enter
+    finally:
+        proc.stop()
+
+
+def test_a_child_can_start_while_the_product_waits_for_enter_on_a_pipe(tmp_path):
+    """製品の読み方で標準入力（パイプ）の Enter を待っている間も、標準入力を受け継ぐ子は始まれる。
+
+    Windows では、読んで待っていると子が始まれない（下の対照）。製品の待たない読み方なら、始まれるはず。
+    Enter も、その後に読める。Windows でない OS では、どちらの読み方でも始まれる。"""
+    assert child_while_waiting(tmp_path, "product") == ("started", "enter")
+
+
+@pytest.mark.skipif(not WINDOWS,
+                    reason="Windows の、読んで待つ間は子が始まれないことの対照（POのPCで流れる）")
+def test_a_blocking_read_on_a_pipe_keeps_a_child_from_starting_on_windows(tmp_path):
+    """対照: 読んで待つ読み方（直す前）だと、Windows では、標準入力を受け継ぐ子が始まれない。
+
+    PO の PC で確かめた形（スレッドが os.read で待っている間に起動した python -c pass は、5 秒たっても
+    終わらない）。上の試験が、読み方の違いを見分けられることの確かめ。この対照が成り立たない環境
+    （Python か Windows の作りが変わった）では、スキップにして、そう記録する。"""
+    child, _enter = child_while_waiting(tmp_path, "blocking")
+    if child != "HANG":
+        pytest.skip("読んで待つ読み方でも、子が始まれた（この環境では、対照が成り立たない）")
+
+
+# 端末（疑似端末）を標準入力にして起動する入口。起動されたプロセスは、新しいまとまりの先頭にいる
+# （tests/app_procs.py の spawn）。疑似端末を、そのまとまりの端末にしてから、アプリ本体に入れ替わる
+TTY_ENTRY = """\
+import fcntl, os, sys, termios
+
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+os.execv(sys.executable, [sys.executable, "-m", "circuit_sim.app", *sys.argv[1:]])
+"""
+
+only_with_a_pty = pytest.mark.skipif(
+    WINDOWS, reason="疑似端末は POSIX だけ（Windows のコンソールからの Enter と Ctrl+C は、手で確かめる）",
+)
+
+
+def launch_on_a_tty(config: Path, *args: str) -> tuple[procs.Launched, int]:
+    """アプリ本体を、疑似端末を標準入力にして起動する。（起動したもの、端末の人の側の fd）。"""
+    master, slave = os.openpty()
+    try:
+        proc = procs.Launched([sys.executable, "-c", TTY_ENTRY, "--no-browser", *args], cwd=ROOT,
+                              env=app_env(config), stdin=slave)
+    except BaseException:
+        os.close(master)
+        raise
+    finally:
+        os.close(slave)
+    return proc, master
+
+
+@only_with_a_pty
+def test_enter_on_a_terminal_gives_a_new_url(tmp_path):
+    """端末（tty）から Enter を読む道: 端末で Enter を押すと、新しい URL が出る。
+
+    疑似端末を標準入力にして起動する（人が端末で起動した形。enter_source は "tty"）。"""
+    proc, master = launch_on_a_tty(tmp_path)
+    try:
+        url, lines = read_lines_until_url(proc)
+        lines += next_lines(proc, 3)
+        assert any("ここで Enter を押すと新しい URL を出します" in ln for ln in lines), lines
+        wait_up(url.split("?")[0], START_LIMIT_S)
+        os.write(master, b"\n")
+        line = proc.wait_line("新しい URL", timeout=5)
+        assert URL_RE.search(line).group(0) != url
+        os.write(master, b"abc\n")  # 文字を打ってから Enter を押しても同じ
+        assert URL_RE.search(proc.wait_line("新しい URL", timeout=5)).group(0) != url
+    finally:
+        stop(proc)
+        os.close(master)
+
+
+@only_with_a_pty
+def test_ctrl_c_on_a_terminal_stops_and_enter_still_works_after_a_warning(tmp_path):
+    """端末で Ctrl+C を押して止める道（端末が、前にいるプロセスへ SIGINT を送る）。
+
+    保存していない変更があれば、1回目は知らせて止めない。その後も Enter は効く。2回目で止まり、
+    「止めました」を出して、終了コード 0 で終わる。"""
+    proc, master = launch_on_a_tty(tmp_path)
+    try:
+        url, _ = read_lines_until_url(proc)
+        client = Client(url)
+        wait_ready(client, START_LIMIT_S)
+        doc = {"file": "mine.json", "template": "rlc_series", "text": "{}", "sample": None}
+        client.json("api/session", {"doc": doc, "dirty": True}, "PUT")
+        os.write(master, b"\x03")  # Ctrl+C
+        assert "mine.json" in proc.wait_line("保存していない変更があります", timeout=5)
+        os.write(master, b"\n")
+        assert URL_RE.search(proc.wait_line("新しい URL", timeout=5)).group(0) != url
+        os.write(master, b"\x03")
+        code, out = proc.end(15)
+        assert code == 0 and out.rstrip().endswith("circuit-sim を止めました。"), (code, out)
+    finally:
+        stop(proc)
+        os.close(master)
 
 
 def test_launch_pages_are_removed_on_expiry_shutdown_and_next_start(tmp_path):
@@ -1119,18 +1592,18 @@ def test_enter_in_the_terminal_gives_a_new_url(tmp_path, lang, note, renew, new,
     proc = launch("--no-browser", config=tmp_path, lang=lang, stdin=subprocess.PIPE)
     try:
         url, lines = read_lines_until_url(proc)
-        lines += [proc.stdout.readline() for _ in range(3)]
+        lines += next_lines(proc, 3)
         assert any(note in ln for ln in lines) and any(renew in ln for ln in lines), lines
         wait_ready(Client(url), START_LIMIT_S)
         # 使い終わった URL を、ブラウザでページとして開く（Sec-Fetch-Mode: navigate、Dest: document）
         req = urllib.request.Request(url, headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
                                                    "Sec-Fetch-Site": "none"})
         urllib.request.urlopen(req, timeout=5).close()
-        line = proc.stdout.readline()
+        line = proc.next_line(5)
         assert stale in line, line
         proc.stdin.write("\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
+        line = proc.next_line(5)  # Enter を読まなくなる後退が入ると、ここで落ちる（待ち続けない）
         assert line.startswith(new), line
         fresh = URL_RE.search(line).group(0)
         assert fresh != url and fresh.split("?")[0] == url.split("?")[0]
@@ -1159,12 +1632,26 @@ def test_enter_source_tells_inputs_apart(tmp_path):
         assert cli.enter_source(f.fileno()) is None
 
 
+@only_with_a_pty
+def test_enter_source_reads_a_terminal_only_in_the_foreground():
+    """端末（tty）は、前にいる（その端末のまとまりの先頭の組にいる）ときだけ読む。
+
+    この試験のプロセスは、疑似端末を自分の端末にしていない（前にいない）ので、読まない。前にいるときの道は、
+    test_enter_on_a_terminal_gives_a_new_url が、起動したアプリ本体で流す。"""
+    master, slave = os.openpty()
+    try:
+        assert os.isatty(slave) and cli.enter_source(slave) is None
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
 def test_without_a_readable_input_restart_is_suggested(tmp_path):
     """Enter を読めない起動（入力が /dev/null など）では、起動し直す方法を案内する。"""
     proc = launch("--no-browser", config=tmp_path)
     try:
         url, lines = read_lines_until_url(proc)
-        lines += [proc.stdout.readline() for _ in range(3)]
+        lines += next_lines(proc, 3)
         assert any("circuit-sim を起動し直してください" in ln for ln in lines), lines
         assert not any("Enter" in ln for ln in lines), lines
     finally:
@@ -1178,8 +1665,8 @@ def test_ctrl_c_stops_right_away_without_unsaved_changes(tmp_path):
         url, _ = read_lines_until_url(proc)
         wait_ready(Client(url), START_LIMIT_S)
         proc.send_signal(signal.SIGINT)
-        assert proc.wait(timeout=10) == 0
-        assert "circuit-sim を止めました" in proc.stdout.read()
+        code, out = proc.end(10)
+        assert code == 0 and "circuit-sim を止めました" in out, (code, out)
     finally:
         stop(proc)
 
@@ -1199,17 +1686,13 @@ def test_ctrl_c_with_unsaved_changes_warns_first_then_stops(tmp_path, lang, warn
         doc = {"file": "mine.json", "template": "rlc_series", "text": "{}", "sample": None}
         client.json("api/session", {"doc": doc, "dirty": True}, "PUT")
         proc.send_signal(signal.SIGINT)
-        line = ""
-        deadline = time.monotonic() + 5
-        while warning not in line and time.monotonic() < deadline:
-            line = proc.stdout.readline()
-        assert "mine.json" in line
+        assert "mine.json" in proc.wait_line(warning, timeout=5)
         time.sleep(0.3)
         assert proc.poll() is None, "1回目の Ctrl+C で止まった"
         assert client.json("api/health")["instance"]
         proc.send_signal(signal.SIGINT)
-        assert proc.wait(timeout=10) == 0
-        assert stopped in proc.stdout.read()
+        code, out = proc.end(10)
+        assert code == 0 and stopped in out, (code, out)
     finally:
         stop(proc)
 
@@ -1218,40 +1701,32 @@ def test_unwritable_config_folder_is_reported(tmp_path):
     """設定の場所に書けないときは、理由を出して終わる（終了コード 2）。"""
     blocker = tmp_path / "file-not-folder"
     blocker.write_text("x", encoding="utf-8")
-    proc = launch("--no-browser", config=blocker / "sub", lang="en_US.UTF-8")
-    out = proc.communicate(timeout=20)[0]
-    assert proc.returncode == 2
+    code, out = run_to_end("--no-browser", config=blocker / "sub", lang="en_US.UTF-8")
+    assert code == 2
     assert "Can't write to the settings folder" in out
 
 
-def break_warns_first_then_stops(proc: subprocess.Popen, send_break) -> None:
+def break_warns_first_then_stops(proc: procs.Launched, send_break) -> None:
     """未決11 の2回押しを、Ctrl+Break（に当たる合図）で確かめる。
 
-    1回目は知らせて止めない。10 秒以内の2回目で止まり、「止めました」を出して、終了コード 0 で終わる。"""
-    url, _ = read_lines_until_url(proc)
-    client = Client(url)
-    wait_ready(client, START_LIMIT_S)
-    doc = {"file": "mine.json", "template": "rlc_series", "text": "{}", "sample": None}
-    client.json("api/session", {"doc": doc, "dirty": True}, "PUT")
-    send_break()
-    lines, pump = pump_lines(proc)
+    1回目は知らせて止めない。10 秒以内の2回目で止まり、「止めました」を出して、終了コード 0 で終わる。
+    どこで落ちても（起動の URL を待つ間、受け付けを待つ間、状態を書く間でも）、起動したものは止める。"""
     try:
-        assert "mine.json" in wait_for_line(lines, "保存していない変更があります", 5)
+        url, _ = read_lines_until_url(proc)
+        client = Client(url)
+        wait_ready(client, START_LIMIT_S)
+        doc = {"file": "mine.json", "template": "rlc_series", "text": "{}", "sample": None}
+        client.json("api/session", {"doc": doc, "dirty": True}, "PUT")
+        send_break()
+        assert "mine.json" in proc.wait_line("保存していない変更があります", timeout=5)
         time.sleep(0.3)
         assert proc.poll() is None, "1回目で止まった"
         assert client.json("api/health")["instance"]
         send_break()
-        code = proc.wait(timeout=10)
-        try:
-            stopped = wait_for_line(lines, "circuit-sim を止めました", 5)
-        except AssertionError as exc:
-            raise AssertionError(f"終了コード {code}。{exc}") from None
+        code, out = proc.end(10)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait(timeout=10)
-        pump.join(timeout=10)
-    assert code == 0 and stopped.strip() == "circuit-sim を止めました。"
+        stop(proc)
+    assert code == 0 and out.rstrip().endswith("circuit-sim を止めました。"), (code, out)
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows の Ctrl+Break（POのPCの local_ci で流れる）")
@@ -1259,31 +1734,19 @@ def test_ctrl_break_on_windows_warns_first_then_stops(tmp_path):
     """Windows: 別のプロセスに Ctrl+C は送れないが、Ctrl+Break（SIGBREAK）は送れる。
 
     未決11 の2回押し（1回目は知らせて止めない、10 秒以内の2回目で止める）を確かめる。止めた後は、Ctrl+C と
-    同じに「止めました」を出して、終了コード 0 で終わる（POのPCでは、直す前は終了コード 3 で、「止めました」も
-    出なかった。cli.break_as_interrupt の説明）。
+    同じに「止めました」を出して、終了コード 0 で終わる（PO の PC では、直す前は終了コード 3 で、
+    「止めました」も出なかった。直した後の Windows での結果は、まだ無い。cli.break_as_interrupt の説明）。
 
     Ctrl+C の2回押しと、窓を閉じたときは、手で確かめる（報告の手順）。"""
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
-           "LC_ALL": "ja_JP.UTF-8"}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "circuit_sim.app", "--no-browser"], cwd=ROOT, env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-    )
+    proc = launch("--no-browser", config=tmp_path, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 
     def send_break() -> None:
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)
         except OSError:
-            proc.kill()
             pytest.skip("この実行には端末（コンソール）が無いので、Ctrl+Break を送れなかった")
 
-    try:
-        break_warns_first_then_stops(proc, send_break)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
+    break_warns_first_then_stops(proc, send_break)
 
 
 # Windows の Ctrl+Break の経路を、Windows でない OS で流すための入口。製品のコードは変えず、起動する前に
@@ -1295,8 +1758,8 @@ def test_ctrl_break_on_windows_warns_first_then_stops(tmp_path):
 # 身代わりにできる理由: uvicorn は、止め終えた後に、受けた合図の扱いを元に戻して出し直す
 # （Server.capture_signals）。元の扱いが「既定」のままだと、出し直された合図の既定の動きでプロセスが終わり、
 # main の終わり（「止めました」、終了コード 0）まで進まない。この流れは OS によらない。違うのは既定の動きの
-# 中身だけ: Windows の SIGBREAK は、C ランタイムが終了コード 3 で終える（ucrt の raise。POのPCで 3 だった）。
-# POSIX の SIGUSR1 は、合図で終わる（終了コードは -10 など）。
+# 中身だけ: Windows の SIGBREAK は、終了コード 3 で終わる（PO の PC で確かめた）。POSIX の SIGUSR1 は、
+# 合図で終わる（終了コードは -10 など）。
 BREAK_STAND_IN_ENTRY = """\
 import signal, sys
 
@@ -1316,14 +1779,9 @@ raise SystemExit(cli.main(sys.argv[1:]))
 """
 
 
-def launch_with_break_stand_in(config: Path, *args: str) -> subprocess.Popen:
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(config),
-           "LC_ALL": "ja_JP.UTF-8"}
-    return subprocess.Popen(
-        [sys.executable, "-c", BREAK_STAND_IN_ENTRY, *args, "--no-browser"], cwd=ROOT, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
-        encoding="utf-8",
-    )
+def launch_with_break_stand_in(config: Path, *args: str) -> procs.Launched:
+    return procs.Launched([sys.executable, "-c", BREAK_STAND_IN_ENTRY, *args, "--no-browser"], cwd=ROOT,
+                          env=app_env(config))
 
 
 only_with_stand_in = pytest.mark.skipif(
@@ -1345,15 +1803,15 @@ def test_break_path_warns_first_then_stops_with_exit_code_0(tmp_path):
 def test_break_path_without_the_handling_ends_by_the_default_action(tmp_path):
     """対照: 製品の扱い（cli.break_as_interrupt）が無いと、止め終えた後に合図の既定の動きで終わる。
 
-    「止めました」は出ず、終了コードは 0 にならない（POのPCの Windows では 3。ここでは合図 SIGUSR1 で
+    「止めました」は出ず、終了コードは 0 にならない（PO の PC の Windows では 3。ここでは合図 SIGUSR1 で
     終わる）。上の試験が、扱いの有無を見分けられることの確かめ。"""
     proc = launch_with_break_stand_in(tmp_path, "--without-the-fix")
     try:
         url, _ = read_lines_until_url(proc)
         wait_ready(Client(url), START_LIMIT_S)
         proc.send_signal(signal.SIGUSR1)
-        assert proc.wait(timeout=10) == -signal.SIGUSR1
-        assert "circuit-sim を止めました" not in proc.stdout.read()
+        code, out = proc.end(10)
+        assert code == -signal.SIGUSR1 and "circuit-sim を止めました" not in out, (code, out)
     finally:
         stop(proc)
 
@@ -1361,32 +1819,50 @@ def test_break_path_without_the_handling_ends_by_the_default_action(tmp_path):
 def test_break_as_interrupt_only_touches_the_break_signal_on_windows_and_puts_it_back(monkeypatch):
     """break_as_interrupt の中では、Windows の SIGBREAK が KeyboardInterrupt を出す。出たら、元の扱いに戻る。
 
-    Windows でなければ何もしない。SIGBREAK の無い OS でも落ちない。主スレッドの外からは何もしない。"""
+    Windows でなければ何もしない。SIGBREAK の無い OS でも落ちない。主スレッドの外からは何もしない
+    （主スレッドの外で合図の扱いを決めようとすると、Python は ValueError を出す。スレッドが例外なく終わり、
+    中で見た扱いが元のままだったことを確かめる）。"""
     stand_in = getattr(signal, "SIGBREAK", None) or getattr(signal, "SIGUSR2", None)
     if stand_in is None:
         pytest.skip("身代わりにできる合図が無い")
     before = signal.getsignal(stand_in)
 
-    def inside(windows: bool, seen: list) -> None:
+    def inside(windows: bool) -> object:
         with cli.break_as_interrupt(windows):
-            seen.append(signal.getsignal(stand_in))
+            return signal.getsignal(stand_in)
+
+    def from_another_thread(windows: bool) -> list:
+        """別のスレッドで呼んだ結果: [中で見た扱い] か、[出た例外]。"""
+        result: list = []
+
+        def run() -> None:
+            try:
+                result.append(inside(windows))
+            except BaseException as exc:  # スレッドの中の例外を、試験まで運ぶ
+                result.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        return result
 
     try:
-        seen: list = []
-        inside(False, seen)
         if not hasattr(signal, "SIGBREAK"):
-            inside(True, seen)  # SIGBREAK の無い OS: 何もしない
+            assert inside(True) is before  # SIGBREAK の無い OS: Windows の分かれ目でも、何も変えず、落ちない
             monkeypatch.setattr(signal, "SIGBREAK", stand_in, raising=False)
-        outside = threading.Thread(target=inside, args=(True, seen))
-        outside.start()
-        outside.join(timeout=5)
-        assert seen and all(handler is before for handler in seen), "扱いを変えないはずの場面で変えた"
+        # ここからは、SIGBREAK がある（本物か、身代わり）
+        assert inside(False) is before, "Windows でない OS で、合図の扱いを変えた"
+        assert from_another_thread(True) == [before], "主スレッドの外で、扱いを変えた（または例外で落ちた）"
+        assert from_another_thread(False) == [before]
+        assert inside(True) is signal.default_int_handler, "Windows の主スレッドで、扱いを決めていない"
+        assert signal.getsignal(stand_in) is before, "出た後に、元の扱いに戻っていない"
         with pytest.raises(KeyboardInterrupt):
             with cli.break_as_interrupt(True):
                 assert signal.getsignal(stand_in) is signal.default_int_handler
                 signal.raise_signal(stand_in)
                 time.sleep(1)  # 合図は、次の命令の切れ目で届く
-        assert signal.getsignal(stand_in) is before, "出た後に、元の扱いに戻っていない"
+        assert signal.getsignal(stand_in) is before, "例外で抜けた後に、元の扱いに戻っていない"
     finally:
         signal.signal(stand_in, before)
 
@@ -1401,18 +1877,13 @@ def test_restart_on_windows_binds_the_same_port_while_a_browser_keeps_connection
     Ctrl+Break で止めたときの終了コードは 0。"""
     import http.client
 
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
-           "LC_ALL": "ja_JP.UTF-8"}
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
 
-    def start():
-        return subprocess.Popen(
-            [sys.executable, "-m", "circuit_sim.app", "--no-browser", "--port", str(port)], cwd=ROOT, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
-            encoding="utf-8", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
+    def start() -> procs.Launched:
+        return launch("--no-browser", "--port", str(port), config=tmp_path,
+                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 
     proc = start()
     conns = []
