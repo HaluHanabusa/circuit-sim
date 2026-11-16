@@ -687,8 +687,14 @@ class _Monitor:
 
     def attach(self, out: np.ndarray, unknowns: list[str], limits: np.ndarray,
                scales: dict[str, tuple[float, str]]) -> None:
-        """時間ステップを始める（発散を確かめる配列と大きさを受け取る）。"""
-        self.out, self.unknowns, self.limits, self.scales = out, unknowns, limits, scales
+        """時間ステップを始める（発散を確かめる配列と大きさを受け取る）。
+
+        目安が 0 で大きさを決められない変数（limits が inf）は、倍精度の最大の有限値までを通す
+        （有限かどうかだけを見ることになる。inf は「inf 以下」に当たるので、有限の値に直しておく）。
+        """
+        self.out, self.unknowns, self.scales = out, unknowns, scales
+        self.limits = np.minimum(limits, np.finfo(float).max)
+        self.bound = float(self.limits.min())       # いちばん小さい大きさ（速い確かめに使う）
         self.phase = "run"
         self.last_check = time.perf_counter()
 
@@ -731,9 +737,12 @@ class _Monitor:
         if k <= self.checked:
             return
         block = self.out[self.checked + 1: k + 1]
-        big = np.abs(block).max(axis=0)
-        if not np.all(big <= self.limits):          # NaN もここで引っかかる
-            self._raise_diverged(block, self.checked + 1)
+        # まず、全部の値の最小と最大を、いちばん小さい大きさと比べる（変数ごとに見るより 2〜15 倍速い。
+        # 発散していなければ、ここで済む）。NaN があると最小も最大も NaN で、比較が偽になる
+        if not (block.min() >= -self.bound and block.max() <= self.bound):
+            big = np.abs(block).max(axis=0)
+            if not np.all(big <= self.limits):
+                self._raise_diverged(block, self.checked + 1)
         self.checked = k
 
     def recheck(self, k: int) -> None:

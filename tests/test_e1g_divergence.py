@@ -225,6 +225,44 @@ def test_undamped_resonance_driven_at_resonance_is_not_divergence():
     assert np.abs(res["v(out)"]).max() > 1000
 
 
+def test_variables_without_a_scale_are_checked_for_finiteness_only():
+    """目安が 0（電源も初期値も 0）で大きさを決められない変数は、有限かどうかだけを見る:
+    大きな有限の値では止めず、inf と NaN で止める（最初の格子点と変数を知らせる）。"""
+    scales = {"V": (0.0, "WORD_VOLTAGE"), "A": (0.0, "WORD_CURRENT")}
+    for bad in (math.inf, -math.inf, math.nan):
+        monitor = simulate_module._Monitor(4, 1e-3, None, None)
+        out = np.zeros((5, 2))
+        monitor.attach(out, ["v(a)", "i(L1)"], np.array([math.inf, math.inf]), scales)
+        out[1] = [1e300, -1e300]
+        monitor.check_values(2)                                  # 有限なら、どれだけ大きくても止めない
+        out[3, 1], out[4, 0] = bad, bad
+        with pytest.raises(DivergenceError) as info:
+            monitor.check_values(4)
+        err = info.value
+        assert err.code == "RUN_DIVERGED_NOT_FINITE" and err.params["signal"] == "i(L1)"
+        assert err.params["k"] == 3 and err.params["t"].value == pytest.approx(3e-3)
+
+
+def test_first_point_and_variable_over_the_limit_are_reported():
+    """大きさを超えた最初の格子点と、その点の最初の変数を知らせる（確かめを何回に分けても同じ）。"""
+    scales = {"V": (2.0, "WORD_VOLTAGE"), "A": (0.5, "WORD_CURRENT")}
+    limits = np.array([2e12, 0.5e12])
+    for split in ((6,), (2, 6), (4, 6), (1, 2, 3, 4, 5, 6)):
+        monitor = simulate_module._Monitor(6, 1e-3, None, None)
+        out = np.ones((7, 2))
+        monitor.attach(out, ["v(a)", "i(L1)"], limits, scales)
+        out[3] = [1.9e12, 0.4e12]              # どちらも大きさの中（電圧の大きさは電流の大きさより大きい）
+        out[4] = [1.9e12, -0.6e12]             # 電流だけが超える
+        out[5] = [-3e12, 9e12]
+        with pytest.raises(DivergenceError) as info:
+            for k in split:
+                monitor.check_values(k)
+        err = info.value
+        assert (err.code, err.params["signal"], err.params["k"]) == ("RUN_DIVERGED", "i(L1)", 4)
+        assert err.params["value"].value == -0.6e12 and err.params["limit"].value == 0.5e12
+        assert err.params["scale"].value == 0.5 and err.params["value"].unit == "A"
+
+
 def test_limits_scale_with_the_circuit():
     """目安は電源・初期値と素子の値から決まる: 電源を 1000 倍にすると、発散とみなす大きさも 1000 倍。"""
     from circuit_sim.mna import build_system
