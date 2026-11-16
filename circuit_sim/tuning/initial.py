@@ -7,7 +7,7 @@
      後退差分の 0.5 サンプル分の遅れも入る）。
      微分を偏差に掛けても測定値に掛けても、帰還の経路は同じなので、開ループと余裕は変わらない。
   3. PIDの零点を、LC の共振の下（ωz = κ·ω0、既定 κ = 0.5。1e-9 ≤ κ ≤ 1）に減衰係数 ζz（既定 0.3。
-     0 < ζz ≤ 2。1 未満で複素数の組、1 で重根、1 より上で2つの実根）で置く:
+     1e-6 ≤ ζz ≤ 2。1 未満で複素数の組、1 で重根、1 より上で2つの実根）で置く:
        C(s) ≈ Ki·(1 + 2ζz·s/ωz + s²/ωz²) / (s·(1 + s·Tf))
      分子の係数を比べて  Kp = 2ζz·Ki/ωz − Ki·Tf、Kd = Ki/ωz² − Kp·Tf。Tf = r·Ts（既定 r = 0.25）。
      LC の位相が共振で −180° 近くまで落ちる前に、零点の進み（最大 +180°）を出しておくため。ζz を小さくすると
@@ -94,6 +94,11 @@ STABILITY_EPS = 1e-9         # 安定と言うのは、閉ループの極の半�
 ZERO_RATIO_MIN = 1e-9        # 零点の比 κ の下限（それより小さいと、閉ループの極の半径が 1 との差 1e-9 の中に
 #                              来ることしか起きない）
 ZERO_RATIO_MAX = 1.0         # 零点の比 κ の上限（ωz ≤ ω0。理由は buck_voltage_mode_pid の説明）
+ZERO_DAMPING_MIN = 1e-6      # 零点の減衰 ζz の下限（D-066）。ζz ≲ 1e-10 かつ f_ctrl/f0 ≳ 1e9 では、PID の
+#                              零点が単位円のすぐ横に来て、その横の交差の余裕の丸めが最大 2.6e-5° になった
+#                              （余白 1e-6° より大きい）。f_ctrl/f0 を 1e7〜1e11 に振った 150 桁の参照との
+#                              照合で、交差ごとの余裕の丸めの最大は ζz = 1e-6〜1e-5 で 9.0e-9°（余白の
+#                              1/110）、1e-5〜1e-4 で 2.3e-10°、0.1〜1 で 2e-13°
 ZERO_DAMPING_MAX = 2.0       # 零点の減衰 ζz の上限（2 で零点が2つの実根になり、その比は約 14）
 Q_MIN = 1e-3                 # 負荷の Q = R·√(C/L) の下限（組み合わせの範囲。ARGUMENT_RANGES の後に
 #                              確かめる）。Q が小さい（負荷がほぼ短絡）と、制御対象は Q·ω0〜ω0/Q で積分に
@@ -141,9 +146,9 @@ def _number_text(value: float) -> str:
 
 
 def _compare_text(value: float, reference: float, relation: Literal["<", ">", ">="], min_decimals: int = 1,
-                  nonzero: float | None = None) -> tuple[str, str, str | None]:
-    """文の中で値を基準と比べるときの書き方（余裕と目標、最大の余裕と目標、半径と 1）。すべての文で
-    これを使う。
+                  nonzero: float | None = None, significant: bool = False) -> tuple[str, str, str | None]:
+    """文の中で値を基準と比べるときの書き方（余裕と目標、最大の余裕と目標、半径と 1、範囲の外の今の値と
+    境目）。すべての文でこれを使う。
 
     基準は _number_text で書く（ちょうどの値）。値は、小数 min_decimals 桁から桁を足し、書いた数字どうしでも
     relation（判定の結論）が成り立つ最初の桁で書く（「55.0°（目標の 55.04° は満たす）」「29.9977° … 最大
@@ -151,12 +156,17 @@ def _compare_text(value: float, reference: float, relation: Literal["<", ">", ">
     同じ桁で 0 に見えないところまで桁を足す。
     relation が ">=" で、値が丸めの範囲（TARGET_TOL_DEG）で基準を下回り、どの桁でも基準以上に見えないときは、
     基準と同じ数字で書く（判定が「満たす」なので、書いた数字もそれと合わせる）。
+    significant が真なら、桁は小数でなく有効数字で数え（min_decimals 桁から）、基準は :g で書く（範囲の外の
+    今の値。「0.001 以上にする（現在 0.001）」と書かず「（現在 0.0009996）」と書く）。
     戻り値は（値、基準、nonzero の書き方。nonzero を渡さなければ None）。
     """
-    ref_text = _number_text(reference)
+    ref_text = f"{reference:g}" if significant else _number_text(reference)
+    if float(ref_text) != reference:
+        ref_text = _number_text(reference)
     ref = float(ref_text)
+    style = "g" if significant else "f"
     for digits in range(min_decimals, 18):
-        text = f"{value:.{digits}f}"
+        text = f"{value:.{digits}{style}}"
         shown = float(text)
         holds = shown < ref if relation == "<" else (shown > ref if relation == ">" else shown >= ref)
         extra = None if nonzero is None else f"{nonzero:.{digits}f}"
@@ -762,7 +772,7 @@ ARGUMENT_RANGES: dict[str, tuple[float, bool, float, bool, str]] = {
     "f_ctrl": (1e-3, True, 1e12, True, " Hz"),
     "f_cross_max": (0.0, False, math.inf, False, " Hz"),
     "zero_ratio": (ZERO_RATIO_MIN, True, ZERO_RATIO_MAX, True, ""),
-    "zero_damping": (0.0, False, ZERO_DAMPING_MAX, True, ""),
+    "zero_damping": (ZERO_DAMPING_MIN, True, ZERO_DAMPING_MAX, True, ""),
     "filter_ratio": (0.0, True, 1e3, True, ""),
     "phase_margin_deg": (0.0, False, 180.0, False, "°"),
 }
@@ -823,13 +833,15 @@ def _check_arguments(values: dict) -> dict[str, float]:
         sl, sc = math.sqrt(out["inductance"]), math.sqrt(out["capacitance"])
         q_load = out["r_load"] * sc / sl
         f_ratio = 2.0 * math.pi * out["f_ctrl"] * sl * sc
-        if q_load < Q_MIN:
-            bad.append(f"負荷の Q = r_load·√(capacitance/inductance) は {Q_MIN:g} 以上にする"
-                       f"（現在 {q_load:.3g}。負荷がほぼ短絡で、ループのゲインが交差周波数のまわりで"
+        if q_load < Q_MIN:                     # 今の値は、境目と見分けられる桁まで書く（D-066）
+            shown, limit, _ = _compare_text(q_load, Q_MIN, "<", 3, significant=True)
+            bad.append(f"負荷の Q = r_load·√(capacitance/inductance) は {limit} 以上にする"
+                       f"（現在 {shown}。負荷がほぼ短絡で、ループのゲインが交差周波数のまわりで"
                        "平らになり、交差周波数が丸めで動く）")
         if f_ratio > F_RATIO_MAX:
+            shown, limit, _ = _compare_text(f_ratio, F_RATIO_MAX, ">", 3, significant=True)
             bad.append(f"制御周波数と LC の共振周波数の比 f_ctrl/f0 = 2π·f_ctrl·√(inductance·capacitance) は "
-                       f"{F_RATIO_MAX:g} 以下にする（現在 {f_ratio:.3g}）")
+                       f"{limit} 以下にする（現在 {shown}）")
         head = "設計の引数の組み合わせが範囲の外。"
     if bad:
         target = _as_real(values.get("phase_margin_deg"))
@@ -855,7 +867,8 @@ def buck_voltage_mode_pid(
     v_in, inductance, capacitance, r_load, f_ctrl : 回路の値と制御周波数（SI。範囲は ARGUMENT_RANGES と、
                    組み合わせの Q_MIN・F_RATIO_MAX）。r_load = math.inf は無負荷
     zero_ratio   : PID の零点の角周波数の、LC の共振に対する比 κ（1e-9 ≤ κ ≤ 1）
-    zero_damping : PID の零点の減衰係数 ζz（0 < ζz ≤ 2。1 未満で複素数の組、1 で重根、1 より上で2つの実根）
+    zero_damping : PID の零点の減衰係数 ζz（1e-6 ≤ ζz ≤ 2。1 未満で複素数の組、1 で重根、1 より上で2つの実根。
+                   1e-6 未満は、零点が単位円のすぐ横に来て余裕の丸めが判定の余白を超えるので断る）
     filter_ratio : 微分のフィルタの時定数の、制御周期に対する比（0〜1000）
     phase_margin_deg : 目標の位相余裕 [deg]（0 < PM < 180）
     f_cross_max  : 交差周波数を探す範囲の上端 [Hz]（既定は f_ctrl/4。ナイキスト周波数の半分）。

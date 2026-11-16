@@ -240,9 +240,6 @@ def test_round5_low_q_reproduction_is_refused_as_outside_the_combination_range()
     assert result == "invalid_argument" and g is None and "Q" in msg
 
 
-@pytest.mark.xfail(strict=True, reason="軽微（文の数字の書き方）: 組み合わせの範囲の外の値を 3 桁で書くので、"
-                                       "境目のすぐ外では「0.001 以上にする（現在 0.001）」「1e+11 以下にする"
-                                       "（現在 1e+11）」と、外れた値が境目と同じ数字に見える")
 @pytest.mark.parametrize("plant_f", [((24.0, 1e-6, 1e-6, 0.9996e-3), 20e6),
                                      ((24.0, 1.0, 1.0, 6.0), 1.0004e11 / (2.0 * math.pi))],
                          ids=["Q", "ratio"])
@@ -377,10 +374,6 @@ def test_near_notch_candidate_is_refused_for_no_stability_margin():
     assert result in ("no_stability_margin", "margin_below_target") and "安定の余裕が無い" in msg
 
 
-@pytest.mark.xfail(strict=True, reason="軽微: ζz ≲ 1e-10 かつ f_ctrl/f0 ≳ 1e9 で、零点のすぐ横の交差の余裕の"
-                                       "丸めが最大 2.6e-5°（D-057 の許し 1e-6° より大きい）。断る候補の文で、"
-                                       "目標を 1.27e-5° 下回るのに「位相余裕は目標を満たすが」"
-                                       "「は満たす」と書く")
 def test_near_notch_candidate_short_of_the_target_is_not_said_to_meet_it():
     plant, f_ctrl, opts = NEAR_NOTCH
     result, g, msg = _run(plant, f_ctrl, **opts)
