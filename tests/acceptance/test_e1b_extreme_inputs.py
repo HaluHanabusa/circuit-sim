@@ -199,10 +199,11 @@ def test_huge_load_matches_q1e10_and_returned_gains_are_stable(circuit, r_load):
 
 BASE = {"v_in": 24.0, "inductance": 22e-6, "capacitance": 100e-6, "r_load": 6.0, "f_ctrl": 200e3}
 # D-059 の文から: 名前 → (下限, 下限を含むか, 上限)。上限はどれも含む
+# 7回目の検証で改めた（D-066）: zero_damping の範囲は (0, 2] から [1e-6, 2] になった
 D059 = {
     "v_in": (1e-6, True, 1e9), "inductance": (1e-12, True, 1e4), "capacitance": (1e-15, True, 1e6),
     "r_load": (1e-6, True, 1e30), "f_ctrl": (1e-3, True, 1e12), "zero_ratio": (1e-9, True, 1.0),
-    "zero_damping": (0.0, False, 2.0), "filter_ratio": (0.0, True, 1000.0),
+    "zero_damping": (1e-6, True, 2.0), "filter_ratio": (0.0, True, 1000.0),
 }
 
 
@@ -263,7 +264,7 @@ def _outside_values():
 
 @pytest.mark.parametrize(("name", "value"), _inside_values(), ids=lambda v: repr(v)[:28])
 def test_d059_range_ends_are_accepted(name, value):
-    """範囲の端（両端を含む。zero_damping の下だけ含まない）は invalid_argument にならず、
+    """範囲の端（両端を含む）は invalid_argument にならず、
     想定外の例外も出ない。組み合わせの範囲（D-065）の外になる端は、ほかの値を D065_COMPANION で選び直す。"""
     base = dict(BASE)
     if name in BASE:
@@ -314,7 +315,7 @@ def test_practical_circuits_are_never_refused_as_invalid_argument():
 CORNER_VALUES = ([1e-6, 24.0, 1e9], [1e-12, 22e-6, 1e4], [1e-15, 100e-6, 1e6], [1e-6, 6.0, 1e30],
                  [1e-3, 200e3, 1e12])
 CORNER_OPTS = [{}, {"zero_ratio": 1e-9, "zero_damping": 2.0, "filter_ratio": 1000.0},
-               {"zero_ratio": 1.0, "zero_damping": 5e-324, "filter_ratio": 0.0}]
+               {"zero_ratio": 1.0, "zero_damping": 1e-6, "filter_ratio": 0.0}]   # 7回目で D-066 の下限に
 
 
 def test_range_corners_only_raise_gain_design_errors():

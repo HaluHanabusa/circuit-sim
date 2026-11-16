@@ -368,10 +368,12 @@ NEAR_NOTCH_REF_SHORT = 1.2695081043290202e-05
 
 
 def test_near_notch_candidate_is_refused_for_no_stability_margin():
-    """断る理由の本体（安定の余裕が無い）は正しい: ゲインは返さない。"""
+    """ゲインは返さない。7回目の検証で改めた（D-066）: ζz = 5e-324 は零点の減衰の下限 1e-6 より小さいので、
+    計算せずに invalid_argument で断り、文に zero_damping を書く（下限の付近は
+    test_e1b_zero_damping_floor.py）。"""
     plant, f_ctrl, opts = NEAR_NOTCH
     result, g, msg = _run(plant, f_ctrl, **opts)
-    assert result in ("no_stability_margin", "margin_below_target") and "安定の余裕が無い" in msg
+    assert result == "invalid_argument" and g is None and "zero_damping" in msg
 
 
 def test_near_notch_candidate_short_of_the_target_is_not_said_to_meet_it():
