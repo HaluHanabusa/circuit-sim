@@ -484,7 +484,7 @@ def test_c8_reproducible(fidelity):
 def discrete_margins(kp, ki, kd, tf, r_load=R, inductance=L, capacitance=C):
     """位相余裕と、その交差周波数（試験の中で別に組んだ離散の開ループ）。
 
-    植物: scipy.signal.cont2discrete の零次ホールド（PWMの保持 0.5 サンプル分）、演算の遅れ z⁻¹、
+    制御対象: scipy.signal.cont2discrete の零次ホールド（PWMの保持 0.5 サンプル分）、演算の遅れ z⁻¹、
     PID: 実装の差分方程式の z 変換  Kp + Ki·Ts/(1 − z⁻¹) + Kd·(1 − z⁻¹)/((Tf + Ts) − Tf·z⁻¹)。
     ゲインが 1 を横切る点すべての位相余裕のうち最小のもの。
     """

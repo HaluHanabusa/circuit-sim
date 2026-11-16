@@ -119,7 +119,7 @@ def test_pid_reset_restores_initial_state():
 
 
 def slow_plant_response(anti_windup: str, n: int = 6000):
-    """試験の中の植物: 1次遅れ y[k+1] = α·y[k] + (1 − α)·G·u[k]（時定数 2 ms、G = 24）。
+    """試験の中の制御対象: 1次遅れ y[k+1] = α·y[k] + (1 − α)·G·u[k]（時定数 2 ms、G = 24）。
 
     指令値 12 の段差で、PI（遅れに対して積分が強い）の出力は上限 0.6（出せる最大 14.4）に長く張り付く。
     戻り値: 出力 y、操作量 u、上下限で止める前の操作量 P + I + D（= Kp·e + 積分）の列。

@@ -316,9 +316,6 @@ def test_largest_reachable_margin_is_shown_below_the_target():
     assert shown == pytest.approx(29.998, abs=1e-3)           # 150 桁の参照の最大は 29.99773°
 
 
-@pytest.mark.xfail(strict=True, reason="軽微（コードレビューの軽2と同じ）: 目標が7桁以上だと、目標を6桁に"
-                                       "丸めて書くので「位相余裕 29.9977° を取れる…（取れるのは最大 "
-                                       "29.9977°）」と同じ数字になる")
 def test_target_and_largest_reachable_margin_are_not_shown_as_the_same_number():
     plant, f_ctrl, opts = MINOR3
     result, _, msg = _run(plant, f_ctrl, phase_margin_deg=29.99773, **opts)
@@ -328,9 +325,6 @@ def test_target_and_largest_reachable_margin_are_not_shown_as_the_same_number():
     assert float(shown_max) < float(shown_target)
 
 
-@pytest.mark.xfail(strict=True, reason="軽微: 「満たす」の文の余裕は小数1桁、目標は6桁で書くので、"
-                                       "「位相余裕 55.0°（目標の 55.04° は満たす）」と、書いた余裕が"
-                                       "目標より小さく見える")
 def test_margin_shown_with_meets_is_not_below_the_shown_target():
     result, g, msg = _run((24.0, 22e-6, 100e-6, 6.0), 200e3, zero_ratio=1e-7, phase_margin_deg=55.04)
     assert result == "no_stability_margin" and g.phase_margin_deg >= 55.04 - MEETS_TOL
@@ -405,9 +399,6 @@ def test_same_circuits_at_24_volts_are_refused_for_no_stability_margin(case):
     assert abs(ref_r) < STABILITY_EPS
 
 
-@pytest.mark.xfail(strict=True, reason="重大（決まり4、D-057）: Vin が約 1e4 V を超えると、閉ループの行列の"
-                                       "尺度がそろわず固有値の丸めが 1e-8 程度になり、半径が 1 − 1e-13 "
-                                       "などの設計を「安定」として返す")
 @pytest.mark.parametrize("case", HIGH_VIN, ids=_HIGH_VIN_IDS)
 def test_high_vin_design_is_not_returned_without_stability_margin(case):
     """返すなら参照の半径が 1 − 1e-9 以下。そうでなければ断る（Vin = 24 V のときと同じ理由で）。"""
@@ -423,9 +414,6 @@ FALSE_UNSTABLE = ((16286220.011097308, 0.0003486222953146516, 0.0304657323407663
                   {"zero_ratio": 1.1490533679001927e-05, "zero_damping": 1.099325229684776})
 
 
-@pytest.mark.xfail(strict=True, reason="重大の続き: Vin 16 MV で、半径 1 − 3.4e-11 の候補を"
-                                       "「1 以上で不安定」と書く"
-                                       "（ゲインは返さない。同じ原因）")
 def test_high_vin_refusal_does_not_call_a_marginal_candidate_unstable():
     plant, f_ctrl, opts = FALSE_UNSTABLE
     result, g, msg = _run(plant, f_ctrl, **opts)
@@ -470,10 +458,6 @@ class GainsChanged(Exception):
     """記録したゲインと違うゲインが返った（150 桁の参照の値を取り直す必要がある）。"""
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="軽微: Q = 4e-10 の回路で、返したゲインの余裕（150 桁の参照）が目標を "
-                          "0.0126° 下回る。"
-                          "周波数を 10% 動かしても |L| が 5e-7 しか変わらず、|L| の丸め 5e-10 で交差が動く")
 def test_low_q_returned_margin_agrees_with_150_digit_reference():
     """断るのは可。返すなら、書いた余裕は 150 桁の参照の余裕（22.615532°）と 1e-6° で合う。"""
     plant, f_ctrl, opts = LOW_Q
