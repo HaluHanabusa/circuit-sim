@@ -15,6 +15,11 @@
 新しい URL は、端末で Enter を押すと出る（端末やパイプから読めないときは、起動し直すと出る）。
 合言葉と画面の好みは、端末の中の設定の場所に置く（config.py）。
 
+起動し直すとき: 設定の場所に前回の起動の記録（ポートとプロセス ID。config.py の last-run.json）を残し、
+前回のポートを最初に試す（開いている画面は前回のポートを見ているので、同じポートに戻れば再接続できる）。
+前回のプロセスがもう無く、そのポートで待ち受けているものも無いのに結べないとき（前回の接続の後始末が OS に
+残っている）は、RESTART_WAIT_SECONDS まで結び直してみる。それでも駄目なら次のポートへ移る。
+
 止めるときは Ctrl+C。保存していない変更があるときは、1回目の Ctrl+C では止めずに知らせ、10 秒以内に
 もう一度押すと止める（画面仕様 14章の未決11。画面からは、アプリ本体を止める操作を防げないため）。
 端末の窓を閉じたときや、OS から止められたとき（SIGTERM）は、知らせずに止まる。
@@ -35,17 +40,24 @@ import secrets
 import signal
 import socket
 import stat
-import struct
 import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import uvicorn
 
-from .config import Settings, config_dir, create_private, ensure_dir, load_token
+from .config import (
+    Settings,
+    config_dir,
+    create_private,
+    ensure_dir,
+    load_token,
+    read_last_run,
+    write_last_run,
+)
 from .server import LAUNCH_SECONDS, TOKEN_PARAM, Launches, Workspace, create_app
 
 HOST = "127.0.0.1"
@@ -58,9 +70,12 @@ WINDOWS = os.name == "nt"
 
 IN_USE = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048), 10048}
 DENIED = {errno.EACCES, getattr(errno, "WSAEACCES", 10013), 10013}
-# Windows で止めるときに、待っている接続を RST で閉じる（SO_LINGER をオン・0 秒）。struct linger は
-# Windows では u_short 2つ、ほかは int 2つ
-LINGER_RESET = struct.pack("HH" if WINDOWS else "ii", 1, 0)
+# 起動し直すとき、前回のポートを結び直してみる時間の上限。開いている画面は 2 秒ごとにアプリ本体を確かめ
+# （HEALTH_INTERVAL_MS）、応答を 2 秒待つ（HEALTH_TIMEOUT_MS）。そのとき、ブラウザは前回のプロセスが閉じた
+# 待ちの接続（keep-alive）を使おうとして閉じ直すので、OS に残る前回の接続の後始末は、確かめ1回分（約 4 秒）の
+# うちに終わる。少し足して 5 秒
+RESTART_WAIT_SECONDS = 5.0
+RESTART_RETRY_SECONDS = 0.2
 
 # 端末の文言（画面の辞書とは別。画面の外に出るものだけ）。「ポート」は --port と同じ言葉
 MESSAGES: dict[str, tuple[str, str]] = {
@@ -83,6 +98,12 @@ MESSAGES: dict[str, tuple[str, str]] = {
     "arg.unknown": (
         "知らないオプションです: {option}。使えるオプションは circuit-sim --help で確かめてください。",
         "Unknown option: {option}. See circuit-sim --help for the options.",
+    ),
+    "arg.file": (
+        "circuit-sim は、起動するときにファイルを受け取りません（{file}）。"
+        "仕様JSONは、起動した後に画面の「開く」で開いてください。",
+        "circuit-sim doesn't take a file when it starts ({file}). "
+        "Open the spec JSON with Open in the workspace after it starts.",
     ),
     "arg.missing": (
         "{option} の後ろに値を指定してください。使い方は circuit-sim --help で確かめてください。",
@@ -224,20 +245,21 @@ class Texts:
 def bind(port: int) -> socket.socket:
     """127.0.0.1 のポート port（0 なら空いているポート）に、待ち受けのソケットを作る。
 
-    使えなければ OSError。"""
+    使えなければ OSError。
+
+    Windows では、どの設定も付けない。
+    - SO_REUSEADDR は、使用中のポートを奪えてしまうので付けない。
+    - SO_EXCLUSIVEADDRUSE も付けない。Windows Server 2003 からは、決まったアドレス（127.0.0.1）に何も付けずに
+      結んだポートを、ほかの利用者が SO_REUSEADDR で奪うことはできない（WSAEACCES。Microsoft の文書
+      「Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE」の表）。SO_EXCLUSIVEADDRUSE が足すのは、同じ利用者の
+      ほかのプログラムからの守りだけで、それは合言葉のファイルも読める相手なので守りにならない。逆に、この設定の
+      ソケットは、受け付けた接続が残っている間は閉じた後も同じポートに結べない（同じ文書）ので、起動し直すと
+      別のポートへ移り、開いている画面が戻れない。
+    POSIX は SO_REUSEADDR（止めた直後の TIME_WAIT の残りがあっても、同じポートで起動し直せるように。
+    POSIX のこの設定は、使用中のポートは奪えない）。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        if WINDOWS:
-            # ほかのプログラム（ほかの利用者を含む）に、同じポートを横取りさせない（Microsoft の勧め）。
-            # この設定のソケットは、受け付けた接続が残っていると、閉じた後も同じポートに結べない。
-            # 止めるときに待っている接続を RST で閉じて（reset_idle_connections）、起動し直したときに
-            # 同じポートで結べるようにする
-            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
-            if exclusive is not None:
-                sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
-        else:
-            # 止めた直後に同じポートで起動し直せるように
-            # （Windows のこの設定は、使用中のポートを奪えてしまうので付けない）
+        if not WINDOWS:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST, port))
         sock.listen(128)
@@ -246,6 +268,51 @@ def bind(port: int) -> socket.socket:
         raise
     sock.set_inheritable(True)
     return sock
+
+
+def pid_alive(pid: int, windows: bool = WINDOWS) -> bool:
+    """プロセス pid が動いているか。分からないときは動いているとみなす（待たずに次のポートへ移る）。"""
+    if pid <= 0:
+        return False
+    if windows:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: あるが、ほかの利用者のもの
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except (OSError, AttributeError):
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # ほかの利用者のプロセス（PermissionError）など
+    return True
+
+
+def port_listening(port: int) -> bool:
+    """127.0.0.1 のポート port で、何かが待ち受けているか（つながるか）。"""
+    try:
+        with socket.create_connection((HOST, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
 
 
 def port_problem(exc: OSError) -> str:
@@ -258,18 +325,38 @@ def port_problem(exc: OSError) -> str:
     return "other"
 
 
-def bind_any(wanted: int | None, binder: Callable[[int], socket.socket] = bind
+def bind_any(wanted: int | None, binder: Callable[[int], socket.socket] = bind,
+             previous: tuple[int, int] | None = None, alive: Callable[[int], bool] = pid_alive,
+             listening: Callable[[int], bool] = port_listening, wait: float = RESTART_WAIT_SECONDS,
+             sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
              ) -> tuple[socket.socket | None, list[tuple[int, OSError]]]:
-    """wanted が None なら 28470 → 28471〜28479 → 空いているポートの順に試す。
+    """待ち受けのソケットを作る。（ソケット、試して使えなかったポートと理由の並び）。
 
-    決めてあれば、そのポートだけ。"""
+    wanted が None なら、前回のポート（previous =（ポート、プロセス ID））→ 28470 → 28471〜28479 → 空いている
+    ポートの順に試す。決めてあれば、そのポートだけ。
+    前回のポートが使用中でも、前回のプロセスがもう無く、そのポートで待ち受けているものも無ければ（OS に前回の
+    接続の後始末が残っているだけ）、wait 秒まで結び直してみる。"""
     candidates = [wanted] if wanted is not None else [DEFAULT_PORT, *FALLBACK_PORTS, 0]
+    if wanted is None and previous is not None and previous[0] > 0:
+        candidates = [previous[0], *[c for c in candidates if c != previous[0]]]
     failures: list[tuple[int, OSError]] = []
     for port in candidates:
         try:
             return binder(port), failures
         except OSError as exc:
-            failures.append((port, exc))
+            last = exc
+        if (previous is not None and port == previous[0] and port_problem(last) == "in_use"
+                and not alive(previous[1]) and not listening(port)):
+            deadline = clock() + wait
+            while clock() < deadline:
+                sleep(RESTART_RETRY_SECONDS)
+                try:
+                    return binder(port), failures
+                except OSError as exc:
+                    last = exc
+                    if port_problem(exc) != "in_use" or listening(port):
+                        break
+        failures.append((port, last))
     return None, failures
 
 
@@ -281,46 +368,13 @@ def bind_failure_text(tr: Texts, wanted: int | None, failures: list[tuple[int, O
     return tr(f"port.{port_problem(exc)}", port=port, reason=reason)
 
 
-def reset_idle_connections(connections: Iterable[object], windows: bool = WINDOWS) -> int:
-    """Windows だけ: 待っている接続（応答を渡し終え、送りの待ちも空のもの）に、閉じたら RST を送る印
-    （SO_LINGER 0 秒）を付ける。付けた数を返す。
-
-    Windows の SO_EXCLUSIVEADDRUSE のソケットは、受け付けた接続が残っている間、同じポートに結べない。FIN で
-    閉じると、ブラウザが自分の側を閉じるまで接続が残り（FIN_WAIT_2）、起動し直すと別のポートへ移って、開いて
-    いる画面が戻れない。POSIX は SO_REUSEADDR で結べるので、印を付けない（ふつうに FIN で閉じる）。
-    RST は、OS の送りの待ちにあるデータを捨てる。uvicorn は、応答のデータを transport に渡した時点で
-    response_complete を立てるので、それだけでは足りず、transport の送りの待ち（get_write_buffer_size）が
-    空のものに限る。それでも、OS が送ったが相手の受け取りの確かめがまだのデータ（止める直前に書き終えた
-    応答の終わり）は、ごくまれに捨てうる。止める間際の応答に限られ、画面は「つながっていない」になって
-    つなぎ直すので、受け入れる。"""
-    if not windows:
-        return 0
-    count = 0
-    for connection in list(connections):
-        cycle = getattr(connection, "cycle", None)
-        if cycle is not None and not getattr(cycle, "response_complete", True):
-            continue  # 応答の途中: uvicorn が応答を終えてから閉じる
-        transport = getattr(connection, "transport", None)
-        if transport is None:
-            continue
-        try:
-            if transport.get_write_buffer_size() != 0:
-                continue  # 送りの待ちが残っている: FIN で閉じ、届き切らせる
-            sock = transport.get_extra_info("socket")
-            if sock is None:
-                continue
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER_RESET)
-            count += 1
-        except (OSError, AttributeError, RuntimeError):
-            pass
-    return count
-
-
 class GuardedServer(uvicorn.Server):
     """保存していない変更があるとき、1回目の Ctrl+C では止めずに知らせる uvicorn のサーバー。
 
-    止めるときは、Windows では待っている接続に「閉じたら RST」の印を付けてから、uvicorn の手順
-    （待ち受けを閉じ、接続を閉じる）で止める（reset_idle_connections）。"""
+    止めるときは uvicorn の手順のまま: 待ち受けを閉じ、応答の途中のものは応答を終えてから、どの接続もふつうに
+    FIN で閉じる（RST で送りの待ちを捨てない）。送りの待ちのデータは、相手が読む間は送り続ける。ただし、
+    止める合図から timeout_graceful_shutdown（main では 2 秒）たっても閉じ終わらない接続は、そこで打ち切る
+    （読むのがそれより遅い相手には、応答の終わりが届かないことがある）。その前に on_shutdown を呼ぶ。"""
 
     def __init__(self, config: uvicorn.Config, workspace: Workspace, say: Callable[[str], None],
                  tr: Texts | None = None, on_shutdown: Callable[[], None] | None = None) -> None:
@@ -343,7 +397,6 @@ class GuardedServer(uvicorn.Server):
         super().handle_exit(sig, frame)
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
-        reset_idle_connections(self.server_state.connections)
         if self.on_shutdown is not None:
             # SIGTERM・窓を閉じたときは、止めた後に uvicorn が合図を出し直してプロセスが終わり、main の後始末
             # まで進まないので、ここでする（転送用の HTML を消す）
@@ -557,7 +610,11 @@ class Parser(argparse.ArgumentParser):
             else:
                 self.fail(self.tr("arg.unexpected", option=name.split("/")[-1]))
         if extras:
-            self.fail(self.tr("arg.unknown", option=extras[0]))
+            first = extras[0]
+            if first.startswith("-"):
+                self.fail(self.tr("arg.unknown", option=first))
+            # ファイルを渡して起動しようとした（python -m circuit_sim <ファイル> と同じ形で試す人がいる）
+            self.fail(self.tr("arg.file", file=first))
         return parsed
 
     def fail(self, text: str):
@@ -589,11 +646,15 @@ def main(argv: list[str] | None = None) -> int:
         print(tr("config.failed", path=directory, reason=exc.strerror or exc), file=sys.stderr)
         return 2
 
-    sock, failures = bind_any(args.port)
+    sock, failures = bind_any(args.port, previous=read_last_run(directory))
     if sock is None:
         print(bind_failure_text(tr, args.port, failures), file=sys.stderr)
         return 2
     port = sock.getsockname()[1]
+    try:
+        write_last_run(directory, port, os.getpid())  # 次に起動し直したとき、同じポートを最初に試す
+    except OSError:
+        pass
     base = f"http://{HOST}:{port}/"
     source = enter_source()
     renew = "enter" if source else "restart"

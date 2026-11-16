@@ -29,6 +29,7 @@ from circuit_sim.app.cli import (
     DEFAULT_PORT,
     FALLBACK_PORTS,
     MESSAGES,
+    RESTART_WAIT_SECONDS,
     Texts,
     bind_any,
     bind_failure_text,
@@ -256,6 +257,137 @@ def test_scan_order_is_28470_then_28471_to_28479_then_os():
     assert bind_any(None, binder)[0] == "socket:28472"
 
 
+def test_previous_port_is_tried_first():
+    """前回の起動のポート（28473）を、28470 より先に試す（開いている画面は前回のポートを見ている）。"""
+    binder, tried = fake_binder({})
+    sock, failures = bind_any(None, binder, previous=(28473, 999999), alive=lambda pid: False,
+                              listening=lambda port: False)
+    assert sock == "socket:28473" and tried == [28473] and failures == []
+
+
+def flaky_binder(port: int, busy_times: int):
+    """port が busy_times 回だけ使用中、その後は結べる。"""
+    tried: list[int] = []
+
+    def binder(p: int):
+        tried.append(p)
+        if p == port and tried.count(p) <= busy_times:
+            raise OSError(errno.EADDRINUSE, "in use")
+        return f"socket:{p}"
+
+    return binder, tried
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_previous_port_is_retried_while_only_old_connections_remain():
+    """前回のプロセスがもう無く、待ち受けているものも無いのに使用中（OS に前回の接続の後始末が残る）なら、
+
+    同じポートを結び直してみる。上限（5 秒）のうちに結べれば、そのポート。"""
+    binder, tried = flaky_binder(28470, 10)
+    clock = FakeClock()
+    sock, failures = bind_any(None, binder, previous=(28470, 4242), alive=lambda pid: False,
+                              listening=lambda port: False, sleep=clock.sleep, clock=clock)
+    assert sock == "socket:28470" and failures == []
+    assert tried.count(28470) == 11 and 1.9 < clock.now < 2.3
+
+
+@pytest.mark.parametrize(("alive", "listening", "busy", "why"), [
+    (True, False, 1, "前回のプロセスがまだ動いている（ほかの circuit-sim が同じ設定の場所で動いている）"),
+    (False, True, 1, "そのポートで、ほかのプログラムが待ち受けている"),
+    (False, False, 1000, "上限まで待っても結べない"),
+])
+def test_previous_port_gives_way_when_retrying_cannot_help(alive, listening, busy, why):
+    binder, tried = flaky_binder(28470, busy)
+    clock = FakeClock()
+    sock, failures = bind_any(None, binder, previous=(28470, 4242), alive=lambda pid: alive,
+                              listening=lambda port: listening, sleep=clock.sleep, clock=clock)
+    assert sock == "socket:28471", why
+    assert [p for p, _ in failures] == [28470]
+    assert clock.now <= RESTART_WAIT_SECONDS + 0.5
+    if alive or listening:
+        assert tried.count(28470) == 1 and clock.now == 0.0  # 待たない
+
+
+def test_explicit_port_is_retried_when_it_was_the_previous_one():
+    binder, tried = flaky_binder(8765, 3)
+    clock = FakeClock()
+    sock, _ = bind_any(8765, binder, previous=(8765, 4242), alive=lambda pid: False,
+                       listening=lambda port: False, sleep=clock.sleep, clock=clock)
+    assert sock == "socket:8765" and tried == [8765] * 4
+
+
+def test_pid_alive_tells_running_and_finished_processes_apart():
+    assert cli.pid_alive(os.getpid())
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=20)
+    assert not cli.pid_alive(proc.pid)
+    assert not cli.pid_alive(0)
+
+
+def test_restart_returns_to_the_previous_port_with_a_browser_still_connected(tmp_path):
+    """起動し直すと、前回のポートに戻る（--port を付けなくても。開いている画面がそのまま戻れる）。
+
+    前回は 28470 の外の空いているポート P で起動し、ブラウザの代わりに待ちの接続（keep-alive）を3本開いたまま
+    止める（POSIX は SIGINT、Windows は Ctrl+Break）。--port 無しで起動し直すと P で起動し、前のクッキーで
+    そのまま使える。Windows の実機では local_ci で流れる。"""
+    import http.client
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CIRCUIT_SIM_CONFIG_DIR": str(tmp_path),
+           "LC_ALL": "ja_JP.UTF-8"}
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0
+
+    def start(*args: str) -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-m", "circuit_sim.app", "--no-browser", *args], cwd=ROOT,
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=flags)
+
+    proc = start("--port", str(port))
+    conns = []
+    try:
+        url, _ = read_lines_until_url(proc)
+        client = Client(url)
+        wait_ready(client, START_LIMIT_S)
+        cookie = "; ".join(f"{c.name}={c.value}" for c in client.jar)
+        for _ in range(3):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/api/health", headers={"Cookie": cookie})
+            conn.getresponse().read()
+            conns.append(conn)
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+        except OSError:
+            pytest.skip("この実行には端末（コンソール）が無いので、Ctrl+Break を送れなかった")
+        proc.wait(timeout=15)
+        proc = start()  # --port 無し
+        url2, lines = read_lines_until_url(proc)
+        assert f":{port}/" in url2, ("前回のポートに戻らなかった", lines)
+        deadline = time.monotonic() + START_LIMIT_S
+        while True:
+            try:
+                assert client.json("api/health")["instance"]  # 前のクッキーのまま
+                break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+    finally:
+        for conn in conns:
+            conn.close()
+        stop(proc)
+
+
 def test_explicit_port_is_the_only_one_tried():
     binder, tried = fake_binder({8765: OSError(errno.EADDRINUSE, "in use")})
     sock, failures = bind_any(8765, binder)
@@ -354,7 +486,15 @@ def test_help_is_in_one_language(tmp_path, lang, words):
      "使えるオプションは circuit-sim --help で確かめてください。"),
     (["--bogus"], "en_US.UTF-8",
      "circuit-sim: error: Unknown option: --bogus. See circuit-sim --help for the options."),
-    (["spec.json"], "ja_JP.UTF-8", "知らないオプションです: spec.json。"),
+    # ファイルを渡したとき（UX 確認3回目の改善4）
+    (["examples/rlc_series.json"], "ja_JP.UTF-8",
+     "circuit-sim: エラー: circuit-sim は、起動するときにファイルを受け取りません"
+     "（examples/rlc_series.json）。"
+     "仕様JSONは、起動した後に画面の「開く」で開いてください。"),
+    (["spec.json"], "en_US.UTF-8",
+     "circuit-sim: error: circuit-sim doesn't take a file when it starts (spec.json). "
+     "Open the spec JSON with Open in the workspace after it starts."),
+    (["-x"], "ja_JP.UTF-8", "知らないオプションです: -x。"),
     (["--port"], "ja_JP.UTF-8", "circuit-sim: エラー: --port の後ろに値を指定してください。"),
     (["--port"], "en_US.UTF-8", "circuit-sim: error: --port needs a value."),
     (["--no-browser=yes"], "ja_JP.UTF-8", "circuit-sim: エラー: --no-browser には値を付けられません。"),
@@ -593,8 +733,9 @@ def test_enter_in_the_terminal_gives_a_new_url(tmp_path, lang, note, renew, new,
         lines += [proc.stdout.readline() for _ in range(3)]
         assert any(note in ln for ln in lines) and any(renew in ln for ln in lines), lines
         wait_ready(Client(url), START_LIMIT_S)
-        # 使い終わった URL を、ブラウザでページとして開く（Sec-Fetch-Mode: navigate）
-        req = urllib.request.Request(url, headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none"})
+        # 使い終わった URL を、ブラウザでページとして開く（Sec-Fetch-Mode: navigate、Dest: document）
+        req = urllib.request.Request(url, headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+                                                   "Sec-Fetch-Site": "none"})
         urllib.request.urlopen(req, timeout=5).close()
         line = proc.stdout.readline()
         assert stale in line, line

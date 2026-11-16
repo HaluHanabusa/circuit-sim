@@ -40,6 +40,7 @@ CONFIG_ENV = "CIRCUIT_SIM_CONFIG_DIR"
 APP_DIR_NAME = "circuit-sim"
 TOKEN_FILE = "token"
 SETTINGS_FILE = "settings.json"
+LAST_RUN_FILE = "last-run.json"  # 前回の起動のポートとプロセス ID（起動し直したとき、同じポートを最初に試す）
 BROKEN_SUFFIX = ".broken"
 # 好みは数百バイト。これより大きいものは壊れているとみなす（読み込みで固まらない）
 SETTINGS_MAX_BYTES = 64 * 1024
@@ -81,7 +82,8 @@ _DACL_FLAGS = re.compile(r"NO_ACCESS_CONTROL|AI|AR|P")
 def sddl_dacl(sddl: str) -> tuple[set[str], list[tuple[str, str, str, str]]] | None:
     """SDDL の DACL を（フラグ、項目の並び）にする。項目は（種類、フラグ、権利、相手）。
 
-    条件つきの項目の後ろの条件（入れ子の括弧）は読み飛ばす。DACL が無い・読めない形なら None。"""
+    条件つきの項目の後ろの条件（入れ子の括弧、引用符の中の文字列。文字列の中の括弧は数えない）は読み飛ばす。
+    DACL が無い・読めない形・項目の並びの後ろに読み残し（ほかの部分 S: O: G: のほか）があるなら None。"""
     if "D:" not in sddl:
         return None
     rest = sddl.split("D:", 1)[1].strip()
@@ -94,12 +96,20 @@ def sddl_dacl(sddl: str) -> tuple[set[str], list[tuple[str, str, str, str]]] | N
     if _DACL_FLAGS.sub("", head).strip():
         return None
     aces: list[tuple[str, str, str, str]] = []
-    while 0 <= i < len(rest) and rest[i] == "(":
-        depth, j = 0, i
+    if i < 0:
+        return flags, aces
+    while i < len(rest) and rest[i] == "(":
+        depth, j, quoted = 0, i, False
         while j < len(rest):
-            depth += {"(": 1, ")": -1}.get(rest[j], 0)
-            if depth == 0:
-                break
+            c = rest[j]
+            if c == '"':
+                quoted = not quoted  # SDDL の文字列には、引用符を書き表す手段が無い（MS-DTYP 2.5.1.1）
+            elif not quoted and c == "(":
+                depth += 1
+            elif not quoted and c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
             j += 1
         if depth != 0:
             return None
@@ -108,6 +118,9 @@ def sddl_dacl(sddl: str) -> tuple[set[str], list[tuple[str, str, str, str]]] | N
             return None
         aces.append((fields[0], fields[1], fields[2], fields[5]))
         i = j + 1
+    tail = rest[i:].strip()
+    if tail and not re.match(r"[OGS]:", tail):
+        return None  # 読み残し: 本人だけとはみなさない
     return flags, aces
 
 
@@ -412,6 +425,23 @@ def _being_written(path: Path) -> bool:
     except OSError:
         return False
     return st.st_size == 0 and time.time() - st.st_mtime < TOKEN_WAIT_SECONDS
+
+
+def read_last_run(directory: Path) -> tuple[int, int] | None:
+    """前回の起動の（ポート、プロセス ID）。無い・読めない・形が違うなら None。"""
+    try:
+        data = json.loads((directory / LAST_RUN_FILE).read_text(encoding="utf-8"))
+        port, pid = data["port"], data["pid"]
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        return None
+    if type(port) is not int or type(pid) is not int or not 0 < port <= 65535 or pid <= 0:
+        return None
+    return port, pid
+
+
+def write_last_run(directory: Path, port: int, pid: int) -> None:
+    ensure_dir(directory)
+    _write_private(directory / LAST_RUN_FILE, json.dumps({"port": port, "pid": pid}).encode("ascii") + b"\n")
 
 
 # ------------------------------------------------------------------ 画面の好み

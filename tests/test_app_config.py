@@ -18,6 +18,7 @@ import pytest
 
 from circuit_sim.app.config import (
     CONFIG_ENV,
+    LAST_RUN_FILE,
     SETTINGS_FILE,
     TOKEN_FILE,
     TOKEN_FORM,
@@ -25,8 +26,10 @@ from circuit_sim.app.config import (
     config_dir,
     folder_dacl_is_private,
     load_token,
+    read_last_run,
     sddl_trustees,
     valid_pref,
+    write_last_run,
 )
 
 WINDOWS = os.name == "nt"
@@ -151,6 +154,23 @@ def test_threads_starting_together_share_one_key(tmp_path):
     for t in threads:
         t.join(timeout=30)
     assert len(results) == 16 and len(set(results)) == 1
+
+
+@pytest.mark.parametrize("content", [
+    "", "{", "[]", '{"port": "1", "pid": 2}', '{"port": 0, "pid": 2}', '{"port": 70000, "pid": 2}',
+    '{"port": 1, "pid": -1}', '{"port": true, "pid": 2}', '{"pid": 2}',
+])
+def test_broken_last_run_record_is_ignored(tmp_path, content):
+    (tmp_path / LAST_RUN_FILE).write_text(content, encoding="utf-8")
+    assert read_last_run(tmp_path) is None
+
+
+def test_last_run_record_round_trips_privately(tmp_path):
+    assert read_last_run(tmp_path / "c") is None
+    write_last_run(tmp_path / "c", 28471, 4242)
+    assert read_last_run(tmp_path / "c") == (28471, 4242)
+    if not WINDOWS:
+        assert stat.S_IMODE((tmp_path / "c" / LAST_RUN_FILE).stat().st_mode) == 0o600
 
 
 # ------------------------------------------------------------------ 画面の好み

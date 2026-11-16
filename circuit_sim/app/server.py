@@ -179,8 +179,8 @@ class Launches:
 
     番号はクッキー（合言葉）と交換したら捨てる。LAUNCH_SECONDS たったものも使えない。
     使い終わった・期限が切れた・知らない番号で、クッキーも持たないページがブラウザで開かれたら
-    （Sec-Fetch-Mode: navigate）on_stale を呼ぶ（端末に、新しい URL の出し方を出す。間隔は
-    STALE_REPORT_SECONDS 以上）。
+    （Sec-Fetch-Mode: navigate、Sec-Fetch-Dest: document）on_stale を呼ぶ（端末に、新しい URL の出し方を
+    出す。間隔は STALE_REPORT_SECONDS 以上）。
     番号が使われた・期限が切れた・古くて捨てたときは on_spent(番号) を呼ぶ（起動コマンドが、番号を書いた
     転送用の HTML を消す）。期限切れは、次に番号を扱ったときか sweep() で見つける。"""
 
@@ -572,9 +572,14 @@ def create_app(
                 response.set_cookie(COOKIE, token, max_age=COOKIE_MAX_AGE, path="/", httponly=True,
                                     samesite="strict")
             elif (headers.get("sec-fetch-mode", "").lower() == "navigate"
+                  and headers.get("sec-fetch-dest", "").lower() == "document"
                   and not token_ok(request.cookies.get(COOKIE), token)):
-                # ブラウザで開いたページが使えない: 端末に、新しい URL の出し方を出す。ブラウザが開いた
-                # ページだけ（ほかの利用者の道具や、別のサイトの画像の要求などからは出させない）
+                # ブラウザで開いたページが使えない: 端末に、新しい URL の出し方を出す。ブラウザが窓やタブに
+                # ページとして開いた要求（Sec-Fetch-Mode: navigate、Sec-Fetch-Dest: document）に限る。
+                # 別のサイトの画像・スクリプト・非表示の iframe からの要求では、ブラウザがこの形を送らない
+                # ので出ない。Sec-Fetch-* はブラウザでない道具なら偽れるので、同じ PC の利用者が出させる
+                # ことはできる
+                # （出るのは決まった案内だけで、STALE_REPORT_SECONDS に1回まで）
                 launches.stale()
             return response
         page = (static_dir / "index.html").read_text(encoding="utf-8")

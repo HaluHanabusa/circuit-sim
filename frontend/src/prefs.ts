@@ -45,6 +45,12 @@ export function onPrefsFailure(handler: ((failure: PrefsFailure) => void) | null
   failureHandler = handler;
 }
 
+let savedHandler: (() => void) | null = null;
+/** 設定ファイルに書けたときに呼ぶものを決める（App が「保存できませんでした」のお知らせを消す）。 */
+export function onPrefsSaved(handler: (() => void) | null): void {
+  savedHandler = handler;
+}
+
 export function serverPrefsKnown(): boolean {
   return serverKnown;
 }
@@ -113,6 +119,7 @@ export async function flushPrefs(byUser = false): Promise<void> {
   try {
     await api.putSettings(batch);
     blocked = false;
+    savedHandler?.();
   } catch (exc) {
     keep(); // つながっていない・合言葉が無いときは、再接続の後に送る
     if (exc instanceof HttpError) {

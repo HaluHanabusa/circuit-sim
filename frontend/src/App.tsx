@@ -18,6 +18,7 @@ import {
   initialLang,
   initialTheme,
   onPrefsFailure,
+  onPrefsSaved,
   readFlag,
   serverPrefsKnown,
   syncServerPrefs,
@@ -29,6 +30,11 @@ import {
 export const HEALTH_INTERVAL_MS = 2000;
 /** 待ちの表示は、始まってから 200 ms たってから出す（design-system 9章） */
 export const WAIT_SHOW_MS = 200;
+/** 読み上げに伝えた文を領域に残す時間。過ぎたら消す（言語を替えたときに前の出来事を読み直さない。
+ * 同じ出来事が続けて起きても、空から入れ直すので毎回読まれる）。A0 の UX 確認3回目の改善3 */
+export const ANNOUNCE_KEEP_MS = 5000;
+/** 読み上げの文を入れ直すとき、空にしてから入れるまでの間 */
+const ANNOUNCE_GAP_MS = 50;
 
 /** unauthorized: アプリ本体は動いているが、このページは合言葉のクッキーを持っていない（D-051） */
 type Conn = "connecting" | "connected" | "disconnected" | "unauthorized";
@@ -53,6 +59,8 @@ export function App() {
   // 読み上げに伝える文。訳した文字列ではなく、キーと差し込む値で持ち、表示するときに訳す（言語を切り替えたら
   // 読み上げ用の領域の文も切り替わる。10.4）
   const [announce, setAnnounce] = useState<{ key: MessageKey; params: Params } | null>(null);
+  const announceTimer = useRef<number | undefined>(undefined);
+  const [focusChoose, setFocusChoose] = useState(0);
   const instance = useRef<string | null>(null);
   const docRef = useRef<Doc | null>(null);
   const nextId = useRef(1);
@@ -81,6 +89,22 @@ export function App() {
     if (focusRun) runRef.current?.focus();
   }, [focusRun]);
 
+  // 読み上げに伝える: いったん空にしてから入れ、ANNOUNCE_KEEP_MS たったら消す
+  const announceNow = useCallback((key: MessageKey, params: Params) => {
+    window.clearTimeout(announceTimer.current);
+    setAnnounce(null);
+    announceTimer.current = window.setTimeout(() => {
+      setAnnounce({ key, params });
+      announceTimer.current = window.setTimeout(() => setAnnounce(null), ANNOUNCE_KEEP_MS);
+    }, ANNOUNCE_GAP_MS);
+  }, []);
+  useEffect(() => () => window.clearTimeout(announceTimer.current), []);
+
+  // 起動直後の画面で、最後のお知らせを閉じて帯が消えたら、フォーカスを「ファイルを選ぶ…」へ（AC-1-5、3.2）
+  useEffect(() => {
+    if (focusChoose) chooseRef.current?.focus();
+  }, [focusChoose]);
+
   const addNotice = useCallback((data: NoticeData) => {
     const e = entry(data.code);
     const notice: Notice = { ...data, id: nextId.current++, time: e.kind === "event" ? clockTime(new Date()) : undefined };
@@ -88,9 +112,9 @@ export function App() {
     if (e.level === "error" && e.kind === "event") {
       // 新しいエラーの出来事は、帯を自動で開いて、読み上げにも伝える（9.4）
       setNoticesOpen(true);
-      setAnnounce({ key: whatKey(notice), params: notice.params });
+      announceNow(whatKey(notice), notice.params);
     }
-  }, []);
+  }, [announceNow]);
 
   // 画面の好みを設定ファイルに書けなかった: お知らせで知らせる（同じお知らせが出ていれば足さない）
   useEffect(() => {
@@ -100,10 +124,17 @@ export function App() {
           ? list
           : [...list, { code: "N-PREFS-SAVE", params: { path }, details, id: nextId.current++, time: clockTime(new Date()) }],
       );
-      setAnnounce({ key: "notice.N-PREFS-SAVE.what", params: {} });
+      announceNow("notice.N-PREFS-SAVE.what", {});
     });
-    return () => onPrefsFailure(null);
-  }, []);
+    // 保存し直せたら、「保存できませんでした」を消す（UX 確認3回目の改善1）
+    onPrefsSaved(() => setNotices((list) => (list.some((n) => n.code === "N-PREFS-SAVE")
+      ? list.filter((n) => n.code !== "N-PREFS-SAVE")
+      : list)));
+    return () => {
+      onPrefsFailure(null);
+      onPrefsSaved(null);
+    };
+  }, [announceNow]);
 
   // ---------------------------------------------------------------- つながっているかの確かめ（D8、1.3）
 
@@ -314,7 +345,10 @@ export function App() {
         // 最後の1件を閉じたら、同じ描画で帯をたたむ（0 件の帯を一瞬でも開いて見せない。9.3）
         const remaining = notices.filter((n) => n.id !== id);
         setNotices(remaining);
-        if (remaining.length === 0) setNoticesOpen(false);
+        if (remaining.length === 0) {
+          setNoticesOpen(false);
+          if (!docRef.current) setFocusChoose((n) => n + 1); // 起動直後の画面では帯ごと消える
+        }
       }}
     />
   );

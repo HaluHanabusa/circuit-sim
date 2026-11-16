@@ -40,17 +40,18 @@ EXTRA = {
     ),
     # A0 の直し（レビュー2回目の軽3）: 画面の好みを設定ファイルに書けなかった（PUT /api/settings が失敗）。
     # 付録B への追記は ux-designer に確認を頼む（入ったら、ここから外す）
+    # 文言は A0 の UX 確認3回目の決めごと1（docs/verification/A0-ux-3.md）
     "notice.N-PREFS-SAVE.what": (
-        "画面の好み（言語、テーマ、仕切りの位置）を、設定ファイルに保存できませんでした。"
-        "この画面ではそのまま使えますが、次に起動したときは戻りません。",
-        "Couldn't save your display preferences (language, theme, panel sizes) to the settings file. "
-        "They still apply here, but won't come back the next time the app starts.",
+        "画面の好み（言語、テーマ、仕切りの位置など）を、設定ファイルに保存できませんでした。"
+        "この画面ではいまの好みのまま使えますが、次に起動したときには残らないことがあります。",
+        "Couldn't save your display preferences (language, theme, panel sizes, and so on) to the settings "
+        "file. They still apply on this page, but may not be kept the next time circuit-sim starts.",
     ),
     "notice.N-PREFS-SAVE.fix": (
         "設定の場所（{path}）に書き込めるか（フォルダの権限、空き容量）を確かめてください。"
-        "直った後に好みを変えると、保存し直します。",
+        "直した後に好みを1つ変えると保存し直し、保存できるとこのお知らせは消えます。",
         "Check that the settings folder ({path}) can be written to (permissions, free space). "
-        "Once it's fixed, change a preference to save them again.",
+        "After fixing it, change any preference to save again. This notice goes away once they're saved.",
     ),
 }
 

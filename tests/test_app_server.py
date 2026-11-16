@@ -387,7 +387,7 @@ def test_stale_launch_number_without_cookie_is_reported_to_the_terminal(tmp_path
     クッキーを持っているページ（履歴から開き直した、など）では知らせない。"""
     reports = []
     running = Running(tmp_path, launches=Launches(on_stale=lambda: reports.append(1))).start()
-    navigate = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none"}
+    navigate = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", "Sec-Fetch-Site": "none"}
     try:
         number = running.launches.issue()
         running.raw("GET", f"/?k={number}", headers=navigate, cookie=False)
@@ -406,11 +406,14 @@ def test_stale_launch_number_without_cookie_is_reported_to_the_terminal(tmp_path
     {"Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image"},    # 別のサイトの <img src=…/?k=x>
     {"Sec-Fetch-Mode": "cors"},
     {"Accept": "text/html"},
+    # 別のサイトの非表示の iframe（ページとして読むが、窓やタブではない）
+    {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe", "Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Mode": "navigate"},
 ])
 def test_stale_report_only_comes_from_a_page_opened_in_the_browser(tmp_path, headers):
-    """端末への案内は、ブラウザがページとして開いた要求（Sec-Fetch-Mode: navigate）からだけ出す。
+    """端末への案内は、ブラウザが窓やタブにページとして開いた要求（Sec-Fetch-Mode: navigate、
 
-    ほかの利用者の道具や、別のサイトの画像の要求から、端末に案内を出させない（レビュー3回目の軽）。"""
+    Sec-Fetch-Dest: document）からだけ出す。別のサイトの画像・iframe の要求では出ない。"""
     reports = []
     running = Running(tmp_path, launches=Launches(on_stale=lambda: reports.append(1))).start()
     try:
@@ -696,66 +699,35 @@ def idle_connection(port: int) -> socket.socket:
     return conn
 
 
-def test_idle_connections_are_closed_by_os_rule_when_stopping(tmp_path):
-    """止めるとき、待っている接続（keep-alive）は、Windows では RST で閉じる（FIN で閉じて相手を待つと、
-
-    SO_EXCLUSIVEADDRUSE のソケットは、その間、同じポートに結べない）。POSIX ではふつうに FIN で閉じる。"""
+def test_idle_connections_are_closed_normally_when_stopping(tmp_path):
+    """止めるとき、待っている接続（keep-alive）はふつうに FIN で閉じる（RST で送りの待ちを捨てない）。"""
     running = Running(tmp_path).start()
     conns = [idle_connection(running.port) for _ in range(3)]
     try:
         running.stop()
         for conn in conns:
             conn.settimeout(5)
-            if WINDOWS:
-                with pytest.raises(ConnectionResetError):
-                    while conn.recv(4096):
-                        pass
-            else:
-                assert conn.recv(4096) == b""
+            assert conn.recv(4096) == b""
     finally:
         for conn in conns:
             conn.close()
 
 
-class FakeTransport:
-    def __init__(self, waiting: int) -> None:
-        self.waiting = waiting
-        self.options: list[tuple] = []
+@pytest.fixture(params=[False, True], ids=["os-path", "windows-path"])
+def bind_path(request, monkeypatch):
+    """結び方を、この OS のもの（POSIX は SO_REUSEADDR）と、Windows のもの（何も付けない）の両方で流す。"""
+    from circuit_sim.app import cli
 
-    def get_write_buffer_size(self) -> int:
-        return self.waiting
-
-    def get_extra_info(self, name: str):
-        return self if name == "socket" else None
-
-    def setsockopt(self, *args) -> None:
-        self.options.append(args)
+    if request.param:
+        monkeypatch.setattr(cli, "WINDOWS", True)
+    return request.param
 
 
-@pytest.mark.parametrize("windows", [True, False])
-def test_reset_mark_only_on_windows_and_only_when_nothing_waits_to_be_sent(windows):
-    """RST の印は Windows だけ。応答を渡し終えていても（response_complete）、送りの待ちが残る接続には付けない
-
-    （RST は送りの待ちを捨てる。uvicorn は transport に渡した時点で response_complete を立てる。
-    レビュー3回目）。"""
-    from circuit_sim.app.cli import reset_idle_connections
-
-    def conn(complete: bool | None, waiting: int) -> SimpleNamespace:
-        cycle = None if complete is None else SimpleNamespace(response_complete=complete)
-        return SimpleNamespace(cycle=cycle, transport=FakeTransport(waiting))
-
-    idle, fresh, sending, flushing = conn(True, 0), conn(None, 0), conn(False, 0), conn(True, 307924)
-    marked = reset_idle_connections([idle, fresh, sending, flushing], windows=windows)
-    assert marked == (2 if windows else 0)
-    assert bool(idle.transport.options) == windows and bool(fresh.transport.options) == windows
-    assert sending.transport.options == [] and flushing.transport.options == []
-
-
-def test_slow_reader_gets_the_whole_response_when_stopping(tmp_path):
+def test_slow_reader_gets_the_whole_response_when_stopping(tmp_path, bind_path):
     """読むのが遅い相手（受け取りの量 4096）が大きな画面のファイルを求め、読み終える前に止めても、
 
-    応答は最後まで届く（RST で送りの待ちを捨てない。レビュー3回目の rst_check.py と同じ形。
-    Windows でも流れる）。"""
+    応答は最後まで届く（レビュー3回目の rst_check.py と同じ形）。Windows の結び方を強制した形でも流す。
+    止めた後もゆっくり読む（4096 バイトずつ 2 ms おき）。"""
     asset = next((STATIC_DIR / "assets").glob("*.js"))
     size = asset.stat().st_size
     assert size > 100_000
@@ -771,8 +743,9 @@ def test_slow_reader_gets_the_whole_response_when_stopping(tmp_path):
         time.sleep(1.0)
         data = b""
         conn.settimeout(10)
-        while chunk := conn.recv(65536):  # 途中で RST なら ConnectionResetError
+        while chunk := conn.recv(4096):  # 途中で RST なら ConnectionResetError
             data += chunk
+            time.sleep(0.002)
         stopper.join(timeout=15)
         head, _, body = data.partition(b"\r\n\r\n")
         assert len(body) == size, (len(body), size)

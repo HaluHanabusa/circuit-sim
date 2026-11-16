@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 import queue
 import re
@@ -173,15 +172,6 @@ def test_slow_reader_gets_the_whole_asset_when_the_app_is_stopped(tmp_path, paus
         app.stop()
 
 
-@pytest.mark.xfail(
-    strict=not WINDOWS,
-    reason=(
-        "製品の不具合(軽微): RST の印（Windows だけで効く）は、transport の送りの待ちが空なら付く。"
-        "RST は OS の送りの待ちも捨てるので、OS が受け取って相手がまだ読んでいない分が届かない"
-        "（Linux で強制すると、約 300 KB の画面のファイルが 10〜130 KB で切れる）。"
-        "Windows で OS が受け取る量は未確認"
-    ),
-)
 def test_slow_reader_gets_the_whole_asset_with_the_windows_reset_branch(tmp_path, monkeypatch):
     """RST の印を付ける分岐を強制して、読むのが遅い相手に最後まで届くかを見る（Windows では、ふだんの形）。"""
     import uvicorn
@@ -190,8 +180,8 @@ def test_slow_reader_gets_the_whole_asset_with_the_windows_reset_branch(tmp_path
     from circuit_sim.app.config import Settings
     from circuit_sim.app.server import Launches, Workspace, create_app
 
-    monkeypatch.setattr(cli, "reset_idle_connections",
-                        functools.partial(cli.reset_idle_connections, windows=True))
+    # 実装の直し（RST をやめた）で reset_idle_connections は無くなった。Windows の経路（結び方）を強制する
+    monkeypatch.setattr(cli, "WINDOWS", True)
     asset = big_asset()
     workspace = Workspace()
     app = create_app(token="v" * 43, settings=Settings(tmp_path / "config"), workspace=workspace,
@@ -329,14 +319,6 @@ def test_sddl_is_not_mistaken_for_private(name, sddl, file_ok, folder_ok):
     assert folder_dacl_is_private(sddl, ME) is folder_ok
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "製品の不具合(軽微): 条件つきの項目の文字列の中の `)` を項目の終わりと読み、その後ろの項目を"
-        "黙って読み落とす（後ろに Everyone の許可があっても、ファイルを本人だけと判定する）。"
-        "場所の判定（完全一致）は誤らない"
-    ),
-)
 @pytest.mark.parametrize(("name", "sddl", "file_ok", "folder_ok"), SDDL_PAREN_IN_STRING,
                          ids=[c[0] for c in SDDL_PAREN_IN_STRING])
 def test_sddl_with_parenthesis_inside_a_condition_string(name, sddl, file_ok, folder_ok):

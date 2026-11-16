@@ -75,10 +75,12 @@ describe("設定ファイルを読めていないとき（data-prefs が無い�
 });
 
 describe("設定ファイルに書けなかったとき", () => {
-  it("知らせて、自動の送り直しを止める。利用者が次に変えたら、まとめて送り直す", async () => {
+  it("知らせて、自動の送り直しを止める。利用者が次に変えたら、まとめて送り直す。書けたら知らせる", async () => {
     const prefs = await load(true);
     const failures: unknown[] = [];
+    let saved = 0;
     prefs.onPrefsFailure((f) => failures.push(f));
+    prefs.onPrefsSaved(() => (saved += 1));
     reply = (method) =>
       Promise.resolve(
         method === "PUT"
@@ -99,6 +101,7 @@ describe("設定ファイルに書けなかったとき", () => {
     expect(puts()).toHaveLength(2);
     expect(puts()[1].body).toEqual({ settings: { theme: "dark", lang: "en" } });
     expect(failures).toHaveLength(1);
+    expect(saved).toBe(1); // 書けた（App は「保存できませんでした」を消す）
   });
 
   it("つながっていないだけなら、知らせずに、次の確かめで送り直す", async () => {

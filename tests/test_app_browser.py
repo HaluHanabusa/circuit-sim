@@ -806,8 +806,8 @@ def test_page_from_another_site_reads_settings_before_writing(browser, app):
 def test_preferences_that_cannot_be_saved_are_told_once(browser, app, tmp_path):
     """設定ファイルに書けないとき（ここでは、設定ファイルと控えの場所が中身のあるフォルダ）、画面は送り直し続けず、
 
-    お知らせの帯で知らせる。起動直後の画面でも帯を出す。利用者が次に好みを変えたら、もう一度送る。
-    （レビュー2回目の軽3）"""
+    お知らせの帯で知らせる。起動直後の画面でも帯を出す。利用者が次に好みを変えたら、もう一度送り、
+    保存できたらお知らせを消す（レビュー2回目の軽3、UX 確認3回目の改善1）。"""
     settings = app.config / "settings.json"
     backup = app.config / "settings.json.broken"
     p = Page(browser, app)
@@ -832,7 +832,7 @@ def test_preferences_that_cannot_be_saved_are_told_once(browser, app, tmp_path):
         row = page.inner_text("[data-testid=notice-row]")
         assert str(app.config) in row and "空き容量" in row, row
         p.shot("prefs-save-failed-open-ja-dark")
-        # 直ったら、次に変えたときに保存し直す。お知らせは1件のまま
+        # 直ったら、次に変えたときに保存し直す。保存できたら、お知らせは消える（起動直後の画面では帯ごと）
         (backup / "x").unlink()
         backup.rmdir()
         settings.rmdir()
@@ -841,7 +841,8 @@ def test_preferences_that_cannot_be_saved_are_told_once(browser, app, tmp_path):
         assert len(puts) == 2
         saved = json.loads(settings.read_text(encoding="utf-8"))
         assert saved["theme"] == "dark" and saved["lang"] == "en", saved
-        assert page.locator("[data-testid=notice-row]").count() == 1
+        page.wait_for_selector("[data-testid=notices]", state="detached", timeout=3000)
+        assert page.locator("[data-testid=notice-row]").count() == 0
     finally:
         if backup.is_dir():
             for child in backup.iterdir():
@@ -850,6 +851,83 @@ def test_preferences_that_cannot_be_saved_are_told_once(browser, app, tmp_path):
         if settings.is_dir():
             settings.rmdir()
         p.close()
+
+
+def fail_settings(app: App) -> tuple[Path, Path]:
+    """設定ファイルに書けなくする（設定ファイルと控えの場所を、中身のあるフォルダにする）。"""
+    settings, backup = app.config / "settings.json", app.config / "settings.json.broken"
+    if settings.exists():
+        settings.unlink()
+    settings.mkdir()
+    backup.mkdir()
+    (backup / "x").write_text("x", encoding="utf-8")
+    return settings, backup
+
+
+def unfail_settings(settings: Path, backup: Path) -> None:
+    if backup.is_dir():
+        for child in backup.iterdir():
+            child.unlink()
+        backup.rmdir()
+    if settings.is_dir():
+        settings.rmdir()
+
+
+@pytest.mark.parametrize("how", ["Delete", "close-button"])
+def test_closing_the_last_notice_on_the_start_screen_focuses_choose_file(browser, app, how):
+    """起動直後の画面で最後のお知らせを閉じると帯ごと消えるので、フォーカスを「ファイルを選ぶ…」に置く
+
+    （AC-1-5、3.2 の最初のフォーカス。UX 確認3回目の改善2）。"""
+    p = Page(browser, app)
+    page = p.open()
+    settings, backup = fail_settings(app)
+    try:
+        page.click("[data-testid=toggle-theme] [role=radio] >> nth=1")
+        page.wait_for_selector("[data-testid=notices]")
+        page.click("[data-testid=notices-toggle]")
+        page.wait_for_selector("[data-testid=notice-row]")
+        if how == "Delete":
+            page.focus("[data-testid=notice-row]")
+            page.keyboard.press("Delete")
+        else:
+            page.focus("[data-testid=notice-dismiss]")
+            page.keyboard.press("Enter")
+        page.wait_for_selector("[data-testid=notices]", state="detached")
+        page.wait_for_function("() => document.activeElement?.dataset.testid === 'choose-file'", timeout=3000)
+        assert page.evaluate("document.activeElement.matches(':focus-visible')")
+    finally:
+        unfail_settings(settings, backup)
+        p.close()
+
+
+ANNOUNCED = "() => document.querySelector('[data-testid=announce]').textContent.includes('broken.json')"
+
+
+def test_announcement_is_cleared_after_a_few_seconds(browser, app, tmp_path):
+    """読み上げに伝えた文は数秒で消える。消えた後に言語を替えても、前の出来事を読み直さない
+
+    （UX 確認3回目の改善3）。同じ出来事が続けて起きても、空から入れ直す。"""
+    bad = tmp_path / "broken.json"
+    bad.write_text("{", encoding="utf-8")
+    p = Page(browser, app)
+    page = p.open()
+    page.click("[data-testid=sample-rlc_series]")
+    page.wait_for_selector("[data-testid=frame]")
+    page.set_input_files("[data-testid=file-input]", str(bad))
+    page.wait_for_function(ANNOUNCED)
+    page.wait_for_function("() => document.querySelector('[data-testid=announce]').textContent === ''",
+                           timeout=8000)
+    page.click("[data-testid=toggle-lang] [lang=en]")
+    page.wait_for_timeout(300)
+    assert page.inner_text("[data-testid=announce]") == ""
+    # 同じ出来事をもう一度: 空から入れ直す
+    page.evaluate("""() => { window.__changes = 0; new MutationObserver(() => window.__changes++)
+        .observe(document.querySelector('[data-testid=announce]'), {childList: true, subtree: true,
+                                                                   characterData: true}); }""")
+    page.set_input_files("[data-testid=file-input]", str(bad))
+    page.wait_for_function(ANNOUNCED)
+    assert page.evaluate("window.__changes") >= 1
+    p.close()
 
 
 def test_tooltip_goes_away_when_pressed_with_the_keyboard(browser, app):
