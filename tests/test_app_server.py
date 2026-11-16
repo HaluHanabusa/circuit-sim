@@ -170,8 +170,13 @@ def test_version_that_is_not_a_string_is_a_format_error(srv, version):
     assert {"path": "schema_version", "problem": "schema.string"} in notice["items"]
 
 
+# 試験の ID には、値そのものではなく短い名前を付ける。pytest は、実行中の試験の ID を環境変数
+# PYTEST_CURRENT_TEST に入れる（_pytest/runner.py の _update_current_test_var）。Windows の環境変数は
+# 32767 文字までで、超えると Python が ValueError を出す（Modules/posixmodule.c の os.putenv）。値が 20 万
+# 文字の ID は、Windows で試験の準備の段階でエラーになる（POのPCで 3 件）
 @pytest.mark.parametrize("text", ["[" * 200_000, '{"plant": ' + "[" * 200_000 + "]" * 200_000 + "}",
-                                  "[" * 200_000 + "]" * 200_000])
+                                  "[" * 200_000 + "]" * 200_000],
+                         ids=["open-only", "inside-plant", "open-and-close"])
 def test_deeply_nested_json_is_reported_not_500(srv, text):
     """入れ子の深い JSON（[ が 20 万）で 500 にしない。開けなかった（仕様の形に合わない）として案内する。"""
     status, _, raw = srv.call("/api/open", {"file": "deep.json", "text": text})
@@ -680,7 +685,7 @@ def test_settings_that_cannot_be_written_are_reported_with_the_place(tmp_path):
         running.stop()
 
 
-# ------------------------------------------------------------ 止めるとき（Windows の SO_EXCLUSIVEADDRUSE）
+# ------------------------------------------------------------ 止めるとき（Windows の待ち受けの結び方）
 
 
 def idle_connection(port: int) -> socket.socket:
@@ -754,9 +759,9 @@ def test_slow_reader_gets_the_whole_response_when_stopping(tmp_path, bind_path):
         conn.close()
 
 
-@pytest.mark.skipif(not WINDOWS, reason="Windows の SO_EXCLUSIVEADDRUSE（POのPCの local_ci で流れる）")
+@pytest.mark.skipif(not WINDOWS, reason="Windows の待ち受けの結び方（POのPCの local_ci で流れる）")
 def test_same_port_can_be_bound_again_right_after_stopping_on_windows(tmp_path):
-    """SO_EXCLUSIVEADDRUSE を付けたまま、受け付けた接続が相手の側で開いたままでも、
+    """Windows の結び方（どの設定も付けない。cli.bind）で、受け付けた接続が相手の側で開いたままでも、
 
     止めてすぐ同じポートに結べる（開いている画面が、起動し直したアプリ本体に、同じポートで戻れる）"""
     first = Running(tmp_path).start()

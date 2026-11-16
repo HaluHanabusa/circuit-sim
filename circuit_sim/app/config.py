@@ -63,7 +63,8 @@ def config_dir(
         base = Path(appdata) if appdata else home / "AppData" / "Roaming"
         return base / APP_DIR_NAME
     xdg = env.get("XDG_CONFIG_HOME")
-    # XDG の決まり: 相対パスの指定は無視する
+    # XDG の決まり: 相対パスの指定は無視する。絶対パスかどうかは、動いている OS の決まりで見る
+    # （ここを通るのは Windows でない OS だけなので、対象の OS の決まりと同じ）
     base = Path(xdg) if xdg and os.path.isabs(xdg) else home / ".config"
     return base / APP_DIR_NAME
 

@@ -22,16 +22,24 @@
 
 止めるときは Ctrl+C。保存していない変更があるときは、1回目の Ctrl+C では止めずに知らせ、10 秒以内に
 もう一度押すと止める（画面仕様 14章の未決11。画面からは、アプリ本体を止める操作を防げないため）。
+Windows の Ctrl+Break も、Ctrl+C と同じに扱う（知らせ方も、終了コードも。break_as_interrupt）。
 端末の窓を閉じたときや、OS から止められたとき（SIGTERM）は、知らせずに止まる。
+
+端末の Enter を読み始めるのは、ブラウザを開く呼び出しが戻ってから（open_when_ready の after_open）。
+ブラウザをコマンドで起動するとき（環境変数 BROWSER の指定など）、起動される側は標準入力をアプリ本体と
+共有する。Windows では、共有しているパイプに読み取りの待ちがあると、起動される側が始まれずに止まる。
 
 端末に出す文言は、OS の言語で日本語か英語にする（LC_ALL、LC_MESSAGES、LANG の順。無ければ Windows の
 表示言語。ja で始まれば日本語）。
 
-終了コード: 0 = 止めた、2 = 起動できなかった（ポートが使えない、設定の場所に書けない、など）。
+終了コード: 0 = 止めた（Ctrl+C、Windows の Ctrl+Break）、2 = 起動できなかった（ポートが使えない、設定の
+場所に書けない、など）。SIGTERM で止められたときは、後始末の後に合図の既定の動きで終わる（POSIX では -15）。
+Windows での動きの根拠は docs/design/app-design.md の 8章。
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import html
 import json
@@ -44,7 +52,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import uvicorn
@@ -404,6 +412,31 @@ class GuardedServer(uvicorn.Server):
         await super().shutdown(sockets=sockets)
 
 
+@contextlib.contextmanager
+def break_as_interrupt(windows: bool) -> Iterator[None]:
+    """Windows: Ctrl+Break（SIGBREAK）で止めた後も、Ctrl+C と同じに、main の後始末と「止めました」まで進める。
+
+    uvicorn は、止め終えた後に、受け取った合図の扱いを元に戻してから、同じ合図を出し直す
+    （uvicorn.Server.capture_signals の signal.raise_signal）。SIGBREAK の元の扱いは「既定」で、Windows の
+    C ランタイムの raise は、既定の扱いの合図を受けると、その場で終了コード 3 で終わる（_exit(3)。Microsoft の
+    文書 signal: "By default, signal terminates the calling program with exit code 3"）。そのままだと、
+    「止めました」を出さずに終了コード 3 で終わる。
+    この中では、元の扱いを Ctrl+C の既定と同じ（KeyboardInterrupt を出す）にしておく。出し直された合図は
+    KeyboardInterrupt として呼んだ側に届き、Ctrl+C と同じ終わり方になる。出るときに、扱いを戻す。
+
+    合図の扱いを決められるのは主スレッドだけなので、ほかのスレッドから呼ばれたときは何もしない
+    （uvicorn も、主スレッドでなければ合図を受けない）。Windows でないときも、何もしない。"""
+    sig = getattr(signal, "SIGBREAK", None)
+    if not windows or sig is None or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(sig, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(sig, previous)
+
+
 def launch_url(base: str, number: str) -> str:
     """ブラウザで開く URL。載せるのは起動の番号（合言葉ではない）。"""
     return f"{base}?{TOKEN_PARAM}={number}"
@@ -442,8 +475,13 @@ def enter_source(fd: int = 0, windows: bool = WINDOWS) -> str | None:
         return None
 
 
-def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0) -> threading.Thread:
-    """Enter を押すたびに on_enter を呼ぶ、別のスレッド（sys.stdin のロックを持たない os.read で読む）。"""
+def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0,
+                start: bool = True) -> threading.Thread:
+    """Enter を押すたびに on_enter を呼ぶ、別のスレッド（sys.stdin のロックを持たない os.read で読む）。
+
+    start が偽なら、スレッドを作るだけで始めない（呼ぶ側が、読み始めてよい時に start() する。main は、
+    ブラウザを開く呼び出しが戻ってから始める）。合図の扱い（SIGTTIN）は主スレッドでしか決められないので、
+    ここで決めておく。"""
     if source == "tty" and not WINDOWS:
         # 後でバックグラウンドへ回されても止められず、読み取りが失敗して終わるように
         signal.signal(signal.SIGTTIN, signal.SIG_IGN)
@@ -463,7 +501,8 @@ def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0) -> threa
                 on_enter()
 
     thread = threading.Thread(target=loop, name="circuit-sim-enter", daemon=True)
-    thread.start()
+    if start:
+        thread.start()
     return thread
 
 
@@ -538,12 +577,23 @@ def _remove(path: Path | None) -> None:
 
 
 def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable[[str], None], tr: Texts,
-                    used: Callable[[], bool] | None = None, wait: float = BROWSER_CHECK_SECONDS) -> None:
+                    used: Callable[[], bool] | None = None, wait: float = BROWSER_CHECK_SECONDS,
+                    after_open: Callable[[], None] | None = None) -> None:
     """サーバーが受け付けを始めたら、既定のブラウザで target（転送用の HTML の file:// の場所）を開く。
 
     開けなければ、url（端末で開く起動の URL）を出す。開いたのに wait 秒たっても番号が使われなければ
     （used() が偽。HTML がブラウザ以外で開いた、ブラウザがその場所を読めない、など）、
-    url を開くよう案内する。"""
+    url を開くよう案内する。
+
+    after_open は、ブラウザを開く呼び出しが戻ったとき（開けても開けなくても）に1回呼ぶ。main は、ここで
+    端末の Enter を読み始める。webbrowser は、コマンドで起動するブラウザ（環境変数 BROWSER の指定など）を、
+    標準入力を差し替えずに起動する（起動される側は、アプリ本体と同じ標準入力を持つ）。その間にアプリ本体が
+    標準入力を読んで待っていると、
+    - Windows では、標準入力がパイプのとき、起動される側が始まれずに止まる（同じパイプへの操作は1つずつ
+      順に処理され、読み取りの待ちが終わるまで次へ進まない。Python は起動のときに標準入力の位置を調べる。
+      CPython の issue 78961）。webbrowser.open が戻らないので、ブラウザは開かず、案内も出ない
+    - どの OS でも、端末で動くブラウザ（w3m など）と、キー入力を取り合う
+    ので、読み始めるのは呼び出しが戻ってから。"""
     while not server.started and not server.should_exit:
         time.sleep(0.02)
     if server.should_exit:
@@ -552,6 +602,9 @@ def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable
         opened = webbrowser.open(target)
     except Exception:  # ブラウザを起動できない環境（画面の無いサーバーなど）でも、アプリ本体は動かし続ける
         opened = False
+    finally:
+        if after_open is not None:
+            after_open()
     if not opened:
         say(tr("browser.failed", url=url))
         return
@@ -678,28 +731,39 @@ def main(argv: list[str] | None = None) -> int:
     say(tr("url.note", minutes=minutes))
     say(tr(f"url.renew.{renew}"))
     say(tr("how_to_stop"))
+    watcher: threading.Thread | None = None
     if source:
         def renew_url() -> None:
             say(tr("url.new", url=launch_url(base, launches.issue()), minutes=minutes))
 
-        watch_enter(renew_url, source)
-    if not args.no_browser:
+        watcher = watch_enter(renew_url, source, start=False)
+
+    def start_watching() -> None:
+        # Enter を読み始める。ブラウザを開くときは、開く呼び出しが戻ってから（open_when_ready の説明）
+        if watcher is not None:
+            watcher.start()
+
+    if args.no_browser:
+        start_watching()
+    else:
         try:
             # ブラウザには、番号を書いた本人だけが読める HTML の場所を渡す（起動の引数に番号を載せない）
             target = pages.write(number, url, settings.read().get("theme")).as_uri()
         except OSError:
             say(tr("browser.failed", url=url))
+            start_watching()
         else:
             def used() -> bool:
                 return not launches.is_open(number)
 
             threading.Thread(target=open_when_ready, args=(server, target, url, say, tr, used),
-                             daemon=True).start()
+                             kwargs={"after_open": start_watching}, daemon=True).start()
             sweeper = threading.Timer(LAUNCH_SECONDS + 1, launches.sweep)  # 期限で HTML を消す
             sweeper.daemon = True
             sweeper.start()
     try:
-        server.run(sockets=[sock])
+        with break_as_interrupt(WINDOWS):  # Windows の Ctrl+Break でも、下の KeyboardInterrupt に届く
+            server.run(sockets=[sock])
     except KeyboardInterrupt:
         pass
     finally:

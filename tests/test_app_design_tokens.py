@@ -135,7 +135,12 @@ def contrast_rows():
     return rows
 
 
-@pytest.mark.parametrize(("label", "names", "threshold", "light", "dark"), contrast_rows())
+CONTRAST_ROWS = contrast_rows()
+
+
+# ID は、行の番号とトークンの名前（表の文をそのまま ID にすると、日本語が \uXXXX の形になって長くなる）
+@pytest.mark.parametrize(("label", "names", "threshold", "light", "dark"), CONTRAST_ROWS,
+                         ids=[f"{i:02d}-{'+'.join(row[1])}" for i, row in enumerate(CONTRAST_ROWS)])
 def test_contrast_pairs_meet_the_threshold(label, names, threshold, light, dark):
     """10章の2: 2.3 の表の組み合わせを計算し直し、基準以上で、表の値（小数2桁）と一致する。"""
     for theme, documented in zip(THEMES, (light, dark), strict=True):

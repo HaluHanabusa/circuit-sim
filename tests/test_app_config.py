@@ -43,16 +43,27 @@ def test_tests_never_touch_the_real_config():
     assert "circuit-sim-guard-" in str(here)
 
 
+# 試験を流している OS で絶対パスになる場所（試験の一時フォルダの下）に置き換える印。
+# 絶対パスの決まりは OS で違う: /x/conf は POSIX では絶対パスだが、Windows ではドライブが無いので
+# 絶対パスではない（Python 3.13 から os.path.isabs が偽を返す。3.12 までは真だった）。POのPC（Windows、
+# Python 3.13.2）で、/x/conf を決め打ちにしていた場合が落ちた
+ABSOLUTE_HERE = "<absolute-here>"
+
+
 @pytest.mark.parametrize(("env", "windows", "expected"), [
     ({"APPDATA": r"C:\Users\u\AppData\Roaming"}, True,
      PureWindowsPath(r"C:\Users\u\AppData\Roaming\circuit-sim")),
     ({}, True, None),  # APPDATA が無ければ ホーム\AppData\Roaming
-    ({"XDG_CONFIG_HOME": "/x/conf"}, False, Path("/x/conf/circuit-sim")),
+    ({"XDG_CONFIG_HOME": ABSOLUTE_HERE}, False, ABSOLUTE_HERE),
     ({"XDG_CONFIG_HOME": "relative/conf"}, False, None),  # 相対パスは無視（XDG の決まり）
     ({}, False, None),
     ({CONFIG_ENV: "/tmp/override", "APPDATA": "C:/a", "XDG_CONFIG_HOME": "/x"}, False, Path("/tmp/override")),
-])
+], ids=["windows-appdata", "windows-no-appdata", "xdg-absolute", "xdg-relative", "xdg-unset", "override"])
 def test_config_dir_follows_os_conventions(env, windows, expected, tmp_path):
+    if expected == ABSOLUTE_HERE:
+        conf = tmp_path / "conf"
+        assert os.path.isabs(str(conf))
+        env, expected = {**env, "XDG_CONFIG_HOME": str(conf)}, conf / "circuit-sim"
     got = config_dir(env=env, windows=windows, home=tmp_path)
     if expected is None:
         tail = ("AppData", "Roaming", "circuit-sim") if windows else (".config", "circuit-sim")
@@ -61,6 +72,21 @@ def test_config_dir_follows_os_conventions(env, windows, expected, tmp_path):
         assert PureWindowsPath(str(got)) == expected
     else:
         assert got == expected
+
+
+def test_xdg_config_home_is_judged_by_the_rule_of_the_running_os(tmp_path):
+    """XDG_CONFIG_HOME が絶対パスかどうかは、動いている OS の決まり（os.path.isabs）で見る。
+
+    XDG の分かれ目を通るのは Windows でない OS だけ（製品は、動いている OS で分かれ目を選ぶ）なので、
+    動いている OS の決まりが、そのまま対象の OS の決まりになる。/x/conf は、POSIX では絶対パスとして使い、
+    Windows で（試験が windows=False を渡して）この分かれ目を通したときは、絶対パスでなければ使わない。"""
+    got = config_dir(env={"XDG_CONFIG_HOME": "/x/conf"}, windows=False, home=tmp_path)
+    if os.path.isabs("/x/conf"):
+        assert got == Path("/x/conf") / "circuit-sim"
+    else:
+        assert got == tmp_path / ".config" / "circuit-sim"
+    if not WINDOWS:
+        assert got == Path("/x/conf/circuit-sim")
 
 
 def test_token_is_created_once_and_kept(tmp_path):
@@ -90,7 +116,8 @@ def test_token_readable_by_others_is_replaced(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-@pytest.mark.parametrize("content", ["", "short", "x" * 42, "has space " * 5, "日本語" * 20, "a" * 200])
+@pytest.mark.parametrize("content", ["", "short", "x" * 42, "has space " * 5, "日本語" * 20, "a" * 200],
+                         ids=["empty", "short", "one-char-short", "spaces", "not-ascii", "too-long"])
 def test_malformed_token_is_replaced(tmp_path, content):
     path = tmp_path / TOKEN_FILE
     path.write_text(content, encoding="utf-8")
