@@ -206,9 +206,23 @@ D059 = {
 }
 
 
-def _call(name, value):
+# D-065（6回目の検証で足した）: 組み合わせの範囲 Q = R·√(C/L) ≥ 1e-3、f_ctrl/f0 = 2π·f_ctrl·√(LC) ≤ 1e11。
+# 基準の回路のままだと、L = 1e4、C = 1e-15、R = 1e-6 の端は Q < 1e-3 になるので、個々の端を確かめるときは
+# ほかの値を下のように選び直して、組み合わせの範囲の中に入れる（_d065_inside で確かめてから使う）。
+D065_Q_MIN, D065_RATIO_MAX = 1e-3, 1e11
+D065_COMPANION = {"inductance": {"r_load": 6e3}, "capacitance": {"r_load": 6e3},
+                  "r_load": {"inductance": 1e-9, "capacitance": 1e-2}}
+
+
+def _d065_inside(v_in, ind, cap, r, f_ctrl):
+    """D-065 の組み合わせの範囲の中か（決定記録の文から。r = inf は無負荷）。"""
+    q_load, ratio = r * math.sqrt(cap / ind), 2.0 * math.pi * f_ctrl * math.sqrt(ind * cap)
+    return q_load >= D065_Q_MIN and ratio <= D065_RATIO_MAX
+
+
+def _call(name, value, base=None):
     """（結果の名前、文）。GainDesignError でない例外は「EXC 型」で返す。"""
-    kw, opt = dict(BASE), {}
+    kw, opt = dict(BASE if base is None else base), {}
     if name in BASE:
         kw[name] = value
     else:
@@ -237,7 +251,9 @@ def _outside_values():
     for name, (lo, lo_closed, hi) in D059.items():
         out += [(name, math.nextafter(hi, math.inf)), (name, hi * 2)]
         out.append((name, math.nextafter(lo, -math.inf) if lo_closed else lo))
-        out += [(name, math.nan), (name, math.inf), (name, -math.inf), (name, -1.0), (name, 10**400)]
+        # r_load = inf は D-065 で無負荷として受ける（test_e1b_noload_and_combination_range.py で確かめる）
+        out += [(name, math.nan), *([] if name == "r_load" else [(name, math.inf)]), (name, -math.inf),
+                (name, -1.0), (name, 10**400)]
         if lo > 0:      # 正でも、倍精度で 0 や範囲の下になる値
             out += [(name, 0.0), (name, 5e-324), (name, np.float32(1e-45)), (name, np.longdouble("1e-4000")),
                     (name, lo / 2)]
@@ -248,8 +264,14 @@ def _outside_values():
 @pytest.mark.parametrize(("name", "value"), _inside_values(), ids=lambda v: repr(v)[:28])
 def test_d059_range_ends_are_accepted(name, value):
     """範囲の端（両端を含む。zero_damping の下だけ含まない）は invalid_argument にならず、
-    想定外の例外も出ない。"""
-    result, _ = _call(name, value)
+    想定外の例外も出ない。組み合わせの範囲（D-065）の外になる端は、ほかの値を D065_COMPANION で選び直す。"""
+    base = dict(BASE)
+    if name in BASE:
+        trial = {**base, name: float(value)}
+        if not _d065_inside(*trial.values()):
+            base.update(D065_COMPANION[name])
+            assert _d065_inside(*{**base, name: float(value)}.values())
+    result, _ = _call(name, value, base)
     assert result != "invalid_argument" and not result.startswith("EXC")
 
 
@@ -271,11 +293,20 @@ def _practical_circuits(n=300):
 
 
 def test_practical_circuits_are_never_refused_as_invalid_argument():
-    """実用の回路 300 通りは、範囲の外として断られない（設計できない理由で断るのは可）。"""
-    results = {}
+    """実用の回路 300 通りは、範囲の外として断られない（設計できない理由で断るのは可）。
+    6回目の検証で改めた（D-065）: 個々の値の範囲から作った組のうち、Q = R·√(C/L) < 1e-3 の 26 通り
+    （L 1〜10 H と C 10 pF〜1 nF に 1 mΩ〜0.1 Ω の負荷、のような降圧コンバータにならない組）は、
+    組み合わせの範囲の外として、Q の名前を書いて断る。それ以外は断らない。"""
+    results, low_q = {}, 0
     for v_in, ind, cap, r, f in _practical_circuits():
-        result, _, _ = _run((v_in, ind, cap, r), f)
+        result, _, msg = _run((v_in, ind, cap, r), f)
+        if not _d065_inside(v_in, ind, cap, r, f):
+            low_q += 1
+            assert r * math.sqrt(cap / ind) < D065_Q_MIN                  # f_ctrl/f0 は最大 6e9 で範囲の中
+            assert result == "invalid_argument" and "Q" in msg and "組み合わせ" in msg
+            continue
         results[result] = results.get(result, 0) + 1
+    assert low_q == 26
     assert "invalid_argument" not in results
     assert results.get("ok", 0) >= 30            # 設計できる回路も含まれている
 
@@ -287,15 +318,24 @@ CORNER_OPTS = [{}, {"zero_ratio": 1e-9, "zero_damping": 2.0, "filter_ratio": 100
 
 
 def test_range_corners_only_raise_gain_design_errors():
-    """範囲の端どうしの組み合わせ（3^5 × 3 = 729 通り）: 結果かGainDesignError だけが出て、候補の値は有限。"""
-    reasons = set()
+    """範囲の端どうしの組み合わせ（3^5 × 3 = 729 通り）: 結果かGainDesignError だけが出て、候補の値は有限。
+    6回目の検証で改めた（D-065）: 組み合わせの範囲の外になる端どうし（Q < 1e-3 か f_ctrl/f0 > 1e11）は
+    invalid_argument で、文に外れた組み合わせを書く。中の組は invalid_argument にならない。"""
+    reasons, outside = set(), 0
     for v_in, ind, cap, r, f in itertools.product(*CORNER_VALUES):
         for opts in CORNER_OPTS:
-            result, g, _ = _run((v_in, ind, cap, r), f, **opts)      # ほかの例外が出れば、ここで試験が落ちる
+            result, g, msg = _run((v_in, ind, cap, r), f, **opts)    # ほかの例外が出れば、ここで試験が落ちる
+            if not _d065_inside(v_in, ind, cap, r, f):
+                outside += 1
+                assert result == "invalid_argument" and g is None and "組み合わせ" in msg
+                assert ("Q" in msg) == (r * math.sqrt(cap / ind) < D065_Q_MIN)
+                assert ("f_ctrl/f0" in msg) == (2.0 * math.pi * f * math.sqrt(ind * cap) > D065_RATIO_MAX)
+                continue
             reasons.add(result)
             if g is not None:
                 assert all(math.isfinite(x) for x in (g.kp, g.ki, g.kd, g.f_cross, g.pole_radius))
     assert "invalid_argument" not in reasons
+    assert 0 < outside < 729 and len(reasons) >= 3
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -363,7 +363,20 @@ def _call(**over):
 @pytest.mark.parametrize("value", [-1.0, math.nan, math.inf, -math.inf])
 def test_bad_design_argument_is_refused_with_its_name(name, value):
     """負、NaN、±inf はどの引数でも計算せずに invalid_argument。最良の候補は無く、文に引数の名前と値があり、
-    「満たす」と書かない。"""
+    「満たす」と書かない。
+    6回目の検証で改めた（D-065）: r_load = +inf だけは無負荷として受け、R = 1e30 Ω と同じ結果になる。"""
+    if name == "r_load" and value == math.inf:
+        outcomes = []
+        for r in (value, 1e30):
+            try:
+                outcomes.append(("ok", _call(r_load=r)))
+            except GainDesignError as e:
+                outcomes.append((e.reason, e.best))
+        (reason_inf, g_inf), (reason_big, g_big) = outcomes
+        assert reason_inf == reason_big != "invalid_argument"
+        assert g_inf.phase_margin_deg == pytest.approx(g_big.phase_margin_deg, abs=1e-9)
+        assert g_inf.ki == pytest.approx(g_big.ki, rel=1e-9) and g_inf.kp == pytest.approx(g_big.kp, rel=1e-9)
+        return
     with pytest.raises(GainDesignError) as info:
         _call(**{name: value})
     err = info.value

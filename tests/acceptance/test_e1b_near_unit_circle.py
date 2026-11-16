@@ -193,12 +193,27 @@ def test_range_ends_of_d057_give_designs_that_are_not_conditionally_stable(opts)
 
 # ------------------------------------------------------------------ 3. 「満たす」と安定の判定（D-057）
 
-def test_candidate_within_1e6_deg_of_the_target_is_said_to_meet_it():
-    """余裕が目標を 1.3e-13° だけ下回る候補（丸め）は「満たす」と書き、「足りない」と書かない（「目標まで
+# 6回目の検証で例を取り直した: 前の例（crossings.UNSTABLE_CASE、目標 24.361861916713153°）は、6回目の修正
+# （d9f98d7）で丸めの向きが変わり、余裕が目標を 1.4e-14° 上回るようになって、前提（目標を下回る）が崩れた。
+# 下の2つは 6回目の修正で目標を 3.0e-12°・6.8e-13° 下回る候補（どちらも no_stability_margin。150 桁の参照でも
+# 余裕は目標 − 1e-11° 以内、半径は 1 − 7.2e-11・1 − 4.0e-12 で、「満たす」「安定の余裕が無い」が正しい）。
+# 目標をはっきり（5e-7°）下回る候補の文は、丸めの向きに頼らない形で
+# test_e1b_noload_and_combination_range.py で確かめる。
+WITHIN_ROUNDING = [
+    ((42.30613676782444, 1.8287100897010294e-11, 5.3595205566901816e-05, 1.050159124468598e-06),
+     66785873.205888286, {"zero_ratio": 5.175900446436682e-07, "filter_ratio": 0.0007893269265332699,
+      "phase_margin_deg": 26.420576153971524}),
+    ((0.0033965286230973665, 3.4609161273413534e-06, 0.008424209268930087, 0.00033423609517650867),
+     28636.478574244513, {"zero_ratio": 5.527456417738679e-07, "zero_damping": 1.1734567796051698,
+                          "filter_ratio": 0.0, "phase_margin_deg": 41.114588074864535}),
+]
+
+
+@pytest.mark.parametrize("case", WITHIN_ROUNDING, ids=["3.0e-12", "6.8e-13"])
+def test_candidate_within_1e6_deg_of_the_target_is_said_to_meet_it(case):
+    """余裕が目標を丸めの分だけ下回る候補は「満たす」と書き、「足りない」と書かない（「目標まで
     0.0000000000001° 足りない」も書かない）。本文の「位相余裕は目標を満たすが」とも食い違わない。"""
-    plant, f_ctrl = crossings.UNSTABLE_CASE
-    opts = {"zero_damping": 0.1437543236478271, "filter_ratio": 0.0, "phase_margin_deg": 24.361861916713153,
-            "zero_ratio": 0.9590984284499318}
+    plant, f_ctrl, opts = case
     best, err = _design(plant, f_ctrl, **opts)
     assert 0.0 < opts["phase_margin_deg"] - best.phase_margin_deg < MEETS_TOL
     text = str(err)
