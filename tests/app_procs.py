@@ -19,12 +19,18 @@
    止めると、試験が起動したものも一緒に止まる。新しいまとまりが要る起動（疑似端末を、そのプロセスの端末に
    する起動）は spawn(new_session=True) を使う。そのときは、試験のプロセスが終わったら起動したものを止める
    見張り（GUARD）を付ける（検証 6回目の問題2。前は、どの起動も新しいまとまりに入れていたので、ハーネスに
-   止められた確認の後に、アプリ本体が待ち受けたまま残った）。
+   止められた確認の後に、アプリ本体が待ち受けたまま残った）。ハーネスがまとまりごと止めるのは、時間切れと
+   中断（Ctrl-C、終了の合図）のときだけ。
 
 止められないもの（既知の限界）:
 - 親が先に終わった子（孫）。POSIX では、試験のプロセスと同じまとまりにいれば、ハーネスがまとまりごと
-  止めるときには止まる。自分で新しいまとまりに移ったもの（webbrowser が、終わりに & を付けた BROWSER の
-  コマンドを起動するときなど）は、親が動いている間に kill_tree が止めなければ、自分で終わるまで残る。
+  止めるとき（時間切れ、中断）には止まる。自分で新しいまとまりに移ったもの（webbrowser が、終わりに & を
+  付けた BROWSER のコマンドを起動するときなど）は、親が動いている間に kill_tree が止めなければ、自分で
+  終わるまで残る。
+- pytest のプロセスだけが強制終了されたとき（メモリ不足など。まとまりごとでない止め方）。見張りは働かず、
+  ふつうの起動は残る（新しいまとまりの起動は、命綱の見張りが止める）。
+- kill_posix_tree の後始末（finally の SIGKILL）の最中に、さらに例外（3 回目の Ctrl+C など）が入ったとき。
+  そこから先の SIGKILL は送られない（Python の合図の扱いは、命令の切れ目ごとに割り込める）。
 - Windows の taskkill /T は、親の番号で子をたどる（Microsoft の文書 taskkill: 指定したプロセスと、
   それが起動した子を止める）。Windows は、親が終わった後も子の「親の番号」を書き換えないので、番号が
   使い回されていると、無関係のプロセスを子と見て止める可能性がある（作られた時刻で見分けているかは、
@@ -61,6 +67,8 @@ _lock = threading.Lock()
 # 入力の終わりになる。そのとき、見張りの親（本来のコマンド）がまだ動いていれば、そのまとまりごと止める。
 # 親が先に終わったら（親の番号が変わる）、見張りも終わる。見張りは自分だけのまとまりに移り、端末の合図
 # （Ctrl+C など）を受けない。持っている入出力は閉じる（試験が、出力の終わりを待ち続けないように）。
+# 命綱は select.poll で見る（select.select は 1024 以上の fd を扱えず、ValueError になる）。見張りの中で
+# 思わぬ失敗が起きたら、黙って見張りをやめず、親がまだ動いていれば止める（試験が落ちて、気づける）。
 GUARD = """\
 import os, select, signal, sys
 
@@ -69,20 +77,26 @@ command = sys.argv[2:]
 target = os.getpid()
 if os.fork() == 0:
     try:
-        os.setpgid(0, 0)
-        for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
-            signal.signal(sig, signal.SIG_IGN)
-        null = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            os.dup2(null, fd)
-        os.closerange(3, lifeline)
-        os.closerange(lifeline + 1, 65536)
-        while os.getppid() == target:
-            ready, _, _ = select.select([lifeline], [], [], 0.2)
-            if ready and not os.read(lifeline, 1):
-                if os.getppid() == target:
-                    os.killpg(target, signal.SIGKILL)
-                break
+        try:
+            os.setpgid(0, 0)
+            for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+                signal.signal(sig, signal.SIG_IGN)
+            null = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            os.closerange(3, lifeline)
+            os.closerange(lifeline + 1, 65536)
+            poller = select.poll()
+            poller.register(lifeline, select.POLLIN)
+            while os.getppid() == target:
+                if poller.poll(200) and not os.read(lifeline, 1):
+                    break
+            else:
+                os._exit(0)
+        except BaseException:
+            pass
+        if os.getppid() == target:
+            os.killpg(target, signal.SIGKILL)
     finally:
         os._exit(0)
 os.close(lifeline)
@@ -165,37 +179,49 @@ def kill_posix_tree(root: int) -> None:
 
     番号を使い回されたほかの人のプロセスを止めないよう、次の順にする:
     1. root を一時停止する（SIGSTOP）。止まっている親は、子を増やせず、終わった子を受け取れない。だから、
-       止まっている親の子の番号は、その子が終わっても使い回されない（受け取られるまで残る）
-    2. 止めた親の子を一覧から探し、一時停止する。増えた分を拾い直す（TREE_ROUNDS まで）
-    3. 見つけた順の逆（子から先）に SIGKILL を送る。どの番号も、送る時点では、止まっている親か
-       このプロセスが受け取っていないので、ほかのプロセスのものではない
+       止まっている親の子の番号は、その子が終わっても、受け取られるまでゾンビとして押さえられ、使い回され
+       ない。ただし、次の条件のもとでだけ成り立つ:
+       - 親が SIGCHLD を無視（SIG_IGN）していない（無視していると、終わった子は止まっている親の下でも
+         片付けられ、番号が空く）
+       - 一時停止が効いた後（SIGSTOP は送ってすぐには効かない。効くまでのわずかな間は、親が子を受け取り
+         うる。一覧を作る間に効く）
+       - ほかの者が、その親を止めない（親が終わると、子は別の親に移って受け取られうる）
+       試験が起動するもの（アプリ本体、偽のブラウザ、眠るだけの Python）は、どれも SIGCHLD を無視しない
+    2. 止めた親の子を一覧から探し、一時停止する。増えた分を拾い直す（TREE_ROUNDS まで）。一時停止が失敗した
+       番号（もう無い）は、後で SIGKILL を送らない（その番号は、もう別のプロセスのものかもしれない）
+    3. 一時停止したものに、止めた順の逆（子から先）で SIGKILL を送る。どの番号も、送る時点では、止まって
+       いる親かこのプロセスが受け取っていない（上の条件のもとで）
+    2 の途中で例外（後始末の最中の Ctrl+C など）が起きても、3 は必ず行う（finally）。一時停止したものを、
+    止まったまま残さない（残すと、見張りも止まって命綱が効かない。レビュー 7回目の中1）。
     親が先に終わった子（親の番号が 1 などに変わったもの）は、たどれない（モジュールの説明の「止められない
     もの」）。一覧を作れなければ、root だけを止める。"""
     try:
         os.kill(root, signal.SIGSTOP)
     except OSError:
         return  # もう無い
-    found = [root]
+    stopped = [root]  # 一時停止したもの（止めた順）
     seen = {root}
-    for _ in range(TREE_ROUNDS):
-        table = children_table()
-        if table is None:
-            break
-        new = [child for parent in found for child in table.get(parent, []) if child not in seen]
-        if not new:
-            break
-        for child in new:
+    try:
+        for _ in range(TREE_ROUNDS):
+            table = children_table()
+            if table is None:
+                break
+            new = [child for parent in stopped for child in table.get(parent, []) if child not in seen]
+            if not new:
+                break
+            for child in new:
+                seen.add(child)
+                try:
+                    os.kill(child, signal.SIGSTOP)
+                except OSError:
+                    continue  # もう無い
+                stopped.append(child)
+    finally:
+        for pid in reversed(stopped):
             try:
-                os.kill(child, signal.SIGSTOP)
+                os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-            seen.add(child)
-            found.append(child)
-    for pid in reversed(found):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
