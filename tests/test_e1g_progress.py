@@ -5,8 +5,11 @@
   （制御周期が、準備の配列を埋める単位より長い回路でも）。
 - 中断: 中断を求めてから 0.2 秒以内に SimulationCancelled で終わり、結果を返さない。準備、時間ステップの
   最中に次の制御周期の配列を埋めるあいだ、後処理でも、中断の求めを見る。
-- 時間の上限（0.2 秒）を持つ試験は、上限を超えたときだけ 1 回測り直す（ほかの仕事で機械が止まった分を、
-  製品の遅れと取り違えないため。上限そのものは基準のまま。値の決まりは毎回確かめる）。
+- 時間の上限（0.2 秒）を持つ試験は、上限を超えたときだけ測り直す（2 回まで。ほかの仕事で機械が止まった分を、
+  製品の遅れと取り違えないため。上限そのものは基準のまま。値の決まりは毎回確かめる）。測る計算は、基準が
+  求める長さ（20 万ステップ以上）の中で短くする（長いほど、機械の揺れを拾う）。
+  CPU を使い切る仕事が、コアの数の 3 倍を超えて並ぶ機械では、3 回とも上限を超えることがある（実測。
+  計算のプロセスに CPU が回ってこない時間は、製品では縮められない）。
 - 区切りの費用: 区切った計算と区切らない計算（1回の核の呼び出し）の結果がビット単位で同じ。
   所要時間の差は benchmarks/bench_e1g_chunks.py で測る（合否の試験にすると機械で揺れるので、
   ここでは測らない）。
@@ -41,7 +44,7 @@ kernel = simulate_module.kernel
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "buck_voltage_mode.json"
 LIMIT_S = 0.2
-ATTEMPTS = 2          # 時間の上限を測る回数（上限を超えたときだけ、もう1回）
+ATTEMPTS = 3          # 時間の上限を測る回数（上限を超えたときだけ測り直す。受け入れ試験と同じ回数）
 
 
 def buck(fidelity="switching", t_end=10e-3, control=None, **plant):
@@ -55,7 +58,7 @@ def buck(fidelity="switching", t_end=10e-3, control=None, **plant):
 
 
 def within_limit(measure_once) -> None:
-    """時間の上限（LIMIT_S）を持つ測定。上限を超えたときだけ、1 回測り直す。
+    """時間の上限（LIMIT_S）を持つ測定。上限を超えたときだけ測り直す（全部で ATTEMPTS 回まで）。
 
     measure_once() は、値の決まり（単調、0 と 1、結果を返さない、など）をその場で確かめてから、測った時間
     [s] を返す（値の決まりは、測り直しでも毎回確かめる）。"""
@@ -107,17 +110,17 @@ def check_progress(seen, span) -> float:
 @pytest.mark.parametrize("case", ["buck_switching", "buck_slow_control", "rectifier", "ladder"])
 def test_progress_rises_to_one_and_never_stalls_longer_than_0_2_s(case):
     """20 万ステップ以上: 降圧（制御器つき、20 万ステップ）、制御周期の長い降圧（f_ctrl 100 Hz。制御周期が
-    20 万ステップで、準備の配列を埋める単位 131072 行より長い。60 万ステップ）、整流（制御器なし、
-    40 万ステップ）、はしご（スイッチなし、未知数 41、20 万ステップ）。"""
+    20 万ステップで、準備の配列を埋める単位 131072 行より長い。2 周期、40 万ステップ）、整流（制御器なし、
+    20 万ステップ）、はしご（スイッチなし、未知数 41、20 万ステップ）。"""
     if case == "buck_switching":
         ex = buck()
         run = lambda p: ex.run(progress=p)                                         # noqa: E731
     elif case == "buck_slow_control":
-        ex = buck(t_end=30e-3, control={"f_ctrl": (100, "Hz")})
+        ex = buck(t_end=20e-3, control={"f_ctrl": (100, "Hz")})
         run = lambda p: ex.run(progress=p)                                         # noqa: E731
     elif case == "rectifier":
         gate = Pwm(name="q1", frequency=100e3, duty=0.3)
-        run = lambda p: simulate(rectifier(), 20e-3, gates=[gate], progress=p)     # noqa: E731
+        run = lambda p: simulate(rectifier(), 10e-3, gates=[gate], progress=p)     # noqa: E731
     else:
         run = lambda p: simulate(ladder(), 0.2, 1e-6, progress=p)                  # noqa: E731
 
@@ -463,13 +466,16 @@ def sine_rc() -> Netlist:
 BLOCK_CASES = {
     **CASES,
     "sine_and_step": lambda **kw: simulate(sine_rc(), 2e-2, 1e-6, **kw),
+    # 制御周期（1000 ステップ）が、配列を埋める単位より長い: 時間ステップの最中にも、区切って埋める
+    "long_control_period": TRACED["long_control_period"][0],
 }
 
 
 @pytest.mark.parametrize("case", list(BLOCK_CASES))
 def test_setup_and_post_processing_in_blocks_give_the_same_result(case, monkeypatch):
     """準備（電源・ゲート信号の配列）と後処理（注意、信号の配列）を区切って行っても、まとめて行ったときと
-    結果（波形、信号、集計、注意）がビット単位で同じ。区切りの行数を小さく半端にして、何度も区切らせる。"""
+    結果（波形、信号、集計、注意）がビット単位で同じ。区切りの行数を小さく半端にして、何度も区切らせる。
+    制御周期の長い回路では、時間ステップの最中に次の制御周期の配列を埋める所も区切られる。"""
     ticks = []
     original = simulate_module._Monitor.tick
 
@@ -481,6 +487,7 @@ def test_setup_and_post_processing_in_blocks_give_the_same_result(case, monkeypa
     monkeypatch.setattr(simulate_module, "SETUP_BLOCK", 509)
     blocked = BLOCK_CASES[case]()
     assert ticks.count("setup") > 10 and ticks.count("post") > 10
+    assert (ticks.count("run") > 10) == (case == "long_control_period")
     monkeypatch.setattr(simulate_module, "SETUP_BLOCK", 10**12)
     whole = BLOCK_CASES[case]()
     same(blocked, whole)
