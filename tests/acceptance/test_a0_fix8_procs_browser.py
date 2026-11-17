@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 import a0_marked as marked
+import acceptance_watch as watch
 import app_procs as procs
 import pytest
 
@@ -388,6 +389,8 @@ def test_the_mark_check_accepts_only_processes_that_carry_the_marks(tmp_path):
     """a0_marked.is_marked は、与えた印（Linux は環境変数と引数、ほかの OS は引数）をどれも持つプロセスだけを
     自分のものと見る。身代わりのブラウザと同じ形（場所を / で区切った引数）で起動して確かめる。合図は送らない
     （確かめるだけ。後始末は Popen の kill で、受け取る前の自分の子にだけ）。"""
+    if not marked.LINUX and watch.list_processes() is None:
+        pytest.skip("この PC では、プロセスの一覧を作れない（引数の印を確かめられない）")
     script = tmp_path / "slow_browser.py"
     script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
     entry = f"A0V8_OUT={tmp_path}"
