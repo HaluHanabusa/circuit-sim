@@ -40,3 +40,17 @@ D-058 に従い、前の作業単位で出た軽微と注意を、A1（スコー
 23. 画面仕様に端末の節を作る: 止め方は「Ctrl+C（Windows の Ctrl+Break も同じ）」、Enter への反応、続けて届いた Enter を1回と数える。`screens-v0.1.md` 14章 #11（窓を閉じたときは知らせない）を Windows の実態に合わせて書き直す。
 24. `app-design.md` の冒頭の「最終更新」と責任者の記載を、8章の追記に合わせる。4回目の UX 確認の改善1〜4（起動し直しの黙った待ちなど）は未対応のまま。
 25. 受け入れ試験 `test_a0_fix6_test_hygiene.py` の `pytest_summary`: docstring は「行の頭から」だが実際は `line.strip()` の後で照合する（字下げされた行も拾う。実害なし）。検証の記録 A0-verifier-10 の「3」の理由づけ（OpenProcess が失敗して動いていないと見る）は強すぎる（合否は pid_alive の値に左右されない）。
+
+## A0 に main を取り込んだ後の確かめから（検証 11回目、レビュー 12回目、UX 7回目）
+
+画面とサーバーのファイルは変わっていない。エンジン側の変更（読める版が 0.1・0.2 の2つ、`buck_voltage_mode` の追加）で、画面に出る案内が変わった所。記録: `docs/verification/A0-verifier-11.md`。
+
+26. **A1 で最初に直すものの1つ**: 版 0.1 の control に数値でない値があると、案内の場所が `$`（全体）・「形式が違います」になり、`control.kp` を示さない。エンジン（`circuit_sim/ir.py` 101〜124 の `_read_versions`、122 行）が `handler` より前の最初の1つで止めるので、同じファイルの `plant.R`・`plant.L`・`extra` の誤りも隠れる（取り込み前は 3 か所、後は 1 か所）。英語の画面でも「詳細」は日本語の文だけ。直し方: 1 件ごとに場所を `control.<名前>`、中身は既存の `schema.number`、数値でない値を全部並べ「{n} か所」をその数にする。エンジンが全部を集めるか、サーバー（`server.py` 355〜360・395〜402）が先に調べるかは A1 の仕様で決める（エンジンは番号 `SPEC_LEGACY_CONTROL_NOT_NUMBER` と項目の名前を持つ）。受け入れ試験 `test_a0_merge_main_engine.py` の strict の xfail は直ったら外す。
+27. 読めない版の案内（N-OPEN-VERSION）の文。UX が決めた文に差し替える。サーバーは `supported` を文字列にせず並びのまま送り、`latest`（いちばん新しい読める版）も送る。N-OPEN-TEMPLATE の一覧も同じ区切り方（日本語「、」、英語「, 」）にそろえる。
+    - `what`: 「{file} は仕様の版 {found} で書かれていて、このアプリでは読めません。」／ "{file} uses spec version {found}, which this app can't read."
+    - `fix`: 「アプリを新しい版にするか、仕様を版 {latest} の形で書き直してください。読める版: {supported}」／ "Update the app, or rewrite the spec in version {latest}. Supported versions: {supported}"
+28. `server.py` 363〜368 の `supported_versions()` の控え `(SCHEMA_VERSION,)` と説明文が古い（いまの版 0.2 では同梱のサンプル（版 0.1）を断る形。使われない道）。一覧を直接 import して控えを消す。
+29. 画面の辞書の差し込む値（`frontend/src/i18n`）を、エンジンが実際に出す params と直接照らす試験が無い（main の試験は付録B を読むだけで、N-RUN-STEPS の `{t_max}`・`{h_min}` を確かめていない。いまは食い違いなし）。
+30. `simulation.fidelity` の誤った値（例 `"ideal"`）の案内が「形式が違います」だけで、使える値（switching、average）は「詳細」の英語の文の中にしかない。新しいキー `schema.choice`（「{choices} のどれかが必要です」／ "must be one of {choices}"）を足す。
+31. A1 の仕様で決める: 「使えるテンプレート」の一覧をエンジンの一覧のままにするか、画面が表示定義を持つものだけにするか（D-073 の 2 では v0.1 の画面は降圧コンバータだけだが、いまは RC ローパスも開けて一覧に出る）。同梱のサンプル（直列RLC）には control が無いので、A1 の受け入れ基準に「降圧コンバータのサンプルで版 0.2 の control の書き方が見える」を入れる。
+32. Windows でまだ一度も流れていない main 由来の試験（E1g の中断・止まりの時間の上限 0.2 秒、`test_e1g_recheck_csv_notes.py`、`test_e1b_independent.py::test_c8_…`、Linux で測った数値の許容差）。A0 の Windows の確認で落ちたら、エンジンの作業単位の不具合として扱う。
