@@ -1000,6 +1000,42 @@ def test_open_when_ready_is_quiet_once_the_number_is_used(tmp_path, monkeypatch)
     assert said == ["Couldn't open a browser. Open this address in your browser: http://u"]
 
 
+@pytest.mark.parametrize("started", [False, True], ids=["before-it-started", "after-it-started"])
+def test_open_when_ready_does_not_open_a_browser_while_the_app_is_stopping(monkeypatch, started):
+    """止めている最中は、ブラウザを開かない。案内も出さない。
+
+    受け付けを始める前に止められたとき（起動の直後の Ctrl+C）も、始めた直後に止められたときも。
+    止めた後に開くと、もう応えないアプリ本体の画面が、ブラウザに開く。"""
+    class Stopping:
+        should_exit = True
+
+    Stopping.started = started
+    opened: list[str] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda target: opened.append(target) or True)
+    said: list[str] = []
+    cli.open_when_ready(Stopping(), "file:///x.html", "http://u", said.append, Texts("en"), lambda: False,
+                        wait=0.3)
+    assert opened == [], "止めている最中に、ブラウザを開いた"
+    assert said == []
+
+
+def test_open_when_ready_gives_no_guidance_once_the_app_is_stopping(monkeypatch):
+    """ブラウザを開いた後、番号が使われるのを待つ間に止められたら、案内を出さずに、すぐ戻る。"""
+    server = FakeServer()
+
+    def opened_then_stopped(target) -> bool:
+        server.should_exit = True  # 開いた直後に、止められた
+        return True
+
+    monkeypatch.setattr(cli.webbrowser, "open", opened_then_stopped)
+    said: list[str] = []
+    began = time.monotonic()
+    cli.open_when_ready(server, "file:///x.html", "http://u", said.append, Texts("en"), lambda: False,
+                        wait=30)
+    assert said == [], "止めた後に、ブラウザの案内を出した"
+    assert time.monotonic() - began < 10, "止められた後も、番号が使われるのを待ち続けた"
+
+
 @pytest.mark.skipif(WINDOWS, reason="POSIX の SIGTERM（Windows は手で窓を閉じて確かめる）")
 def test_unused_launch_page_is_removed_when_stopped_by_sigterm(tmp_path):
     """ブラウザが番号を使わないまま（偽のブラウザは開かない）、SIGTERM で止められても、
@@ -1149,21 +1185,30 @@ def posix_pipe_ready(fd: int):
     """Windows の PeekNamedPipe の身代わり（POSIX の本物のパイプで、待たない読み方の道を流すため）。
 
     届いているバイト数（FIONREAD）。届いていなくて、書く側が閉じていれば None。windows_pipe_ready が作る
-    関数と同じ約束。"""
+    関数と同じ約束。
+
+    量を見てから「閉じたか」（POLLHUP）を見るまでの間に、書く側が「書いて、閉じる」ことがある。閉じたと
+    分かった後で、量を読み直す（閉じた後は増えない）。読み直さないと、届いた分が残っているのに None
+    （入力の終わり）と答える（レビュー 6回目の軽微1）。"""
     import array
     import fcntl
     import select
     import termios
 
-    def ready() -> int | None:
+    def arrived() -> int:
         count = array.array("i", [0])
         fcntl.ioctl(fd, termios.FIONREAD, count)
-        if count[0]:
-            return count[0]
+        return count[0]
+
+    def ready() -> int | None:
+        count = arrived()
+        if count:
+            return count
         poller = select.poll()
         poller.register(fd, select.POLLIN)
-        closed = any(event & select.POLLHUP for _, event in poller.poll(0))
-        return None if closed else 0
+        if any(event & select.POLLHUP for _, event in poller.poll(0)):
+            return arrived() or None
+        return 0
 
     return ready
 
@@ -1173,6 +1218,54 @@ def pipe_reader(fd: int):
 
     Windows は None（製品が、本物の PeekNamedPipe を使う）。ほかの OS は身代わり。"""
     return None if WINDOWS else posix_pipe_ready(fd)
+
+
+def watch_read_sizes(monkeypatch, fd: int) -> list[int]:
+    """os.read を見張る: 製品が fd を読みに行くたびに、頼んだ大きさを控える（読み取りそのものは本物）。"""
+    real_read = os.read
+    sizes: list[int] = []
+
+    def watched_read(target, size):
+        if target == fd:
+            sizes.append(size)
+        return real_read(target, size)
+
+    monkeypatch.setattr(cli.os, "read", watched_read)
+    return sizes
+
+
+@pytest.mark.skipif(WINDOWS, reason="身代わり（POSIX の FIONREAD と POLLHUP）の確かめ。Windows は本物を使う")
+def test_stand_in_answers_what_is_left_when_the_writer_wrote_and_closed_in_between(monkeypatch):
+    """身代わり posix_pipe_ready: 量を見た後、「閉じたか」を見る前に、書く側が「書いて、閉じた」とき。
+
+    届いた分が残っているので、その量を答える（None ではない。None と答えると、製品の読むスレッドは、
+    届いていた Enter を読まずに終わる）。読み終えた後は None。
+    競合を、決まった順で起こす: 身代わりが「閉じたか」を調べ始める所（select.poll を作る所）で、
+    書いて閉じる。"""
+    import select
+
+    r, w = os.pipe()
+    real_poll = select.poll
+    wrote: list[int] = []
+
+    def poll_after_a_write_and_a_close():
+        if not wrote:
+            wrote.append(os.write(w, b"\n"))
+            os.close(w)
+        return real_poll()
+
+    try:
+        ready = posix_pipe_ready(r)
+        assert ready() == 0  # 開いていて、届いていない
+        monkeypatch.setattr(select, "poll", poll_after_a_write_and_a_close)
+        assert ready() == 1, "届いた分が残っているのに、入力の終わりと答えた"
+        assert wrote == [1]
+        assert os.read(r, 10) == b"\n"
+        assert ready() is None  # 読み終えて、書く側は閉じている
+    finally:
+        if not wrote:
+            os.close(w)
+        os.close(r)
 
 
 def test_watch_enter_reads_a_pipe_and_ends_when_the_writer_closes():
@@ -1335,53 +1428,229 @@ def test_polling_reader_does_not_spin_while_nothing_arrives():
     assert used < 0.5, f"何も届かない 2 秒の間に、CPU を {used:.2f} 秒使った（調べた回数 {checks}）"
 
 
-class FakePeekNamedPipe:
-    """kernel32.PeekNamedPipe の身代わり。呼ばれ方を控え、決めた答えを返す（ctypes の関数と同じに、引数と
-    戻り値の型を後から決められる）。
+def test_on_a_windows_pipe_the_product_picks_the_polling_reader_by_itself(monkeypatch):
+    """ready を渡さなくても、Windows のパイプなら、製品が自分で待たない読み方を選ぶ（8.3 の対策の中心）。
+
+    製品の Windows の分かれ目（cli.WINDOWS）を真にして流す。調べる関数を作る所（cli.windows_pipe_ready）は、
+    Windows では本物、ほかの OS では身代わり（posix_pipe_ready）。何も届かない間は、読みに行かない
+    （待つ読み方なら、届いていなくても読みに行って、そこで待つ）。届いたら、届いた分だけ読む。"""
+    make = cli.windows_pipe_ready if WINDOWS else posix_pipe_ready
+    made: list[int] = []
+
+    def recorded(fd: int):
+        made.append(fd)
+        return make(fd)
+
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "windows_pipe_ready", recorded)
+    r, w = os.pipe()
+    sizes = watch_read_sizes(monkeypatch, r)
+    got = threading.Event()
+    stop_reading = threading.Event()
+    try:
+        thread = cli.watch_enter(got.set, "pipe", fd=r, stop=stop_reading)
+        time.sleep(0.4)  # 何も届かない間
+        assert made == [r], "Windows のパイプなのに、調べる用意をしていない"
+        assert sizes == [], "届いていないのに、読みに行った（待つ読み方を選んだ）"
+        os.write(w, b"\n")
+        assert got.wait(5), "送った Enter を読まない"
+        assert sizes == [1], "届いた分だけを読んでいない"
+    finally:
+        stop_reading.set()
+        thread.join(timeout=5)
+        stopped = not thread.is_alive()  # パイプを閉じる前に見る（閉じると、入力の終わりでも終わる）
+        os.close(w)
+        os.close(r)
+    assert stopped, "止める合図で、読むスレッドが終わらない"
+
+
+def test_on_a_windows_terminal_the_product_keeps_the_waiting_reader(monkeypatch):
+    """Windows の端末（コンソール）には、待たない読み方を用意しない（待つ読み方のまま。8.3）。
+
+    製品の Windows の分かれ目を真にし、入力の種類を "tty" と渡す（入力そのものはパイプで代える。見るのは、
+    読み方の選び方だけ）。調べる関数を作らず、届いていなくても読みに行って、待つ。"""
+    made: list[int] = []
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "windows_pipe_ready", made.append)
+    r, w = os.pipe()
+    sizes = watch_read_sizes(monkeypatch, r)
+    got = threading.Event()
+    stop_reading = threading.Event()
+    try:
+        thread = cli.watch_enter(got.set, "tty", fd=r, stop=stop_reading)
+        deadline = time.monotonic() + 5
+        while not sizes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sizes == [1024], "端末で、待つ読み方（届いていなくても読みに行って、待つ）になっていない"
+        assert made == [], "端末に、待たない読み方を用意した"
+        os.write(w, b"\n")
+        assert got.wait(5), "送った Enter を読まない"
+    finally:
+        stop_reading.set()
+        os.close(w)  # 読み取りの待ちを切る（Windows の端末の読み方は、0 バイトなら 0.2 秒おいて読み直す）
+        thread.join(timeout=5)
+        os.close(r)
+    assert not thread.is_alive(), "止める合図で、読むスレッドが終わらない"
+
+
+@pytest.mark.parametrize("error", [
+    OSError(errno.EBADF, "Bad file descriptor"),
+    AttributeError("module 'ctypes' has no attribute 'WinDLL'"),
+    ImportError("No module named 'msvcrt'"),
+    ValueError("I/O operation on closed file"),
+], ids=["os-error", "attribute-error", "import-error", "value-error"])
+def test_when_the_check_cannot_be_prepared_the_product_falls_back_to_the_waiting_reader(monkeypatch, error):
+    """調べる用意ができないとき（windows_pipe_ready が失敗する）は、待つ読み方に戻る。起動は失敗しない。
+
+    Enter は読める（8.3 の止まり方は残る）。失敗の種類は、製品が受ける4つ: OS の失敗、API や部品が無い
+    （ctypes.WinDLL、msvcrt）、値の誤り（閉じた入力など）。"""
+    def cannot_prepare(fd: int):
+        raise error
+
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "windows_pipe_ready", cannot_prepare)
+    r, w = os.pipe()
+    sizes = watch_read_sizes(monkeypatch, r)
+    got = threading.Event()
+    try:
+        thread = cli.watch_enter(got.set, "pipe", fd=r)  # 用意の失敗を、外へ出さない
+    except BaseException:
+        os.close(w)
+        os.close(r)
+        raise
+    try:
+        deadline = time.monotonic() + 5
+        while not sizes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sizes == [1024], "待つ読み方（届いていなくても読みに行って、待つ）に戻っていない"
+        os.write(w, b"\n")
+        assert got.wait(5), "待つ読み方に戻った後、Enter を読まない"
+    finally:
+        os.close(w)  # 入力の終わり
+        thread.join(timeout=5)
+        os.close(r)
+    assert not thread.is_alive(), "書く側が閉じても、読むスレッドが終わらない"
+
+
+@pytest.mark.parametrize("ending", ["returns", "ctrl-c", "fails"])
+def test_main_tells_the_enter_reader_to_stop_when_serving_ends(tmp_path, monkeypatch, capsys, ending):
+    """main は、待ち受けが終わったら、Enter を読むスレッドに止める合図を出す。
+
+    ふつうに終わっても、Ctrl+C（KeyboardInterrupt）でも、例外で落ちても。待ち受けている間は、出さない。
+    待たない読み方のスレッドは、この合図で眠りから抜けて終わる（合図が無いと、プロセスが終わるまで調べ
+    続ける）。アプリ本体ごとの起動では、外から見分けられない（スレッドはプロセスと一緒に終わる）ので、
+    main をこの中で呼び、待ち受け（GuardedServer.run）と Enter の読み取り（watch_enter）だけを差し替えて、
+    main が渡した合図を見る。"""
+    seen: dict = {}
+
+    def fake_watch_enter(on_enter, source, fd=0, stop=None, ready=None):
+        seen.update(source=source, stop=stop)
+        return threading.Thread()
+
+    def fake_run(self, sockets=None) -> None:
+        seen["set_while_serving"] = seen["stop"].is_set()
+        if ending == "ctrl-c":
+            raise KeyboardInterrupt
+        if ending == "fails":
+            raise RuntimeError("the server failed")
+
+    monkeypatch.setenv("CIRCUIT_SIM_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setattr(cli, "enter_source", lambda: "pipe")
+    monkeypatch.setattr(cli, "watch_enter", fake_watch_enter)
+    monkeypatch.setattr(cli.GuardedServer, "run", fake_run)
+    argv = ["--no-browser", "--port", "0"]
+    if ending == "fails":
+        with pytest.raises(RuntimeError, match="the server failed"):
+            cli.main(argv)
+    else:
+        assert cli.main(argv) == 0
+        assert Texts(terminal_lang())("stopped") in capsys.readouterr().out
+    assert seen["source"] == "pipe"
+    assert seen["set_while_serving"] is False, "待ち受けている間に、止める合図を出した"
+    assert seen["stop"].is_set(), "待ち受けが終わっても、Enter を読むスレッドに止める合図を出していない"
+
+
+class PeekNamedPipeStandIn:
+    """kernel32.PeekNamedPipe の身代わり。本物の ctypes の関数（C から呼び返される関数）として作る。
+
+    - 受ける側（answer）は、Microsoft の文書の型で引数を受ける C の関数（ctypes.CFUNCTYPE）:
+      BOOL PeekNamedPipe(HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD)
+    - 製品に渡すもの（function）は、その番地から作った、型の決まっていない関数。DLL から取り出した関数と
+      同じ状態（引数の型は無し、戻り値は int）。製品が決めた argtypes・restype で、引数が C の型に直される。
+      決めなければ、Python の整数は C の int として渡り、32 ビットに収まらないハンドルは切り詰められる
+    - ctypes.WinDLL と ctypes.get_last_error の身代わりも持つ。ctypes が失敗の理由を控えるのは、
+      use_last_error=True で読み込んだ DLL の関数を呼んだときだけ（CPython の文書 ctypes.get_last_error）。
+      そうでなければ、控えは 0 のまま
 
     答えは Microsoft の文書の約束: 成功は 0 でない値で、届いている量を 5 番目の引数の先に書く。失敗は 0 で、
     理由は GetLastError（ここでは error）。"""
 
     def __init__(self) -> None:
-        self.calls: list[tuple] = []
+        import ctypes
+        from ctypes import wintypes
+
+        self.calls: list[tuple] = []  # C の側に届いた引数（ハンドル、バッファ、大きさ、残りは NULL でないか）
         self.available: int | None = 0  # None なら失敗
         self.error = 0
-        self.argtypes: list | None = None
-        self.restype: object = None
+        self.loaded: list[tuple[str, bool]] = []  # WinDLL の呼ばれ方（名前、use_last_error）
+        prototype = ctypes.CFUNCTYPE(wintypes.BOOL, wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                     wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD)
+        self.callee = prototype(self.answer)  # 持ち続ける（捨てると、番地が無効になる）
+        untyped = ctypes.CFUNCTYPE(ctypes.c_int)
+        self.function = untyped(ctypes.cast(self.callee, ctypes.c_void_p).value)
 
-    def __call__(self, handle, buffer, size, read, available, left) -> int:
-        self.calls.append((handle, buffer, size, read, left))
-        if self.available is None:
+    def answer(self, handle, buffer, size, read, available, left) -> int:
+        self.calls.append((handle, buffer, size, bool(read), bool(available), bool(left)))
+        if self.available is None or not available:
             return 0
-        available._obj.value = self.available  # ctypes.byref で渡された DWORD
+        available[0] = self.available
         return 1
+
+    def win_dll(self, name, mode=0, handle=None, use_errno=False, use_last_error=False, winmode=None):
+        """ctypes.WinDLL の身代わり（引数の並びは、CPython の ctypes.CDLL と同じ）。"""
+        self.loaded.append((str(name), bool(use_last_error)))
+        return types.SimpleNamespace(PeekNamedPipe=self.function)
+
+    def get_last_error(self) -> int:
+        return self.error if self.loaded and all(kept for _, kept in self.loaded) else 0
 
 
 def test_windows_pipe_ready_calls_peek_named_pipe_as_documented(monkeypatch):
     """windows_pipe_ready が、PeekNamedPipe を文書どおりに呼び、答えを約束どおりに読む。
 
-    Windows の API を差し替えて流す（どの OS でも）。差し替える値の出どころ（Microsoft の文書）:
+    Windows の API を差し替えて流す（どの OS でも）。身代わりは本物の ctypes の関数なので、製品が決めた
+    引数の型（argtypes）での変換も、実際に通る（PeekNamedPipeStandIn の説明）。
+    差し替える値の出どころ（Microsoft の文書）:
     - PeekNamedPipe(hNamedPipe, lpBuffer, nBufferSize, lpBytesRead, lpTotalBytesAvail,
       lpBytesLeftThisMessage): バッファは NULL でよい（読まない）。成功は 0 でない値、失敗は 0 で、
       理由は GetLastError
     - System Error Codes: ERROR_BROKEN_PIPE 109（The pipe has been ended.）、ERROR_PIPE_NOT_CONNECTED 233
       （No process is on the other end of the pipe.）、ERROR_INVALID_FUNCTION 1、ERROR_INVALID_HANDLE 6
+    確かめること:
+    - kernel32 を、use_last_error=True で読み込む（そうしないと、失敗の理由が ctypes の控えに入らず、
+      書く側が閉じたこと（109、233）を見分けられない）
+    - ハンドルは、切り詰めずに渡す（64 ビットの Windows のハンドルは、ポインタの大きさ。ここでは、
+      32 ビットに収まらない値で確かめる）。ほかは、量を受け取る所だけを渡す（バッファは NULL、大きさは 0）
     本物の呼び出しは、Windows の試験（パイプを使う上の試験と、下の「子が始まれる」試験）で流れる。"""
     import ctypes
     from ctypes import wintypes
 
-    peek = FakePeekNamedPipe()
-    kernel32 = types.SimpleNamespace(PeekNamedPipe=peek)
-    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: kernel32, raising=False)
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: peek.error, raising=False)
-    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: 4000 + fd))
+    peek = PeekNamedPipeStandIn()
+    big = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8 - 2)) + 0x9A00  # 64 ビットなら、32 ビットに収まらない
+    monkeypatch.setattr(ctypes, "WinDLL", peek.win_dll, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", peek.get_last_error, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: big + fd))
     ready = cli.windows_pipe_ready(7)
-    assert peek.argtypes == [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD,
-                             wintypes.LPDWORD, wintypes.LPDWORD] and peek.restype is wintypes.BOOL
+    loaded = [(name.lower().removesuffix(".dll"), kept) for name, kept in peek.loaded]
+    assert loaded == [("kernel32", True)], ("kernel32 を use_last_error=True で読み込んでいない", peek.loaded)
+    assert list(peek.function.argtypes) == [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                            wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD]
+    assert peek.function.restype is wintypes.BOOL
     assert ready() == 0
     peek.available = 5
     assert ready() == 5
-    assert peek.calls[-1] == (4007, None, 0, None, None), "ハンドルのほかは、量を受け取る所だけを渡す"
+    assert peek.calls[-1] == (big + 7, None, 0, False, True, False), (
+        "ハンドルは切り詰めずに渡す。ほかは、量を受け取る所だけを渡す", peek.calls[-1])
     peek.available = None
     for ended in (109, 233):
         peek.error = ended
