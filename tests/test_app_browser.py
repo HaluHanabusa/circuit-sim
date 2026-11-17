@@ -138,13 +138,17 @@ class App:
 
     @staticmethod
     def _read(proc: subprocess.Popen, lines: queue.Queue) -> None:
-        for raw in proc.stdout:
-            lines.put(raw.decode("utf-8", "replace"))
+        try:
+            for raw in proc.stdout:
+                lines.put(raw.decode("utf-8", "replace"))
+        finally:
+            proc.stdout.close()  # 読むのは、このスレッドだけ。終わりまで読んだので閉じる
 
     def stop(self) -> None:
-        """止める（子も）。もう終わっていても、起動していなくても呼べる。"""
+        """止める（子も。親が動いている間にたどれる子だけ）。もう終わっていても、起動していなくても呼べる。"""
         if self.proc is not None:
             procs.kill_tree(self.proc)
+            procs.release(self.proc)
             KEPT.discard(self.proc.pid)
 
     def api(self, path: str, body: dict | None = None, method: str = "GET") -> dict:

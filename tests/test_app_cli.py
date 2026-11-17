@@ -1752,8 +1752,9 @@ def test_a_blocking_read_on_a_pipe_keeps_a_child_from_starting_on_windows(tmp_pa
         pytest.skip("読んで待つ読み方でも、子が始まれた（この環境では、対照が成り立たない）")
 
 
-# 端末（疑似端末）を標準入力にして起動する入口。起動されたプロセスは、新しいまとまりの先頭にいる
-# （tests/app_procs.py の spawn）。疑似端末を、そのまとまりの端末にしてから、アプリ本体に入れ替わる
+# 端末（疑似端末）を標準入力にして起動する入口。起動されたプロセスは、新しいまとまり（セッション）の先頭に
+# いる（tests/app_procs.py の spawn(new_session=True)。試験のプロセスが終わったら止める見張りつき）。
+# 疑似端末を、そのまとまりの端末にしてから、アプリ本体に入れ替わる
 TTY_ENTRY = """\
 import fcntl, os, sys, termios
 
@@ -1771,7 +1772,7 @@ def launch_on_a_tty(config: Path, *args: str) -> tuple[procs.Launched, int]:
     master, slave = os.openpty()
     try:
         proc = procs.Launched([sys.executable, "-c", TTY_ENTRY, "--no-browser", *args], cwd=ROOT,
-                              env=app_env(config), stdin=slave)
+                              env=app_env(config), stdin=slave, new_session=True)
     except BaseException:
         os.close(master)
         raise
