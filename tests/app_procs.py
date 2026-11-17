@@ -29,8 +29,9 @@
   終わるまで残る。
 - pytest のプロセスだけが強制終了されたとき（メモリ不足など。まとまりごとでない止め方）。見張りは働かず、
   ふつうの起動は残る（新しいまとまりの起動は、命綱の見張りが止める）。
-- kill_posix_tree の後始末（finally の SIGKILL）の最中に、さらに例外（3 回目の Ctrl+C など）が入ったとき。
-  そこから先の SIGKILL は送られない（Python の合図の扱いは、命令の切れ目ごとに割り込める）。
+- kill_posix_tree の後始末（finally の SIGKILL）の繰り返しの中で、os.kill の外（命令の切れ目）で例外
+  （Ctrl+C など）が入ったとき。そこから先の SIGKILL は送られない（Python の合図の扱いは、命令の切れ目
+  ごとに割り込める）。os.kill の中から出る例外は、全部に送ってから出し直すので、これには当たらない。
 - Windows の taskkill /T は、親の番号で子をたどる（Microsoft の文書 taskkill: 指定したプロセスと、
   それが起動した子を止める）。Windows は、親が終わった後も子の「親の番号」を書き換えないので、番号が
   使い回されていると、無関係のプロセスを子と見て止める可能性がある（作られた時刻で見分けているかは、
@@ -184,24 +185,32 @@ def kill_posix_tree(root: int) -> None:
        - 親が SIGCHLD を無視（SIG_IGN）していない（無視していると、終わった子は止まっている親の下でも
          片付けられ、番号が空く）
        - 一時停止が効いた後（SIGSTOP は送ってすぐには効かない。効くまでのわずかな間は、親が子を受け取り
-         うる。一覧を作る間に効く）
+         うる。一覧を作る間に効く見込み: 検証 7回目に、効くまで最大 234 µs を測った。一覧を作るのは数
+         ミリ秒。言い切れない）
        - ほかの者が、その親を止めない（親が終わると、子は別の親に移って受け取られうる）
        試験が起動するもの（アプリ本体、偽のブラウザ、眠るだけの Python）は、どれも SIGCHLD を無視しない
     2. 止めた親の子を一覧から探し、一時停止する。増えた分を拾い直す（TREE_ROUNDS まで）。一時停止が失敗した
        番号（もう無い）は、後で SIGKILL を送らない（その番号は、もう別のプロセスのものかもしれない）
     3. 一時停止したものに、止めた順の逆（子から先）で SIGKILL を送る。どの番号も、送る時点では、止まって
        いる親かこのプロセスが受け取っていない（上の条件のもとで）
-    2 の途中で例外（後始末の最中の Ctrl+C など）が起きても、3 は必ず行う（finally）。一時停止したものを、
+    1・2 の途中で例外（後始末の最中の Ctrl+C など）が起きても、3 は必ず行う（finally）。一時停止したものを、
     止まったまま残さない（残すと、見張りも止まって命綱が効かない。レビュー 7回目の中1）。
+    例外は、os.kill の中からも出る（CPython の os.kill は、合図を送った後に、待っている合図を処理するので、
+    Ctrl+C がそこで KeyboardInterrupt になる。検証 8回目に実測）。だから:
+    - 一時停止を送る前に控える（送った直後に例外が出ても、3 で止める）。送るのに失敗したら（もう無い）、
+      控えから外す。root も同じ
+    - 3 の SIGKILL の途中で例外が出ても、残りの全部に送ってから、最初の例外を出し直す
     親が先に終わった子（親の番号が 1 などに変わったもの）は、たどれない（モジュールの説明の「止められない
     もの」）。一覧を作れなければ、root だけを止める。"""
-    try:
-        os.kill(root, signal.SIGSTOP)
-    except OSError:
-        return  # もう無い
-    stopped = [root]  # 一時停止したもの（止めた順）
+    stopped: list[int] = []  # 一時停止を送るもの（送る前に控える。止めた順）
     seen = {root}
     try:
+        stopped.append(root)
+        try:
+            os.kill(root, signal.SIGSTOP)
+        except OSError:
+            stopped.remove(root)
+            return  # もう無い
         for _ in range(TREE_ROUNDS):
             table = children_table()
             if table is None:
@@ -211,17 +220,23 @@ def kill_posix_tree(root: int) -> None:
                 break
             for child in new:
                 seen.add(child)
+                stopped.append(child)
                 try:
                     os.kill(child, signal.SIGSTOP)
                 except OSError:
-                    continue  # もう無い
-                stopped.append(child)
+                    stopped.remove(child)  # もう無い: 後で SIGKILL を送らない
     finally:
+        pending: BaseException | None = None
         for pid in reversed(stopped):
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
+            except BaseException as exc:  # 送った後に出た例外（Ctrl+C など）: 残りにも送ってから出し直す
+                if pending is None:
+                    pending = exc
+        if pending is not None:
+            raise pending
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
