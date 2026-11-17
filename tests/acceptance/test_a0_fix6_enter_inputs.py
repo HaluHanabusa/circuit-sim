@@ -351,22 +351,31 @@ def test_enter_pressed_before_the_app_is_ready_is_not_lost(tmp_path, kind):
 
 
 def test_each_enter_gives_exactly_one_new_url(tmp_path):
-    """Enter 1回につき、新しい URL は1つ。文字を打ってからの Enter でも、CR LF（Windows の改行）でも1つ。
+    """Enter 1回につき、新しい URL は1つ。文字を打ってからの Enter でも、CR LF（Windows の改行）でも、
+    CR だけでも1つ。
 
     1回の Enter で2つ出ても、どの番号も使える（使うか、期限が切れるまで有効）が、端末の案内が読みにくく
-    なる。22d2fdc も、1回につき1つ。1 秒は、余分な行が出ないことを見るための待ち（合否は、行の数）。"""
+    なる。22d2fdc も、1回につき1つ。1 秒は、余分な行が出ないことを見るための待ち（合否は、行の数）。
+
+    CR だけの Enter は、標準入力が「改行を変換しない読み方」であることの確かめにもなる。Windows の
+    C ランタイムは、改行を変換する読み方だと、CR で終わる入力の次の1文字を読んで待つ（待たない読み方が
+    崩れる）。CPython は、起動のときに、標準入力を変換しない読み方にする（Modules/_io/fileio.c の
+    _setmode）。"""
     app = start(tmp_path, "no-browser")
     try:
         first = app.first_url()
         numbers = [first.group(2)]
-        for data in (b"\n", b"\n", b"abc\n", b"\r\n"):
+        for data in (b"\n", b"\n", b"abc\n", b"\r\n", b"\r"):
             app.press(data)
             line = app.wait_line(NEW_URL, timeout=10)
-            assert line is not None, f"{data!r} を送っても、新しい URL が出ない: " + app.out
+            assert line is not None, (
+                f"{data!r} を送っても、新しい URL が出ない"
+                "（CR だけのときに出ないなら、標準入力が、改行を変換する読み方のまま）: " + app.out
+            )
             numbers.append(URL_RE.search(line).group(2))
             extra = app.wait_line(NEW_URL, timeout=1.0)
             assert extra is None, f"{data!r} の1回で、新しい URL が2つ出た: " + app.out
-        assert len(set(numbers)) == 5, numbers
+        assert len(set(numbers)) == 6, numbers
     finally:
         stop_all(app, tmp_path)
 
