@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 
+import circuit_sim
 from circuit_sim.app import server as server_module
 from circuit_sim.app.cli import GuardedServer, bind
 from circuit_sim.app.config import SETTINGS_FILE, Settings
@@ -43,6 +44,10 @@ from circuit_sim.app.server import (
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "t" * 43
 WINDOWS = os.name == "nt"
+# 読める版はエンジンが公開する一覧（circuit_sim.SUPPORTED_SCHEMA_VERSIONS）。試験は決め打ちしない
+READABLE = tuple(circuit_sim.SUPPORTED_SCHEMA_VERSIONS)
+# 読めない版の例: 読める版の次の、まだ無い版（いまは 0.3）
+UNREADABLE = next(f"0.{n}" for n in range(1, 1000) if f"0.{n}" not in READABLE)
 
 
 class Running:
@@ -154,9 +159,9 @@ def test_open_sample_enters_session_and_reload_restores(srv):
         ('{"a": 1,,}', "N-OPEN-SYNTAX", {"file": "x.json", "line": 1, "col": 9}),
         ('{\n  "template": "rlc_series",\n  "plant": {\n}', "N-OPEN-SYNTAX", {"line": 4, "col": 2}),
         ('{"schema_version": "9.9", "template": "rlc_series", "plant": {}}', "N-OPEN-VERSION",
-         {"found": "9.9", "supported": "0.1"}),
-        ('{"schema_version": "0.2", "template": "rlc_series", "plant": {}}', "N-OPEN-VERSION",
-         {"found": "0.2", "supported": "0.1"}),
+         {"found": "9.9", "supported": ", ".join(READABLE)}),
+        ('{"schema_version": "' + UNREADABLE + '", "template": "rlc_series", "plant": {}}', "N-OPEN-VERSION",
+         {"found": UNREADABLE, "supported": ", ".join(READABLE)}),
         ('{"template": "nope", "plant": {}}', "N-OPEN-TEMPLATE", {"template": "nope"}),
     ],
 )
@@ -168,6 +173,14 @@ def test_open_errors_come_as_codes_and_values(srv, text, code, params):
         assert result["notice"]["params"][key] == value
     if code == "N-OPEN-TEMPLATE":
         assert "rlc_series" in result["notice"]["params"]["list"]
+
+
+@pytest.mark.parametrize("version", READABLE)
+def test_every_readable_version_opens(srv, version):
+    """エンジンが読める版（circuit_sim.SUPPORTED_SCHEMA_VERSIONS）の仕様は、どれも開ける。"""
+    text = '{"schema_version": "' + version + '", "template": "rlc_series", "plant": {}}'
+    result = srv.json("/api/open", {"file": "v.json", "text": text})
+    assert result["ok"] is True, result
 
 
 @pytest.mark.parametrize("version", ["0.1", "0.2", "1", "null", "true", "[0.1]"])
@@ -826,8 +839,7 @@ def test_version_is_checked_in_one_place():
     source = Path(server_module.__file__).read_text(encoding="utf-8")
     assert "!= SCHEMA_VERSION" not in source and "== SCHEMA_VERSION" not in source
     assert source.count('"N-OPEN-VERSION"') == 1
-    assert server_module.supported_versions() == ("0.1",) or hasattr(server_module.circuit_sim,
-                                                                       "SUPPORTED_SCHEMA_VERSIONS")
+    assert server_module.supported_versions() == READABLE  # エンジンが公開する一覧そのもの
 
 
 def test_list_of_supported_versions_is_used_when_published(monkeypatch):
