@@ -4,9 +4,11 @@
 名前が「表示する」と「内部」に
   漏れなく分かれる。テンプレートが決めていない名前（内部とみなす名前）は無い。表示する信号は画面仕様の付録A の
   信号の表（A.2、A.3、A.4）と1対1。テンプレートが決めた情報は、エンジンが回路から作る情報と食い違わない。
-- CSV（範囲4、基準7）: コマンドラインの --csv の見出しに単位（画面と同じ形）。注意は番号つきでデータの後ろ。
-- テンプレートの注意（基準7）: C_esr を省いた降圧で、
-Result.notes・コマンドラインの表示・CSV に番号つきで出る。
+- CSV（範囲4、基準7、D-075、D-076）: コマンドラインの --csv の見出しに単位（画面と同じ形）。CSV は見出し
+  1行とサンプルの行だけ（注意の行を入れない）。行の終わりは CR LF で、Result.to_csv の newline で選べる。
+- テンプレートの注意（基準7）: C_esr を省いた降圧で、Result.notes・コマンドラインの表示・CSV と一緒に書き出す
+  注意のファイル（<CSV の名前>.notes.txt）に番号つきで出る。注意が無ければ注意のファイルを書かず、前の
+  書き出しのものが残っていたら消す。
 - 表示に使う値（基準11）: 降圧の r_on がテンプレートの表示定義から取れ、計算に使った値と一致する。
 - 出典（基準8）: 手入力 と manual が同じ結果になり、書き出すと 手入力。
 - 層A の欄（基準13）: targets と missing は予約で、読まない（結果を変えない）。
@@ -23,6 +25,7 @@ import pytest
 
 from circuit_sim import Spec, expand
 from circuit_sim.__main__ import main as cli_main
+from circuit_sim.__main__ import notes_path
 from circuit_sim.signals import KIND_UNIT, describe_signals
 from circuit_sim.templates import TEMPLATE_DISPLAY
 
@@ -144,8 +147,9 @@ def write_spec(tmp_path, d) -> Path:
     return path
 
 
-def test_template_note_appears_in_notes_cli_and_csv_with_its_code(tmp_path, capsys):
-    """基準7: C_esr を省いた降圧（同梱の例）。"""
+def test_template_note_appears_in_notes_cli_and_the_notes_file_with_its_code(tmp_path, capsys):
+    """基準7（D-075 で改訂）: C_esr を省いた降圧（同梱の例）。注意は Result.notes、コマンドラインの表示、
+    CSV と一緒に書き出す注意のファイルの3か所に、番号つきで出る。CSV そのものには入れない。"""
     d = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     d["simulation"] = {"fidelity": "switching", "t_end": 0.2e-3}
     ex = expand(Spec.model_validate(d))
@@ -154,19 +158,36 @@ def test_template_note_appears_in_notes_cli_and_csv_with_its_code(tmp_path, caps
     assert res.notes[: len(ex.notes)] == ex.notes                    # 展開の注意が先頭に入る
     csv_path = tmp_path / "out.csv"
     assert cli_main([str(write_spec(tmp_path, d)), "--csv", str(csv_path)]) == 0
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
+    assert captured.err == ""
     assert re.search(r"^  \[ESR_OMITTED\] 注意: C_esr（出力コンデンサの等価直列抵抗）の値が無い", out, re.M)
     assert out.count("注意:") == len(res.notes)                      # 展開の注意を二重に出さない
-    lines = csv_path.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "t [s],v(out) [V],i(L1) [A]"
-    notes = [line for line in lines if line.startswith("#")]
-    assert notes == [f"# [{n.code}] 注意: {n}" for n in res.notes]
-    assert any("[ESR_OMITTED]" in line for line in notes)
-    assert all(not line.startswith("#") for line in lines[: len(res.t) + 1])     # 注意はデータの後ろ
-    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)            # # の行は読み飛ばせる
+    # CSV: 見出し1行（単位つき）とサンプルの行だけ。どの行も CR LF。注意の行（# …）は無い
+    raw = csv_path.read_bytes()
+    lines = raw.decode("utf-8").split("\r\n")
+    assert lines[-1] == "" and len(lines) - 1 == 1 + len(res.t) and raw.count(b"\n") == 1 + len(res.t)
+    assert lines[0] == "t [s],v(out) [V],i(L1) [A]" and b"#" not in raw and "注意".encode() not in raw
+    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
     assert data.shape == (len(res.t), 3) and np.array_equal(data[:, 1], res["v(out)"])
-    raw = csv_path.read_bytes()                                       # 行の終わりは、注意の行も同じ（CR LF）
-    assert raw.endswith(b"\r\n") and raw.count(b"\n") == raw.count(b"\r\n") == len(lines)
+    # 注意のファイル: CSV のファイル名の後ろに .notes.txt（D-076）。UTF-8（BOM なし）、1行1件、番号つき、CR LF
+    notes_file = tmp_path / "out.csv.notes.txt"
+    assert notes_path(csv_path) == notes_file
+    expected = "".join(f"[{n.code}] 注意: {n}\r\n" for n in res.notes)
+    assert notes_file.read_bytes() == expected.encode("utf-8")
+    assert "[ESR_OMITTED] 注意: C_esr（出力コンデンサの等価直列抵抗）の値が無い" in expected
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.csv", "out.csv.notes.txt", "spec.json"]
+    # 書いたことと場所を、端末に出す（波形、注意の順）
+    assert out.splitlines()[-2:] == [
+        f"波形を書き出しました: {csv_path}", f"注意（{len(res.notes)} 件）を書き出しました: {notes_file}"]
+
+
+def test_notes_file_name_is_the_csv_file_name_plus_notes_txt():
+    """D-076: 拡張子を取り替えない（out.csv → out.csv.notes.txt）。拡張子の無い名前、点の多い名前でも同じ。"""
+    assert notes_path(Path("a") / "out.csv") == Path("a") / "out.csv.notes.txt"
+    assert notes_path(Path("out")) == Path("out.notes.txt")
+    assert notes_path(Path("run.1.CSV")) == Path("run.1.CSV.notes.txt")
+    assert notes_path(Path("-")) == Path("-.notes.txt")          # 標準出力に出す形は無い（- もファイル名）
 
 
 def test_csv_header_units_for_dimensionless_and_time(tmp_path):
@@ -179,14 +200,108 @@ def test_csv_header_units_for_dimensionless_and_time(tmp_path):
     assert path.read_text(encoding="utf-8").splitlines()[0] == "t,v(out)"
 
 
-def test_rc_cli_csv_has_units_and_no_notes_when_there_are_none(tmp_path, capsys):
+def test_to_csv_writes_only_the_header_and_samples_and_takes_the_line_ending(tmp_path):
+    """D-075、D-076: to_csv は注意の行を書かない（注意のある結果でも）。行の終わりは newline で選ぶ
+    （既定は CR LF、"\\n" も選べる）。中身は同じで、行の終わりだけが違う。"""
+    res = buck("average").run()
+    assert len(res.notes) >= 2                                       # 注意のある結果で確かめる
+    names = ["v(out)", "cmd(duty)"]
+    res.to_csv(tmp_path / "crlf.csv", names, units=True)
+    res.to_csv(tmp_path / "same.csv", names, units=True, newline="\r\n")
+    res.to_csv(tmp_path / "lf.csv", names, units=True, newline="\n")
+    crlf, lf = (tmp_path / "crlf.csv").read_bytes(), (tmp_path / "lf.csv").read_bytes()
+    assert (tmp_path / "same.csv").read_bytes() == crlf
+    rows = [",".join(["t [s]", "v(out) [V]", "cmd(duty) [1]"])] + [
+        ",".join(repr(float(v)) for v in (res.t[k], res["v(out)"][k], res["cmd(duty)"][k]))
+        for k in range(len(res.t))]
+    assert crlf == "".join(row + "\r\n" for row in rows).encode("utf-8")
+    assert lf == "".join(row + "\n" for row in rows).encode("utf-8")
+    # 注意を CSV に足す引数は無い（D-075。注意は Result.notes から取る）
+    with pytest.raises(TypeError):
+        res.to_csv(tmp_path / "x.csv", names, notes=True)
+    assert not (tmp_path / "x.csv").exists()
+
+
+@pytest.mark.parametrize("bad", ["\r", "", "\n\n", ";", None, 2, "\r\n "])
+def test_to_csv_refuses_other_line_endings_with_a_coded_error_before_writing(tmp_path, bad):
+    res = t0("rc_lowpass", **RC).run()
+    path = tmp_path / "keep.csv"
+    path.write_bytes(b"old")
+    with pytest.raises(ValueError) as info:
+        res.to_csv(path, newline=bad)
+    assert info.value.code == "ARG_CSV_NEWLINE" and info.value.params == {"value": repr(bad)}
+    assert "CR LF" in str(info.value) and "CR LF" in info.value.text("en") and repr(bad) in str(info.value)
+    assert path.read_bytes() == b"old"                               # 断るのは、ファイルを開く前
+    with pytest.raises(KeyError):
+        res.to_csv(path, ["v(nowhere)"], units=True)                 # 無い名前も、開く前に断る
+    assert path.read_bytes() == b"old"
+
+
+def rc_dict():
     plant = {k: {"value": v, "unit": u, "source": "手入力"} for k, (v, u) in RC.items()}
-    d = {"template": "rc_lowpass", "plant": plant}
+    return {"template": "rc_lowpass", "plant": plant}
+
+
+def test_rc_cli_csv_has_units_and_no_notes_file_when_there_are_no_notes(tmp_path, capsys):
     csv_path = tmp_path / "rc.csv"
-    assert cli_main([str(write_spec(tmp_path, d)), "--csv", str(csv_path)]) == 0
-    assert "注意" not in capsys.readouterr().out
+    assert cli_main([str(write_spec(tmp_path, rc_dict())), "--csv", str(csv_path)]) == 0
+    out = capsys.readouterr().out
+    assert "注意" not in out and out.splitlines()[-1] == f"波形を書き出しました: {csv_path}"
     lines = csv_path.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "t [s],v(out) [V],i(V1) [A]" and not any(line.startswith("#") for line in lines)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["rc.csv", "spec.json"]   # 注意のファイルは無い
+
+
+def test_cli_removes_the_notes_file_of_an_earlier_export_when_this_run_has_no_notes(tmp_path, capsys):
+    """前の書き出しの注意のファイルが同じ名前で残っていると、今回の CSV の注意に見える。注意が無い計算では、
+    それを消して、消したことと場所を表示する。ほかの名前のファイルには触らない。"""
+    csv_path = tmp_path / "rc.csv"
+    stale, other = tmp_path / "rc.csv.notes.txt", tmp_path / "rc.notes.txt"
+    stale.write_text("[ESR_OMITTED] 注意: 前の計算の注意\r\n", encoding="utf-8")
+    other.write_text("自分で書いたメモ", encoding="utf-8")
+    assert cli_main([str(write_spec(tmp_path, rc_dict())), "--csv", str(csv_path)]) == 0
+    captured = capsys.readouterr()
+    assert not stale.exists() and other.read_text(encoding="utf-8") == "自分で書いたメモ"
+    assert captured.err == "" and captured.out.splitlines()[-2:] == [
+        f"波形を書き出しました: {csv_path}",
+        f"今回の計算に注意は無いので、前の書き出しで残っていた注意のファイルを消しました: {stale}"]
+    # もう一度書き出すと、消すものは無いので、何も言わない
+    assert cli_main([str(tmp_path / "spec.json"), "--csv", str(csv_path)]) == 0
+    assert "注意" not in capsys.readouterr().out
+
+
+def test_cli_replaces_the_notes_file_of_an_earlier_export_when_this_run_has_notes(tmp_path, capsys):
+    """注意のある計算では、前の注意のファイルを今回の注意で置き換える（後ろに足さない）。"""
+    d = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    d["simulation"] = {"fidelity": "average", "t_end": 0.2e-3}
+    res = expand(Spec.model_validate(d)).run()
+    csv_path = tmp_path / "out.csv"
+    notes_file = notes_path(csv_path)
+    notes_file.write_text("[OLD] 注意: 前の計算の注意\r\n" * 50, encoding="utf-8")
+    assert cli_main([str(write_spec(tmp_path, d)), "--csv", str(csv_path)]) == 0
+    capsys.readouterr()
+    assert notes_file.read_bytes() == "".join(f"[{n.code}] 注意: {n}\r\n" for n in res.notes).encode("utf-8")
+
+
+def test_cli_reports_a_failed_export_in_one_line(tmp_path, capsys):
+    """書き出せないとき（場所が無い、注意のファイルの名前が使えない）は、理由を1行で標準エラーに出して、
+    終了コード 2（Python の例外の表示にしない）。"""
+    spec_path = write_spec(tmp_path, rc_dict())
+    missing_dir = tmp_path / "no_such_dir" / "rc.csv"
+    assert cli_main([str(spec_path), "--csv", str(missing_dir)]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.count("\n") == 1 and captured.err.startswith("ファイルに書き出せません: ")
+    assert "no_such_dir" in captured.err and "書き出しました" not in captured.out
+    # 注意のファイルの名前に、フォルダがある: CSV は書けるが、注意のファイルを書けない
+    d = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    d["simulation"] = {"fidelity": "average", "t_end": 0.2e-3}
+    csv_path = tmp_path / "out.csv"
+    notes_path(csv_path).mkdir()
+    assert cli_main([str(write_spec(tmp_path, d)), "--csv", str(csv_path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.count("\n") == 1 and captured.err.startswith("ファイルに書き出せません: ")
+    assert "out.csv.notes.txt" in captured.err
+    assert captured.out.splitlines()[-1] == f"波形を書き出しました: {csv_path}" and csv_path.exists()
 
 
 # ------------------------------------------------------------------ 表示に使う値

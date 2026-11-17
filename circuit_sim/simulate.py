@@ -54,6 +54,7 @@ DIODE_BAND_REL = 1e-8            # t = 0 の状態が落ち着かないとき、
 #                                  通常の判定には使わない
 SIMULTANEOUS_FLIPS = 4           # ダイオードの状態決定で、違反したものを同時に反転する回数
 _GRID_TOL = 1e-6                 # 周期が時間刻みの整数倍かどうかの判定（ステップ数に対する相対値）
+CSV_NEWLINES = ("\r\n", "\n")    # Result.to_csv の行の終わりに選べるもの（既定は CR LF。D-075、D-076）
 
 # --- 区切り（進み具合、中断、発散の確かめ）。核の外で、核を呼ぶ単位で区切る ---------------------------
 CHUNK_SECONDS = 0.02             # 1つの区切りの計算時間の目安 [s]。中断に応じるまでの遅れと、進み具合を
@@ -67,6 +68,13 @@ POST_SHARE = 0.01                # 進み具合のうち、後処理（注意の
 SETUP_BLOCK = 1 << 17            # 準備の配列を埋める単位の行数（この単位ごとに中断の求めを見る。
 #                                  1000 万ステップの計算で、1つの単位が数 ms〜十数 ms）
 DIVERGENCE_FACTOR = 1e12         # 発散とみなす大きさ: 回路の電圧（電流）の目安のこの倍（_divergence_limits）
+# 時間ステップのあいだ、numpy のあふれ（overflow）と無効の演算（invalid。inf − inf など）の警告を止める設定
+# （np.errstate に渡す）。値が倍精度をあふれるまで発散すると、核の行列の演算が1ステップごとに
+# RuntimeWarning を出す（番号の無い英語の文。python -W error では、その警告で落ちる）。有限でない値は、
+# 区切りごとの確かめ（_Monitor.check_values）と制御器の指令の確かめが番号つきのエラーで知らせるので、
+# 警告は要らない。止めるのは核の外（核を呼ぶ側）で、計算の値は変わらない。止めている範囲は、核の呼び出しと、
+# そのあいだに呼ぶもの（制御器の演算、途中で出会ったスイッチング状態の行列の用意、progress と cancel）
+_QUIET_OVERFLOW = {"over": "ignore", "invalid": "ignore"}
 
 
 class StepLimitError(CodedError):
@@ -162,28 +170,31 @@ class Result:
 
     def to_csv(
         self, path: str | Path, names: list[str] | None = None, *, units: bool = False,
-        notes: bool = False,
+        newline: str = "\r\n",
     ) -> None:
         """波形を CSV に書く。UTF-8、1行目が見出し、1列目が時刻、値は倍精度を失わない桁数（repr）。
 
-        units : 見出しに単位を角かっこで付ける（"t [s],v(out) [V],cmd(duty) [1]"。画面と同じ形。D-042）
-        notes : 注意を、データの後ろに1つ1行で足す（"# [番号] 注意: 文"。表計算ソフトや numpy.loadtxt では
-                # で始まる行を飛ばせる）
-        行の終わりは、どの行も csv モジュールの既定（CR LF。E0 から同じ）。
+        書くのは、見出し1行とサンプルの行だけ（行数 = 1 + サンプルの数。画面の CSV と同じ形。D-075）。
+        注意（notes）は CSV に入れない（後ろに行を足すと、表として読む道具が時刻の列を文字列にする）。
+        注意を一緒に残すときは、別のファイルに書く（コマンドラインは <CSV の名前>.notes.txt。__main__.py）。
+
+        units   : 見出しに単位を角かっこで付ける（"t [s],v(out) [V],cmd(duty) [1]"。画面と同じ形。D-042）
+        newline : 行の終わり。"\\r\\n"（CR LF。既定。E0 から同じ。RFC 4180）か "\\n"（LF）。
+                  ほかの値は番号つきのエラー（ARG_CSV_NEWLINE。ファイルを開く前に断る）
         """
+        if newline not in CSV_NEWLINES:
+            raise CodedError("ARG_CSV_NEWLINE", value=repr(newline))
         names = names or self.unknowns
+        if units:
+            header = ["t [s]"] + [f"{n} [{self.unit_of(n) or '1'}]" for n in names]
+        else:
+            header = ["t"] + names
+        cols = [self[n] for n in names]
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if units:
-                w.writerow(["t [s]"] + [f"{n} [{self.unit_of(n) or '1'}]" for n in names])
-            else:
-                w.writerow(["t"] + names)
-            cols = [self[n] for n in names]
+            w = csv.writer(f, lineterminator=newline)
+            w.writerow(header)
             for k in range(len(self.t)):
                 w.writerow([repr(float(self.t[k]))] + [repr(float(c[k])) for c in cols])
-            if notes:
-                for note in self.notes:
-                    f.write(render_note_line(note, "CSV_NOTE") + w.dialect.lineterminator)
 
     def unit_of(self, name: str) -> str:
         """信号の単位の記号（無次元は ""）。"""
@@ -195,7 +206,10 @@ class Result:
 
 
 def render_note_line(note: Message, code: str = "CLI_NOTE", lang: str = "ja") -> str:
-    """注意1つを、番号つきの1行にする（コマンドラインと CSV の書き方）。"""
+    """注意1つを、番号つきの1行にする。
+
+    code は行の書き方の番号: CLI_NOTE（コマンドラインの表示。字下げつき）、NOTES_FILE_LINE（CSV と一緒に
+    書き出す注意のファイルの1行。字下げなし）。"""
     text = note.text(lang) if isinstance(note, Message) else str(note)
     return Message(code, text=text, code=getattr(note, "code", "")).text(lang)
 
@@ -666,6 +680,9 @@ class _Monitor:
     progress と cancel が無くても、発散の確かめのために区切る。
     進み具合は、準備を [0, SETUP_SHARE)、時間ステップを [SETUP_SHARE, 1 − POST_SHARE]（計算したステップ数の
     割合）、後処理を (1 − POST_SHARE, 1) に割り当て、最後に 1 にする。
+    時間ステップの最中にも、核の外で配列を埋める所がある（制御周期ごとに、次の周期のゲート信号と指令。
+    制御周期が SETUP_BLOCK より長いと、そこでも tick() が呼ばれる）。その前に filling() で区間を知らせる。
+    そのあいだの進み具合は、時間ステップの割り当ての中に留める（後処理の値に先回りしない）。
     """
 
     def __init__(self, n_steps: int, h: float, progress: Callable[[float], object] | None,
@@ -681,6 +698,7 @@ class _Monitor:
         self.last_check = self.started
         self.last_fraction = 0.0
         self.phase, self.ticks = "setup", 0
+        self.fill_from = self.fill_to = 0       # 時間ステップの最中に配列を埋めている区間（filling）
         self._stop_if_cancelled(0)
         if progress is not None:
             progress(0.0)
@@ -699,17 +717,38 @@ class _Monitor:
         self.last_check = time.perf_counter()
 
     def tick(self) -> None:
-        """準備か後処理の1区切りが済んだ（中断の求めを見て、進み具合を少し進める）。"""
-        self._stop_if_cancelled(self.last_k)
+        """準備、後処理、時間ステップの最中の配列を埋める仕事の、1区切りが済んだ。
+
+        中断の求めを見て、進み具合を少し進める。時間ステップの最中（filling() で知らせた区間を埋めている
+        あいだ）は、計算の済んだ格子点 fill_from の値から、fill_to の値との中ほどまでを少しずつ進める。
+        fill_to は、次に after() が知らせる点か、埋めている区間の終わりの早いほうなので、次に知らせる値を
+        超えず、時間ステップの割り当ての外（後処理の値）にも出ない。
+        """
+        self._stop_if_cancelled(max(self.last_k, self.fill_from))
         self.ticks += 1
         if self.phase == "setup":
             self._report(SETUP_SHARE * self.ticks / (self.ticks + 20))
+        elif self.phase == "run":
+            ahead = 0.5 * (self.fill_to - self.fill_from) * self.ticks / (self.ticks + 1)
+            self._report(self._run_fraction(self.fill_from + ahead))
         else:
             self._report(1.0 - POST_SHARE + POST_SHARE * self.ticks / (self.ticks + 5))
+
+    def filling(self, k0: int, k1: int) -> None:
+        """区間 [k0, k1) の配列を埋め始める（格子点 k0 まで計算が済んでいる）。続く tick() が、これを使う。
+
+        準備のあいだ（最初の区間。attach() の前）に呼んでもよい（tick() は準備の値を知らせ続ける）。"""
+        self.fill_from, self.fill_to = k0, max(k0, min(k1, self.next_check))
+        if self.phase == "run":
+            self.ticks = 0
 
     def finish_run(self) -> None:
         """時間ステップが済んだ（ここから後処理）。"""
         self.phase, self.ticks = "post", 0
+
+    def _run_fraction(self, k: float) -> float:
+        """格子点 k まで計算が済んだときの進み具合（時間ステップの割り当ての中）。"""
+        return SETUP_SHARE + (1.0 - SETUP_SHARE - POST_SHARE) * k / self.n_steps
 
     def after(self, k: int) -> None:
         """格子点 k まで計算が済んだ。区切りの点に来ていれば、確かめて次の区切りを決める。"""
@@ -722,7 +761,7 @@ class _Monitor:
         self.chunk = int(min(CHUNK_STEPS_MAX, max(CHUNK_STEPS_MIN, steps * CHUNK_SECONDS / max(spent, 1e-6))))
         self.next_check = min(self.n_steps, k + self.chunk)
         self._stop_if_cancelled(k)
-        self._report(SETUP_SHARE + (1.0 - SETUP_SHARE - POST_SHARE) * k / self.n_steps, now)
+        self._report(self._run_fraction(k), now)
 
     def _report(self, fraction: float, now: float | None = None) -> None:
         if self.progress is None:
@@ -814,6 +853,8 @@ def _divergence_limits(system: System, t_end: float) -> tuple[np.ndarray, dict[s
     取って、目安の DIVERGENCE_FACTOR（1e12）倍を「決めた大きさ」とする。超えるのは、制御器を通した正帰還
     （閉ループが不安定）などで指数的に育つときだけ。目安が 0（電源も初期値も 0）の変数は、
     有限かどうかだけを見る。
+    目安を決められないとき（素子の値が極端で、√(L/C) が 0 に下あふれする、換算の途中や 1e12 倍が倍精度を
+    あふれる）も、その変数の大きさを無限大にして、有限かどうかだけを見る（見積もりで計算を止めない）。
     """
     netlist = system.netlist
     s_v = s_i = 0.0
@@ -837,12 +878,25 @@ def _divergence_limits(system: System, t_end: float) -> tuple[np.ndarray, dict[s
     if inductances and capacitances:
         z_values += [math.sqrt(min(inductances) / max(capacitances)),
                      math.sqrt(max(inductances) / min(capacitances))]
-    i = max([s_i] + ([s_v / min(z_values)] if z_values else [])
-            + ([s_v * t_end / min(inductances)] if inductances else []))
-    v = max([s_v] + ([i * max(z_values)] if z_values else [])
-            + ([i * t_end / min(capacitances)] if capacitances else []))
-    limit_v = DIVERGENCE_FACTOR * v if v > 0 else math.inf
-    limit_i = DIVERGENCE_FACTOR * i if i > 0 else math.inf
+
+    def over(a: float, b: float) -> float:
+        """a / b。b が 0（下あふれした値）なら、決められない印の inf（0 で割る例外にしない）。"""
+        return a / b if b != 0.0 else math.inf
+
+    i = max([s_i] + ([over(s_v, min(z_values))] if z_values else [])
+            + ([over(s_v * t_end, min(inductances))] if inductances else []))
+    if math.isfinite(i):
+        v = max([s_v] + ([i * max(z_values)] if z_values else [])
+                + ([over(i * t_end, min(capacitances))] if capacitances else []))
+    else:
+        v = math.inf                   # 電流の目安が決まらなければ、電圧の目安も決まらない
+
+    def limit(scale: float) -> float:
+        """目安の DIVERGENCE_FACTOR 倍。目安が 0、決まらない（inf、NaN）、倍があふれるなら inf。"""
+        size = DIVERGENCE_FACTOR * scale
+        return size if scale > 0 and math.isfinite(size) else math.inf
+
+    limit_v, limit_i = limit(v), limit(i)
     limits = np.array([limit_v if name.startswith("v(") else limit_i for name in system.unknowns])
     return limits, {"V": (v, "WORD_VOLTAGE"), "A": (i, "WORD_CURRENT")}
 
@@ -950,18 +1004,19 @@ def _simulate_linear(
     monitor.attach(out, system.unknowns, *_divergence_limits(system, t_end))
     # 区切りごとに核を呼ぶ（区切りの初めの値は、前の区切りの最後の値。減衰ステップの残りも引き継ぐ）
     k, damp = 0, -1
-    while k < n_steps:
-        k_next = monitor.next_check
-        damp = kernel.run(
-            ops.P, ops.Q, ops.Rx, ops.Ru, out[k], u_start[k:k_next], u_end[k:k_next], event[k:k_next],
-            out[k:k_next + 1], ops.Pd, ops.Qd_start, ops.Qd_end, n_damp, damp,
-        )
-        k = k_next
-        monitor.after(k)
-    if u_last is not None:
-        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
-        out[n_steps] = ops.Rx @ out[n_steps] + ops.Ru @ u_last
-        monitor.recheck(n_steps)
+    with np.errstate(**_QUIET_OVERFLOW):
+        while k < n_steps:
+            k_next = monitor.next_check
+            damp = kernel.run(
+                ops.P, ops.Q, ops.Rx, ops.Ru, out[k], u_start[k:k_next], u_end[k:k_next], event[k:k_next],
+                out[k:k_next + 1], ops.Pd, ops.Qd_start, ops.Qd_end, n_damp, damp,
+            )
+            k = k_next
+            monitor.after(k)
+        if u_last is not None:
+            # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+            out[n_steps] = ops.Rx @ out[n_steps] + ops.Ru @ u_last
+            monitor.recheck(n_steps)
     monitor.finish_run()
 
     result = Result(
@@ -1299,8 +1354,13 @@ def _simulate_switched(
         デューティはキャリアの周期の先頭で取り込む。区間の途中から始まる周期は、取り込み済みの値を使う。
         周期ごとのオンのステップ数は区間でまとめて決め、ステップごとの配列は SETUP_BLOCK 行ずつ埋める
         （制御器の無い回路では区間が計算の全体になるので、そのあいだも中断の求めを見る）。
+        最初の区間は計算の準備のうち、2つ目からの区間は時間ステップの最中（格子点 k0 まで計算が済んで
+        いる）。どちらかは monitor が知っている（進み具合を、その段階の値で知らせる）。
         """
-        tick = monitor.tick if k1 - k0 > SETUP_BLOCK else None
+        tick = None
+        if k1 - k0 > SETUP_BLOCK:
+            monitor.filling(k0, k1)
+            tick = monitor.tick
         per_gate = []
         for g, (pwm, n_div) in enumerate(zip(gates, gate_steps, strict=True)):
             duty = pwm.duty if gate_cmd[g] < 0 else float(active[gate_cmd[g]])
@@ -1356,50 +1416,51 @@ def _simulate_switched(
     # k_done は計算の済んだ最後の格子点（核の ctl[CTL_K] と同じ値。制御周期ごとに ctl から読み直す手間を
     # 省くため、こちらで数える）。next_check は次の確かめの点（monitor.after() の後にだけ変わる）
     k_done, next_check = 0, monitor.next_check
-    while True:
-        while k_done < k1:
-            k_stop = k1 if k1 < next_check else next_check
-            status = kernel.run_switched(
-                table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
-                table.Rx, table.Ru, table.code, table.count,
-                d_pos, d_neg, n_sw,
-                u_start, u_mid, u_end, event, source_event, sw_code,
-                x, ctl, k_stop,
-                damping_steps, SIMULTANEOUS_FLIPS, max_flips, DIODE_ON_VOLTAGE,
-                out, code_out,
-            )
-            if status == kernel.DONE:
-                k_done = k_stop            # 核は k_stop まで進んで戻る（k_done < k_stop なので）
-                if k_done >= next_check:
-                    monitor.after(k_done)
-                    next_check = monitor.next_check
-                continue
-            code = int(ctl[kernel.CTL_CODE])
-            if status == kernel.NEED_STATE:
-                table.slot(code)       # 行列を用意して、同じステップからやり直す
-                continue
-            k = int(ctl[kernel.CTL_K])
-            monitor.check_values(k)    # 値が発散していて確定しないなら、発散として知らせる
-            raise CircuitError(
-                "DIODES_NOT_SETTLED", t=Value(k * h, "s"), k=k, flips=max_flips,
-                state=describe_state(system, code), hints=_unsettled_hint(system, [], {}),
-            )
-        # k0 の測定値で演算する。結果は次の制御周期の先頭から使う
-        for c, m, ins, outs in zip(controllers, ctrl_steps, ctrl_inputs, ctrl_outputs, strict=True):
-            if k0 % m == 0:
-                pending[outs] = commands(c, c.step(k0 * h, out[k0, ins].copy()), k0 * h, len(outs))
-        for m, outs in zip(ctrl_steps, ctrl_outputs, strict=True):
-            if k1 % m == 0:
-                active[outs] = pending[outs]
-        if k1 >= n_steps:
-            break
-        k0, k1 = k1, next_stop(k1)
-        fill(k0, k1)
-    if u_last is not None:
-        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
-        s_last = table.slot(int(ctl[kernel.CTL_STATE]))
-        out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
-        monitor.recheck(n_steps)
+    with np.errstate(**_QUIET_OVERFLOW):
+        while True:
+            while k_done < k1:
+                k_stop = k1 if k1 < next_check else next_check
+                status = kernel.run_switched(
+                    table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
+                    table.Rx, table.Ru, table.code, table.count,
+                    d_pos, d_neg, n_sw,
+                    u_start, u_mid, u_end, event, source_event, sw_code,
+                    x, ctl, k_stop,
+                    damping_steps, SIMULTANEOUS_FLIPS, max_flips, DIODE_ON_VOLTAGE,
+                    out, code_out,
+                )
+                if status == kernel.DONE:
+                    k_done = k_stop            # 核は k_stop まで進んで戻る（k_done < k_stop なので）
+                    if k_done >= next_check:
+                        monitor.after(k_done)
+                        next_check = monitor.next_check
+                    continue
+                code = int(ctl[kernel.CTL_CODE])
+                if status == kernel.NEED_STATE:
+                    table.slot(code)       # 行列を用意して、同じステップからやり直す
+                    continue
+                k = int(ctl[kernel.CTL_K])
+                monitor.check_values(k)    # 値が発散していて確定しないなら、発散として知らせる
+                raise CircuitError(
+                    "DIODES_NOT_SETTLED", t=Value(k * h, "s"), k=k, flips=max_flips,
+                    state=describe_state(system, code), hints=_unsettled_hint(system, [], {}),
+                )
+            # k0 の測定値で演算する。結果は次の制御周期の先頭から使う
+            for c, m, ins, outs in zip(controllers, ctrl_steps, ctrl_inputs, ctrl_outputs, strict=True):
+                if k0 % m == 0:
+                    pending[outs] = commands(c, c.step(k0 * h, out[k0, ins].copy()), k0 * h, len(outs))
+            for m, outs in zip(ctrl_steps, ctrl_outputs, strict=True):
+                if k1 % m == 0:
+                    active[outs] = pending[outs]
+            if k1 >= n_steps:
+                break
+            k0, k1 = k1, next_stop(k1)
+            fill(k0, k1)
+        if u_last is not None:
+            # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+            s_last = table.slot(int(ctl[kernel.CTL_STATE]))
+            out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
+            monitor.recheck(n_steps)
     monitor.finish_run()
     # 刻みが回路の速い成分を解像しているか（計算で使った回路状態ごと。スイッチの無い回路と同じ注意）
     used = _used_codes(table, code0, code_out[:n_steps], monitor.tick)

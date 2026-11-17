@@ -531,6 +531,11 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "cancel は、中断するなら真を返す引数なしの関数にする（現在 {value}）",
         "cancel must be a function without arguments that returns true to stop (now {value})",
     ),
+    "ARG_CSV_NEWLINE": (
+        "to_csv の newline（行の終わり）は \"\\r\\n\"（CR LF。既定）か \"\\n\"（LF）にする（現在 {value}）",
+        "newline (the line ending) of to_csv must be \"\\r\\n\" (CR LF, the default) or \"\\n\" (LF) "
+        "(now {value})",
+    ),
     "GATE_PERIOD_NOT_MULTIPLE": (
         "ゲート信号 '{name}' の周期（{period:.6g} s）が時間刻み h（{h:.6g} s）の整数倍になっていない。h "
         "を周期の整数分の1にする",
@@ -966,7 +971,17 @@ MESSAGES: dict[str, tuple[str, str]] = {
     ),
     "CLI_NOTE": ("  [{code}] 注意: {text}", "  [{code}] Warning: {text}"),
     "CLI_CSV_WRITTEN": ("波形を書き出しました: {path}", "Waveforms written: {path}"),
-    "CSV_NOTE": ("# [{code}] 注意: {text}", "# [{code}] Warning: {text}"),
+    "CLI_NOTES_WRITTEN": (
+        "注意（{count} 件）を書き出しました: {path}",
+        "Warnings ({count}) written: {path}",
+    ),
+    "CLI_NOTES_REMOVED": (
+        "今回の計算に注意は無いので、前の書き出しで残っていた注意のファイルを消しました: {path}",
+        "This run has no warnings, so the warnings file left by an earlier export was removed: {path}",
+    ),
+    "CLI_WRITE_FAILED": ("ファイルに書き出せません: {detail}", "Can't write the file: {detail}"),
+    # CSV と一緒に書き出す注意のファイル（<CSV の名前>.notes.txt）の1行
+    "NOTES_FILE_LINE": ("[{code}] 注意: {text}", "[{code}] Warning: {text}"),
 }
 
 

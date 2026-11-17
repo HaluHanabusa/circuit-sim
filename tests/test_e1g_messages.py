@@ -541,13 +541,17 @@ def test_basic_design_table_matches_the_code_table():
     assert rows == SCREEN_NOTICES
 
 
-def test_render_note_line_for_cli_and_csv():
+def test_render_note_line_for_cli_and_the_notes_file():
+    """注意の1行: コマンドラインの表示（字下げつき）と、CSV と一緒に書き出す注意のファイル（字下げなし）。
+    CSV に注意の行を足す書き方（# で始まる行）は、もう無い（D-075）。"""
     from circuit_sim.simulate import render_note_line
     note = Message("ESR_OMITTED")
     assert render_note_line(note) == f"  [ESR_OMITTED] 注意: {note}"
-    english = render_note_line(note, "CSV_NOTE", "en")
-    assert english.startswith("# [ESR_OMITTED] Warning: C_esr (equivalent series")
-    assert render_note_line(note, "CSV_NOTE") == f"# [ESR_OMITTED] 注意: {note}"
+    english = render_note_line(note, "NOTES_FILE_LINE", "en")
+    assert english.startswith("[ESR_OMITTED] Warning: C_esr (equivalent series")
+    assert render_note_line(note, "NOTES_FILE_LINE") == f"[ESR_OMITTED] 注意: {note}"
+    assert "CSV_NOTE" not in MESSAGES and not any(text.startswith("#") for pair in MESSAGES.values()
+                                                  for text in pair)
 
 
 def test_values_and_names_format():
