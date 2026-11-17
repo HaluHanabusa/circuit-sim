@@ -290,11 +290,16 @@ class Peeking(PositiveFeedback):
         return super().step(t, measured)
 
 
+# 呼び出し側の設定（既定と違う値にしておく）と、時間ステップのあいだの設定（あふれと無効の演算だけを止める）
+CALLER_STATE = {"divide": "raise", "over": "raise", "under": "ignore", "invalid": "raise"}
+QUIET_STATE = {"divide": "raise", "over": "ignore", "under": "ignore", "invalid": "ignore"}
+
+
 @pytest.mark.parametrize("g", [0.5, 3.0])
 def test_numpy_error_handling_of_the_caller_is_put_back_after_the_run(g):
     """警告を止めるのは、時間ステップのあいだの「あふれ」と「無効の演算」だけ（0 で割る、は止めない）。
     計算が終わったら（最後まで計算しても、発散のエラーで終わっても）、呼び出し側の設定に戻す。"""
-    with np.errstate(divide="raise", over="warn", under="warn", invalid="raise"):
+    with np.errstate(**CALLER_STATE):
         before = np.geterr()
         ctrl = Peeking(g)
         if g > 1:
@@ -303,9 +308,31 @@ def test_numpy_error_handling_of_the_caller_is_put_back_after_the_run(g):
         else:
             simulate(rc_with_command(), 5e-3, 1e-5, controllers=[ctrl])
         assert np.geterr() == before
-    assert ctrl.states and all(
-        state == {"divide": "raise", "over": "ignore", "under": "warn", "invalid": "ignore"}
-        for state in ctrl.states)
+    assert before == CALLER_STATE and ctrl.states and all(state == QUIET_STATE for state in ctrl.states)
+
+
+@pytest.mark.parametrize("diverging", [False, True])
+def test_numpy_error_handling_is_put_back_after_a_run_without_switches(diverging):
+    """スイッチも制御器も無い回路の経路でも同じ。途中の設定は、進み具合を受け取る関数の中から見る。"""
+    netlist = Netlist(components=[
+        Component(id="V1", type="V", nodes=("in", "0"),
+                  waveform=Step(final=1.7e308 if diverging else 1.0, t_step=1e-3)),
+        Component(id="R1", type="R", nodes=("in", "out"), value=1e-3),
+        Component(id="C1", type="C", nodes=("out", "0"), value=1e-6),
+    ])
+    states = []
+    with np.errstate(**CALLER_STATE), pytest.MonkeyPatch.context() as mp:
+        mp.setattr(simulate_module, "PROGRESS_SECONDS", 0.0)
+        mp.setattr(simulate_module, "CHUNK_STEPS_FIRST", 20)       # ステップの前（k = 100 の前）にも知らせる
+        before = np.geterr()
+        if diverging:
+            with pytest.raises(DivergenceError):
+                simulate(netlist, 5e-3, 1e-5, progress=lambda f: states.append((f, np.geterr())))
+        else:
+            simulate(netlist, 5e-3, 1e-5, progress=lambda f: states.append((f, np.geterr())))
+        assert np.geterr() == before
+    during = [state for f, state in states if 0.02 < f < 0.99]     # 時間ステップのあいだの知らせ
+    assert during and all(state == QUIET_STATE for state in during)
 
 
 def test_scale_that_cannot_be_determined_means_finiteness_only():
@@ -374,19 +401,36 @@ def test_template_buck_with_unstable_gains_is_a_bounded_limit_cycle_and_is_not_s
         assert set(np.unique(res["cmd(duty)"][len(res.t) // 2:])) >= {0.0, 0.9}       # 上下限に交互に張り付く
 
 
-def test_undamped_resonance_driven_at_resonance_is_not_divergence():
-    """受動素子だけの回路は、共振で振れが育っても（目安の Q 倍、線形に）止めない。LC を共振周波数の正弦波で
-    20 万ステップ（共振 2000 周期）駆動すると、振れは電源の約 π·2000 倍（6e3 倍）まで育つが、
-    目安の 1e12 倍には遠い。"""
+@pytest.mark.parametrize("tuned", [False, True])
+def test_undamped_resonance_driven_at_resonance_is_not_divergence(tuned):
+    """受動素子だけの回路は、共振で振れが育っても（時間に比例して）止めない。損失の無い LC を共振の周波数の
+    正弦波で駆動すると、コンデンサ電圧の振れは 電源 × ω₀t/2 で育つ（2000 周期で π·2000 ≈ 6283 倍）。
+    目安の 1e12 倍には遠い。
+
+    tuned = True : 電源の周波数を、計算の上での共振の周波数（台形則では (2/h)·atan(ω₀h/2)）に合わせる。
+                   振れは理論の π·2000 倍になる（許容差 1%: 1 周期 100 点の、振幅の読み取りの分）。
+    tuned = False: 電源を f₀ のままにする。台形則の共振の周波数は f₀ より δ = (ω₀h)²/12 = 3.3e-4（相対）だけ
+                   低いので、うなりになる。包絡線は 電源 × (1/δ)·|sin(δ·ω₀t/2)| で、山は 1/δ 倍
+                   （1 周期 100 点で 3040 倍。2000 周期の中に山が入る: δ·ω₀t/2 = 2.07 > π/2）。
+    どちらも止めない。"""
     f0 = 1.0 / (2 * math.pi * math.sqrt(1e-3 * 1e-6))
+    h = 1 / (100 * f0)
+    f_numeric = (2 / h) * math.atan(2 * math.pi * f0 * h / 2) / (2 * math.pi)
+    f = f_numeric if tuned else f0
     netlist = Netlist(components=[
-        Component(id="V1", type="V", nodes=("in", "0"), waveform=Sine(amplitude=1.0, frequency=f0)),
+        Component(id="V1", type="V", nodes=("in", "0"), waveform=Sine(amplitude=1.0, frequency=f)),
         Component(id="L1", type="L", nodes=("in", "out"), value=1e-3),
         Component(id="C1", type="C", nodes=("out", "0"), value=1e-6),
         Component(id="R1", type="R", nodes=("out", "0"), value=1e12),
     ])
-    res = simulate(netlist, 2000 / f0, 1 / (100 * f0))
-    assert np.abs(res["v(out)"]).max() > 1000
+    res = simulate(netlist, 2000 / f, h)
+    peak = np.abs(res["v(out)"]).max()
+    if tuned:
+        assert peak == pytest.approx(math.pi * 2000, rel=0.01)
+    else:
+        delta = (2 * math.pi / 100) ** 2 / 12                      # 共振の周波数のずれ（相対）
+        assert delta * math.pi * 2000 > math.pi / 2                # うなりの山が、計算の中に入っている
+        assert peak == pytest.approx(1 / delta, rel=0.01) and peak > 1000
 
 
 def test_variables_without_a_scale_are_checked_for_finiteness_only():

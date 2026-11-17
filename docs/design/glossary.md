@@ -229,7 +229,7 @@ PO の問い（2026-11-16）「電気、電子の専門用語はきちんと押�
 | `test_e1c_followups.py::test_x_interruption_example_of_the_review_is_noted` | 遮断の注意を探す言葉「行き場」→「還流経路」（`interruption_notes`） |
 | `test_e1c_followups.py::test_x_normal_turn_off_in_current_driven_circuit_is_not_an_interruption`、`test_e1c_recheck.py::test_leakage_through_low_off_resistance_is_not_an_interruption` | 同じ「行き場」。xfail(strict) の試験で、注意を探せなくなって XPASS になる。言葉を直すと、もとの xfail に戻る（製品の軽微な不具合は残っている。xfail の印は外さない） |
 
-用語の是正とは別に、E1g の仕様が決めた変更（コマンドラインの CSV の注意の行、D-048 の記録の決まり）で期待値が古くなった受け入れ試験が 2 件ある（`basic-design.md` 15.3）。
+用語の是正とは別に、E1g の仕様が決めた変更（コマンドラインの CSV の注意の行、D-048 の記録の決まり）で期待値が古くなった受け入れ試験が 2 件あった。どちらも片付いた: CSV の注意の行は D-075 でやめたので、`test_e1a_units_limits.py::test_c14_cli_reports_the_limit_in_one_line` は元の期待のまま通る。D-048 の 1 件（`test_e1b_recheck.py::test_average_leg_is_a_command_source_with_the_on_resistance_in_series`）は、検証担当が期待値を改めた（`docs/verification/E1g-verifier.md`）。
 
 | # | 場所 | 直す前の文 | 直した文 | E1g で直した番号（`circuit_sim/messages.py`） |
 |---|---|---|---|---|
@@ -306,3 +306,4 @@ PO の問い（2026-11-16）「電気、電子の専門用語はきちんと押�
 - 2026-11-16（ux-designer、S1 の読み合わせ）: D-063 の決めごとを反映した（1.2、1.3、2〜4章、7章、8章、9章、13章）。ほかの文書で使っていて表に無かった語を足した（高分解能 PWM、評価関数と ITAE、周期平均の振れ、表示定義、お知らせ、7章のアプリの起動と安全の言葉）。D-056 の「起動の番号」は D-050 のポート（「起動の番号（ポート）」）と紛れるので、「起動コード」と呼ぶことにした。10章に、`CLAUDE.md`・`architecture.md`・`roadmap.md` に残る表記を足した。
 - 2026-11-16（solver-engineer、E1g）: 9章（エンジンの注意とエラーの文で直すもの）を片付けた。直した文の番号の列を足した。
 - 2026-11-16（solver-engineer、E1g の引き継ぎ）: 9章に、用語の是正で落ちる受け入れ試験の一覧（11 件）を書いた。
+- 2026-11-17（solver-engineer、E1g の差し戻しの直し）: 9章の、期待値が古くなった受け入れ試験 2 件の文を、片付いた形に直した（参照先の `basic-design.md` 15.3 の行を消したため）。

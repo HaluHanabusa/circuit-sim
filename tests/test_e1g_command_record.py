@@ -134,6 +134,70 @@ def test_second_order_is_kept_when_halving_the_step():
     assert errs[-1][0] < 1e-5 and errs[-1][1] < 1e-5
 
 
+class Sequence:
+    """測定値によらず、決めた値を制御周期ごとに1つずつ出す制御器。"""
+
+    period = TC
+    inputs = ()
+    outputs = ("u",)
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def reset(self):
+        self.j = 0
+        return [self.values[0]]
+
+    def step(self, t, measured):
+        self.j += 1
+        return [self.values[min(self.j, len(self.values) - 1)]]
+
+
+def test_a_command_moving_outside_the_limits_is_not_a_change_of_the_source():
+    """変わり目かどうかは、上下限で止めた後の「電源の値」で決める（止める前の指令の値では決めない）。
+
+    電源は 値 = 2 × 指令（指令は −0.5〜1 で止める）。指令が上限の外で 1.5 → 2.5 → 4 と動いても、下限の外で
+    −0.7 → −3 と動いても、電源の値は変わらない。そこは不連続点ではない: 変わり目に数えず、直後を
+    減衰ステップにもしない。止める前の値で決めると、数えすぎ、余分な減衰ステップで結果が変わる。"""
+    gain, lower, upper = 2.0, -0.5, 1.0
+    raw = [0.2, 1.5, 2.5, 4.0, 0.6, -0.7, -3.0, -0.5, 0.1, 0.1]
+    held = [min(max(u, lower), upper) for u in raw]                # 止めた後の指令
+    assert held == [0.2, 1.0, 1.0, 1.0, 0.6, -0.5, -0.5, -0.5, 0.1, 0.1]
+    assert sum(a != b for a, b in zip(raw, raw[1:], strict=False)) == 8       # 指令そのものが変わる回数
+    assert sum(a != b for a, b in zip(held, held[1:], strict=False)) == 4     # 電源の値が変わる回数
+
+    def circuit(**limits):
+        source = Command(command="u", gain=gain, **limits)
+        return Netlist(components=[
+            Component(id="V1", type="V", nodes=("in", "0"), waveform=source),
+            Component(id="R1", type="R", nodes=("in", "out"), value=R),
+            Component(id="C1", type="C", nodes=("out", "0"), value=C),
+        ])
+
+    n = 20                                                         # 制御周期あたりのステップ数
+    t_end = len(raw) * TC
+    limited = simulate(circuit(lower=lower, upper=upper), t_end, TC / n, controllers=[Sequence(raw)])
+    assert limited.stats["command_changes"] == 4 and limited.stats["state_changes"] == 0
+    # 指令の記録は、止める前の値のまま（制御器が出した値）
+    assert [limited["cmd(u)"][j * n] for j in range(len(raw))] == raw
+    # 電源の電圧は、どの格子点でも、その点までの区間の「止めた後の指令 × gain」（変わり目は変わる前の値）。
+    # v(in) は方程式を解いた値なので、丸めの分（2 V に対して 1e-12 V）だけ許す
+    expected_v = np.array([gain * held[max(k - 1, 0) // n] for k in range(len(limited.t))])
+    assert np.max(np.abs(limited["v(in)"] - expected_v)) <= 1e-12
+    # 止めた後の値をそのまま指令にした（上下限の無い）計算と、回路の変数がビット単位で同じ
+    plain = simulate(circuit(), t_end, TC / n, controllers=[Sequence(held)])
+    assert plain.stats["command_changes"] == 4
+    assert limited.x.tobytes() == plain.x.tobytes()
+    # 解析解（区間ごとの指数関数）との差は、台形則の誤差の大きさ: h = TC/20 = τ/200 で (h/τ)²/12 ≈ 2e-6。
+    # 余裕 5 倍の 1e-5（電源の振れ 3 V に対して）
+    v, target = 0.0, []
+    for u in held:
+        target.append(v)
+        v = gain * u + (v - gain * u) * math.exp(-TC / TAU)
+    at_periods = limited["v(out)"][::n][: len(raw)]
+    assert np.max(np.abs(at_periods - np.array(target))) <= 1e-5 * 3.0
+
+
 def test_time_defined_step_still_records_the_value_after():
     """時刻で決まる電源のステップは、これまでどおり変わった後の値（D-019）。"""
     net = Netlist(components=[

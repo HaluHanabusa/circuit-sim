@@ -879,17 +879,16 @@ def _divergence_limits(system: System, t_end: float) -> tuple[np.ndarray, dict[s
         z_values += [math.sqrt(min(inductances) / max(capacitances)),
                      math.sqrt(max(inductances) / min(capacitances))]
 
-    def over(a: float, b: float) -> float:
+    def ratio(a: float, b: float) -> float:
         """a / b。b が 0（下あふれした値）なら、決められない印の inf（0 で割る例外にしない）。"""
         return a / b if b != 0.0 else math.inf
 
-    i = max([s_i] + ([over(s_v, min(z_values))] if z_values else [])
-            + ([over(s_v * t_end, min(inductances))] if inductances else []))
-    if math.isfinite(i):
-        v = max([s_v] + ([i * max(z_values)] if z_values else [])
-                + ([over(i * t_end, min(capacitances))] if capacitances else []))
-    else:
-        v = math.inf                   # 電流の目安が決まらなければ、電圧の目安も決まらない
+    i = max([s_i] + ([ratio(s_v, min(z_values))] if z_values else [])
+            + ([ratio(s_v * t_end, min(inductances))] if inductances else []))
+    # √(L/C) が 0 になって i が inf（決まらない）のとき: L と C の両方がある回路なので、下の C の項が inf に
+    # なり、v も inf になる（i·Z_max が inf × 0 = NaN になっても、v は NaN や有限の値にならない）
+    v = max([s_v] + ([i * max(z_values)] if z_values else [])
+            + ([ratio(i * t_end, min(capacitances))] if capacitances else []))
 
     def limit(scale: float) -> float:
         """目安の DIVERGENCE_FACTOR 倍。目安が 0、決まらない（inf、NaN）、倍があふれるなら inf。"""

@@ -19,7 +19,10 @@
   direct    : 発散の確かめと区切りの手間（simulate._Monitor の中で使った時間）を、計算の時間に対する
               割合で測る。形どうしの揺れを受けないので、「区切りと確かめによる所要時間の増加」の値に使える
   intervals : 大きな計算（100 万〜200 万ステップ）で、中断の求めを見る間隔と、進み具合を知らせる間隔の最大
-              （呼び出しの初めから最初の1回までと、最後の1回から戻るまでを含む。準備と後処理も入る）
+              （呼び出しの初めから最初の1回までと、最後の1回から戻るまでを含む。準備と後処理も入る）。
+              ここだけ、制御周期の長い降圧（buck_slow_control。f_ctrl 100 Hz で、制御周期が 20 万ステップ。
+              時間ステップの最中に、次の制御周期の配列を何回かに分けて埋める）も測る。進み具合が、
+              時間ステップの済む前に後処理の値（0.99 以上）になっていないかも出す
   instructions : 1ステップあたりの命令数を valgrind（cachegrind）で数えて、cost と同じ3つの形を比べる。
               時間と違って機械の揺れを受けない（同じ条件なら 1e-5 以内で同じ値）ので、数 % より小さい差を
               見分けられる。valgrind が要る（無ければ飛ばす）。既定では測らない（数分かかる）。
@@ -48,15 +51,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("buck_switching", "buck_average", "rectifier", "ladder")
+INTERVAL_CASES = CASES + ("buck_slow_control",)      # intervals だけで測る回路を足したもの
 # 回路 → （cost と direct の計算の長さ、intervals の計算の長さ）[s]
 T_END = {
     "buck_switching": (10e-3, 50e-3),     # 20 万ステップ、100 万ステップ
     "buck_average": (200e-3, 2.0),        # 20 万、200 万
     "rectifier": (4e-3, 0.1),             # 40 万（1周期 1000 分割）、200 万（1周期 200 分割）
     "ladder": (0.2, 2.0),                 # 20 万、200 万
+    "buck_slow_control": (10e-3, 50e-3),  # 20 万、100 万（制御周期 20 万ステップ）
 }
 # 回路 → 1 秒あたりのステップ数（cost の刻み。instructions で、ステップ数から計算の長さを決める）
-STEPS_PER_SECOND = {"buck_switching": 2e7, "buck_average": 1e6, "rectifier": 1e8, "ladder": 1e6}
+STEPS_PER_SECOND = {"buck_switching": 2e7, "buck_average": 1e6, "rectifier": 1e8, "ladder": 1e6,
+                    "buck_slow_control": 2e7}
 IR_STEPS = (2000, 42000)                  # instructions で比べる2つの長さ [ステップ]
 IR_CHUNK = 5000                           # instructions の「区切る」形の、区切りのステップ数
 
@@ -79,7 +85,11 @@ def make_case(cs, case: str, long: bool, steps: int | None = None):
     t_end = T_END[case][1 if long else 0] if steps is None else steps / STEPS_PER_SECOND[case]
     if case.startswith("buck_"):
         d = json.loads((ROOT / "examples" / "buck_voltage_mode.json").read_text(encoding="utf-8"))
-        d["simulation"] = {"fidelity": case.removeprefix("buck_"), "t_end": t_end}
+        fidelity = case.removeprefix("buck_")
+        if case == "buck_slow_control":
+            fidelity = "switching"
+            d["control"]["f_ctrl"] = {"value": 100, "unit": "Hz", "source": "手入力"}
+        d["simulation"] = {"fidelity": fidelity, "t_end": t_end}
         ex = cs.expand(cs.Spec.model_validate(d))
         return lambda **kw: ex.run(**kw)
     comp = cs.Component
@@ -180,16 +190,25 @@ def worker_intervals(case: str) -> dict:
         polls.append(time.perf_counter())
         return False
 
+    values: list[float] = []
+
+    def progress(fraction: float) -> None:
+        reports.append(time.perf_counter())
+        values.append(fraction)
+
     t0 = time.perf_counter()
-    res = run(progress=lambda f: reports.append(time.perf_counter()), cancel=cancel)
+    res = run(progress=progress, cancel=cancel)
     t1 = time.perf_counter()
 
     def largest_gap(times: list[float]) -> float:
         points = [t0] + times + [t1]
         return max(b - a for a, b in zip(points, points[1:], strict=False))
 
+    # 後処理の値（0.99 以上）を最初に知らせた時刻（所要時間に対する割合）。時間ステップが所要時間の
+    # ほとんどなので、1 に近いはず（制御周期の長い回路で、途中で 0.99 以上に跳んでいれば、小さく出る）
+    late = [(t - t0) / (t1 - t0) for t, f in zip(reports, values, strict=True) if f >= 0.99]
     return {"steps": len(res.t) - 1, "total": t1 - t0, "polls": len(polls), "cancel_gap": largest_gap(polls),
-            "reports": len(reports), "progress_gap": largest_gap(reports)}
+            "reports": len(reports), "progress_gap": largest_gap(reports), "post_at": late[0]}
 
 
 def worker_count(case: str, mode: str, steps: int, baseline: Path | None) -> dict:
@@ -286,13 +305,13 @@ def show_instructions(baseline: Path | None) -> None:
 
 def show_intervals() -> None:
     print("中断の求めを見る間隔と、進み具合を知らせる間隔の最大 [ms]（基準はどちらも 200 ms 以内）")
-    print(f"{'回路':16} {'ステップ':>8} {'所要時間':>8} {'中断を見た回数':>10} {'間隔の最大':>10} "
-          f"{'知らせた回数':>10} {'間隔の最大':>10}")
-    for case in CASES:
+    print(f"{'回路':18} {'ステップ':>8} {'所要時間':>8} {'中断を見た回数':>10} {'間隔の最大':>10} "
+          f"{'知らせた回数':>10} {'間隔の最大':>10} {'0.99 以上になった時点':>14}")
+    for case in INTERVAL_CASES:
         got = in_new_process("intervals", case)
-        print(f"{case:16} {got['steps']:8d} {got['total']:8.2f} {got['polls']:10d} "
-              f"{got['cancel_gap'] * 1e3:10.1f} {got['reports']:10d} {got['progress_gap'] * 1e3:10.1f}",
-              flush=True)
+        print(f"{case:18} {got['steps']:8d} {got['total']:8.2f} {got['polls']:10d} "
+              f"{got['cancel_gap'] * 1e3:10.1f} {got['reports']:10d} {got['progress_gap'] * 1e3:10.1f} "
+              f"{got['post_at']:14.1%}", flush=True)
 
 
 def main() -> int:

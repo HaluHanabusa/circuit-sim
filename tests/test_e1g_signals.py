@@ -26,8 +26,8 @@ import pytest
 from circuit_sim import Spec, expand
 from circuit_sim.__main__ import main as cli_main
 from circuit_sim.__main__ import notes_path
-from circuit_sim.signals import KIND_UNIT, describe_signals
-from circuit_sim.templates import TEMPLATE_DISPLAY
+from circuit_sim.signals import KIND_UNIT, SignalInfo, describe_signals, merge_signal_info
+from circuit_sim.templates import TEMPLATE_DISPLAY, TEMPLATES
 
 ROOT = Path(__file__).resolve().parents[1]
 SCREENS = ROOT / "docs" / "design" / "screens-v0.1.md"
@@ -136,6 +136,37 @@ def test_buck_internal_signals_match_the_a4_internal_table():
     for f, esr, ls in itertools.product(("switching", "average"), (None, 0.02), (False, True)):
         found |= set(buck(f, esr, ls).run().internal_names)
     assert found == listed - {"i(Rleg)"}
+
+
+def test_names_the_template_did_not_declare_are_internal_and_never_shown():
+    """テンプレートが決めていない名前は、内部の信号として扱う（表示する信号に黙って足さない。付録A.4）。
+
+    merge_signal_info の決まり: 並びは、テンプレートが決めた順（結果に無い名前は飛ばす）、続いて決めていない
+    名前（結果の順）。決めていない名前は internal=True、shown=False で、単位と種類はエンジンの情報のまま。"""
+    ex = buck("average")
+    names = ["v(sw_avg)", "v(sw)", "v(out)", "i(Vleg)", "i(L1)", "cmd(duty)"]
+    engine = describe_signals(ex.netlist, names)
+    assert not any(s.internal or s.shown for s in engine.values())      # エンジンは、表示と内部を決めない
+    declared = [s for s in ex.signals if s.name in ("i(L1)", "v(out)")]
+    declared.append(SignalInfo("v(nowhere)", "V", True, "node_voltage", node="nowhere"))   # 結果に無い名前
+    merged = merge_signal_info(engine, declared)
+    assert list(merged) == ["v(out)", "i(L1)", "v(sw_avg)", "v(sw)", "i(Vleg)", "cmd(duty)"]
+    for name in ("v(out)", "i(L1)"):
+        assert merged[name].shown and not merged[name].internal
+    for name in ("v(sw_avg)", "v(sw)", "i(Vleg)", "cmd(duty)"):
+        info = merged[name]
+        assert info.internal and not info.shown, name
+        assert (info.unit, info.kind, info.positive) == (engine[name].unit, engine[name].kind,
+                                                        engine[name].positive)
+    # 結果でも同じ: テンプレートが決め忘れた名前は、表示する信号に出ない（単位は返る）
+    forgotten = ("v(sw)", "cmd(duty)", "v(sw_avg)")
+    ex.signals = [s for s in ex.signals if s.name not in forgotten]
+    res = ex.run()
+    assert res.display_names == ["v(out)", "i(L1)", "i(Vleg)"]
+    assert set(res.internal_names) == set(forgotten)
+    assert set(res.display_names) | set(res.internal_names) == set(res.names)
+    assert [res.unit_of(name) for name in forgotten] == ["V", "", "V"]
+    assert all(res.signal_info[name].internal and not res.signal_info[name].shown for name in forgotten)
 
 
 # ------------------------------------------------------------------ CSV とテンプレートの注意
@@ -369,3 +400,89 @@ def test_targets_and_missing_are_reserved_and_not_read():
         expand(Spec.model_validate(d))
     assert info.value.code == "MISSING_VALUES" and info.value.names == ["R", "C"]
     assert "予約" in Spec.__doc__ and "targets" in Spec.__doc__ and "missing" in Spec.__doc__
+
+
+def buck_dict(fidelity="average", t_end=0.3e-3):
+    d = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    d["simulation"] = {"fidelity": fidelity, "t_end": t_end}
+    return d
+
+
+def plain_dict(template, values):
+    return {"template": template, "plant": {k: {"value": v, "unit": u} for k, (v, u) in values.items()}}
+
+
+# テンプレートごとの、値のそろった仕様（テンプレートを足したら、ここにも足す）
+COMPLETE_SPECS = {
+    "rc_lowpass": lambda: plain_dict("rc_lowpass", RC),
+    "rlc_series": lambda: plain_dict("rlc_series", RLC),
+    "buck_voltage_mode": buck_dict,
+}
+
+
+def test_every_template_is_checked_for_the_reserved_fields():
+    assert set(COMPLETE_SPECS) == set(TEMPLATES)
+
+
+def item_names(d) -> list[str]:
+    return list(d["plant"]) + list(d.get("control") or {})
+
+
+@pytest.mark.parametrize("template", list(COMPLETE_SPECS))
+def test_no_template_reads_the_missing_and_targets_fields(template):
+    """基準13: どのテンプレートも、missing と targets を読まない。値がそろっていれば、missing に何が
+    書いてあっても（全部の項目、一部、知らない名前）、展開の結果（回路、時間、注意）も計算の結果も同じ。"""
+    base = COMPLETE_SPECS[template]()
+    reference = expand(Spec.model_validate(base))
+    ref = reference.run()
+    names = item_names(base)
+    for extra in ({"missing": names}, {"missing": names[:1]}, {"missing": names[-1:]},
+                  {"missing": ["no_such_item"]}, {"targets": {"overshoot": 5.0, "settling_time": 1e-3}},
+                  {"targets": {"phase_margin": 60.0}, "missing": names}):
+        spec = Spec.model_validate({**base, **extra})
+        ex = expand(spec)                                            # 値はあるので、不足にならない
+        assert ex.netlist == reference.netlist and (ex.t_end, ex.h, ex.probes) == (
+            reference.t_end, reference.h, reference.probes), extra
+        assert [n.to_dict() for n in ex.notes] == [n.to_dict() for n in reference.notes]
+        res = ex.run()
+        assert np.array_equal(res.x, ref.x) and np.array_equal(res.t, ref.t), extra
+        assert res.signals.keys() == ref.signals.keys()
+        assert all(np.array_equal(res.signals[k], ref.signals[k]) for k in ref.signals)
+        assert [n.to_dict() for n in res.notes] == [n.to_dict() for n in ref.notes]
+        written = json.loads(spec.model_dump_json())                 # 中身は捨てずに持つ（書き出しに残る）
+        assert all(written[key] == value for key, value in extra.items())
+
+
+@pytest.mark.parametrize("template", list(COMPLETE_SPECS))
+@pytest.mark.parametrize("claimed", [[], ["no_such_item"], None])
+def test_missing_values_are_found_from_the_values_whatever_the_missing_field_says(template, claimed):
+    """値が足りないかは、実際の値（欄が無い、または value が null）から判断する。missing の欄が空でも、
+    別の名前を挙げていても、知らせる名前は実際に足りない項目。"""
+    d = COMPLETE_SPECS[template]()
+    plant = list(d["plant"])
+    d["plant"][plant[1]]["value"] = None                             # 値が null
+    del d["plant"][plant[2]]                                         # 欄が無い
+    expected = [plant[1], plant[2]]
+    if d.get("control"):
+        first = next(iter(d["control"]))
+        d["control"][first]["value"] = None
+        expected.append(first)
+    if claimed is not None:
+        d["missing"] = claimed
+    with pytest.raises(ValueError) as info:
+        expand(Spec.model_validate(d))
+    assert info.value.code == "MISSING_VALUES" and info.value.names == expected
+
+
+def test_buck_pair_is_found_missing_from_the_values_not_from_the_missing_field():
+    """組で入れる項目（負荷ステップの値と時刻）の片方だけがある: missing の欄が空でも、足りない側を知らせる。
+    逆に、missing が組の項目を挙げていても、どちらも無ければ（省略なら）不足にしない。"""
+    d = buck_dict()
+    d["plant"]["R_load_step"] = {"value": 3, "unit": "ohm"}
+    d["missing"] = []
+    with pytest.raises(ValueError) as info:
+        expand(Spec.model_validate(d))
+    assert info.value.names == ["t_load_step"] and info.value.pairs == {"t_load_step": "R_load_step"}
+    d = buck_dict()
+    d["missing"] = ["R_load_step", "t_load_step", "C_esr", "Tf"]     # 省略できる項目が「足りない」とある
+    assert "R2" not in [c.id for c in expand(Spec.model_validate(d)).netlist.components]
