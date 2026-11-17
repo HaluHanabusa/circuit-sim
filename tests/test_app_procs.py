@@ -3,6 +3,15 @@
 アプリ本体の代わりに、眠るだけの Python（引数に、試験ごとの印を持つ）を起動する。残ったかどうかは、
 プロセスの一覧（ps）で印を探して見る。見つけたものは、試験の終わりに止める（印は試験ごとに違うので、
 ほかの人のプロセスを止めない）。
+
+本物の合図は、印で確かめた番号にだけ送る（D-078。レビュー 8回目の中1）:
+- どの試験も、os.kill と os.killpg を gate（Gate）に替えて流す。部品の止め方（kill_tree）も、試験の
+  終わりの後始末（reap）も、gate の中で動く。gate が本物を送るのは、この試験が起動して、まだ受け取って
+  いない子と、印と「up」の行で確かめて許した番号だけ。ほかへの送信は控えて断り、試験を失敗にする。部品が
+  後退しても、木の外に本物の合図は届かない
+- 試験の終わりの印の後始末（kill_marked）は、送る直前に、その番号が印を持つことをもう一度確かめる
+- 止め方の壊し方を確かめるとき（例外の位置など）は、合図を控えるだけの身代わりの木で流す（本物の合図を
+  送らない）
 """
 from __future__ import annotations
 
@@ -13,13 +22,17 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import app_procs as procs
 import pytest
 
 WINDOWS = os.name == "nt"
+LINUX = sys.platform.startswith("linux")
 TESTS = Path(__file__).resolve().parent
+REAL_KILL = os.kill
+REAL_KILLPG = getattr(os, "killpg", None)
 
 # どのプロセスも、1 行を 1 回の書き込みで出す（PIPE_BUF 以下の書き込みは、ほかのプロセスの書き込みと
 # 混ざらない）。print は、引数・区切り・改行を別々に書くので、出力をためない設定（PYTHONUNBUFFERED=1）では、
@@ -66,8 +79,10 @@ time.sleep(120)
 
 
 @pytest.fixture(autouse=True)
-def no_process_left_behind():
-    """その試験が起動したプロセスが、試験の終わりに動いていたら、止めて（子も）、その試験を失敗にする。"""
+def no_process_left_behind(gate):
+    """その試験が起動したプロセスが、試験の終わりに動いていたら、止めて（子も）、その試験を失敗にする。
+
+    gate の中で動く（止める合図も、gate を通る）。"""
     start = procs.mark()
     yield
     left = procs.reap(start)
@@ -127,14 +142,33 @@ def gone_within(token: str, seconds: float) -> list[int]:
         time.sleep(0.1)
 
 
+def has_mark(pid: int, token: str) -> bool:
+    """pid のプロセスが、引数の1つとして token を持つか（POSIX。ゾンビと、無いものは偽）。
+
+    Linux は /proc の引数、そのほかの OS は ps。"""
+    if LINUX:
+        try:
+            return token.encode() in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            return False
+    done = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,args="], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=30, check=False)
+    line = done.stdout.strip()
+    return done.returncode == 0 and bool(line) and not line.startswith("Z") and token in line.split()
+
+
 def kill_marked(token: str) -> None:
-    """引数に token を持つプロセスを止める（POSIX。印は試験ごとに違うので、ほかの人のプロセスを止めない）。"""
+    """引数に token を持つプロセスを止める（POSIX。印は試験ごとに違うので、ほかの人のプロセスを止めない）。
+
+    一覧で見つけた番号は、送る直前に、印をもう一度確かめる（その間に終わって、番号が使い回されていたら
+    送らない）。"""
     if not WINDOWS:
         for pid in marked(token):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            if has_mark(pid, token):
+                try:
+                    REAL_KILL(pid, signal.SIGKILL)
+                except OSError:
+                    pass
 
 
 @pytest.fixture
@@ -145,11 +179,88 @@ def token():
     kill_marked(value)
 
 
+class Gate:
+    """os.kill と os.killpg の差し替え（D-078。レビュー 8回目の中1）。
+
+    本物の合図（send、send_group）を送るのは、次のものだけ:
+    - この試験が spawn で起動し、まだ受け取っていない子（Popen が番号を押さえているので、使い回されない）
+    - allow で許した番号のうち、送る直前にも、この試験の印（token）を引数に持つもの（印と「up」の行で
+      確かめた子・孫、見張り）。印を持たなくなった番号（終わった、使い回された）には送らない
+      （ProcessLookupError を出すだけ。断りとは数えない）
+    - allow_group で許したまとまり（この試験が起動し、まだ受け取っていない、まとまりの先頭）
+    ほかの番号とまとまりへの送信は、送らずに控え（refused）、ProcessLookupError（ESRCH）を出す。"""
+
+    def __init__(self, token: str, send=None, send_group=None, check=None) -> None:
+        self.token = token
+        self.start = procs.mark()
+        self.allowed: set[int] = set()
+        self.groups: set[int] = set()
+        self.sent: list[tuple] = []
+        self.refused: list[tuple] = []
+        self.send = send or REAL_KILL
+        self.send_group = send_group or REAL_KILLPG
+        self.check = check or has_mark  # 印の確かめ方（gate そのものの試験は、身代わりにする）
+
+    def own_child(self, pid: int) -> bool:
+        """この試験が spawn で起動し、まだ受け取っていない子か。"""
+        return any(proc.pid == pid and proc.returncode is None
+                   and getattr(proc, "app_procs_number", -1) >= self.start for proc in list(procs.STARTED))
+
+    def kill(self, pid: int, sig: int) -> None:
+        if self.own_child(pid) or (pid in self.allowed and self.check(pid, self.token)):
+            self.sent.append((pid, int(sig)))
+            return self.send(pid, sig)
+        if pid in self.allowed:
+            raise ProcessLookupError(errno.ESRCH, "gate: 許した番号だが、もう印を持たない（終わった）")
+        self.refused.append((pid, int(sig)))
+        raise ProcessLookupError(errno.ESRCH, "gate: 許す番号の外には送らない")
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        if pgid in self.groups and self.own_child(pgid):
+            self.sent.append(("group", pgid, int(sig)))
+            return self.send_group(pgid, sig)
+        self.refused.append(("group", pgid, int(sig)))
+        raise ProcessLookupError(errno.ESRCH, "gate: 許すまとまりの外には送らない")
+
+    def allow(self, *pids: int) -> None:
+        """印を確かめてから、番号を許す（印が読めるまで、10 秒まで待つ）。"""
+        for pid in pids:
+            deadline = time.monotonic() + 10
+            while not self.check(pid, self.token) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert self.check(pid, self.token), f"{pid} は、この試験の印を持たない（許さない）"
+            self.allowed.add(pid)
+
+    def allow_group(self, proc) -> None:
+        """この試験が起動した、まだ動いているまとまりの先頭を許す。"""
+        assert self.own_child(proc.pid) and proc.poll() is None and os.getpgid(proc.pid) == proc.pid
+        self.groups.add(proc.pid)
+
+
+@pytest.fixture(autouse=True)
+def gate(token):
+    """その試験の間（試験の終わりの後始末も）、os.kill と os.killpg を Gate に替える（POSIX）。
+
+    終わりに、許していない所へ送ろうとしていたら、試験を失敗にする。"""
+    if WINDOWS:
+        yield None
+        return
+    current = Gate(token)
+    os.kill, os.killpg = current.kill, current.killpg
+    try:
+        yield current
+    finally:
+        os.kill, os.killpg = REAL_KILL, REAL_KILLPG
+    if current.refused:
+        pytest.fail(f"許していない番号やまとまりに、合図を送ろうとした（gate が止めた）: {current.refused}",
+                    pytrace=False)
+
+
 only_posix = pytest.mark.skipif(WINDOWS, reason="POSIX のプロセスのまとまりの話（Windows は taskkill /T）")
 
 
 @only_posix
-def test_started_processes_die_when_the_harness_kills_the_check_with_its_group(tmp_path, token):
+def test_started_processes_die_when_the_harness_kills_the_check_with_its_group(tmp_path, token, gate):
     """ハーネスが確認をまとまりごと止めても（scripts/cycle.py の kill_tree: まとまりごと SIGKILL）、
     確認が部品で起動したものは残らない。
 
@@ -167,6 +278,7 @@ def test_started_processes_die_when_the_harness_kills_the_check_with_its_group(t
         while len(running := marked(token)) < 3 and time.monotonic() < deadline:
             time.sleep(0.05)  # 新しいまとまりの起動が、見張りを分けるまで
         assert set(started) <= set(running) and len(running) == 3, (line, running)  # 2つと、見張り
+        gate.allow_group(check.proc)
         os.killpg(check.pid, signal.SIGKILL)  # ハーネスの止め方（時間切れ、中断）
         check.wait(timeout=30)
         left = gone_within(token, 5)
@@ -176,16 +288,18 @@ def test_started_processes_die_when_the_harness_kills_the_check_with_its_group(t
 
 
 @only_posix
-def test_kill_tree_stops_children_and_grandchildren_while_the_parent_runs(tmp_path, token):
+def test_kill_tree_stops_children_and_grandchildren_while_the_parent_runs(tmp_path, token, gate):
     """kill_tree は、親が動いている間なら、子と孫も止める。自分だけのまとまりに移った子と、その孫も。
 
     前の止め方（起動したもののまとまりごと止める）では、自分だけのまとまりに移った子は残った。"""
     parent = procs.Launched([sys.executable, "-c", PARENT, token], cwd=tmp_path,
                             env={**os.environ, **PARENT_ENV})
     try:
-        ups = [parent.wait_line("up", timeout=30) for _ in range(4)]  # 親、子、起動役、孫
-        assert len(marked(token)) == 4, (ups, marked(token))
+        tree = tree_of(parent)  # 親、子、起動役、孫
+        assert sorted(marked(token)) == sorted(tree.values()), (tree, marked(token))
+        gate.allow(*tree.values())
         procs.kill_tree(parent.proc)
+        assert {pid for pid, sig in gate.sent if sig == signal.SIGKILL} == set(tree.values()), gate.sent
         left = gone_within(token, 5)
         assert not left, f"親を止めた後も、子か孫が動いていた: {left}"
     finally:
@@ -198,7 +312,7 @@ class Interrupted(BaseException):
 
 @only_posix
 @pytest.mark.parametrize("at", [1, 2], ids=["first-listing", "second-listing"])
-def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, token, monkeypatch, at):
+def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, token, gate, monkeypatch, at):
     """子をたどる途中で例外が起きても、一時停止したものを止まったまま残さない（レビュー 7回目の中1）。
 
     at 回目の一覧（children_table）で例外を起こす。一時停止したものには、必ず SIGKILL を送る（finally）。
@@ -211,14 +325,17 @@ def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, to
     alone = procs.Launched([sys.executable, "-c", SLEEPER, token], cwd=tmp_path, env=dict(os.environ),
                            new_session=True)
     try:
-        tree_of(tree)
+        members = tree_of(tree)
         alone.wait_line("up", timeout=30)
         deadline = time.monotonic() + 30
         while len(marked(token)) < 6 and time.monotonic() < deadline:
             time.sleep(0.05)  # 見張りが分かれるまで
         assert len(marked(token)) == 6, marked(token)
+        guards = [pid for pid in marked(token) if pid not in {*members.values(), alone.pid}]
+        assert len(guards) == 1, (guards, members)
+        gate.allow(*members.values(), alone.pid, *guards)
         real_table = procs.children_table
-        real_kill = os.kill
+        gated_kill = os.kill  # gate（許した番号にだけ本物を送る）
         stopped_by_it: list[int] = []
         calls = [0]
 
@@ -229,7 +346,7 @@ def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, to
             return real_table()
 
         def kill(pid, sig):
-            real_kill(pid, sig)
+            gated_kill(pid, sig)
             if sig == signal.SIGSTOP:
                 stopped_by_it.append(pid)
 
@@ -241,6 +358,7 @@ def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, to
                 procs.kill_tree(launched.proc)
         monkeypatch.undo()
         assert tree.pid in stopped_by_it and alone.pid in stopped_by_it
+        assert not gate.refused, ("許していない番号に送ろうとした", gate.refused)
         deadline = time.monotonic() + 5
         while (left := stopped(token)) and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -255,7 +373,7 @@ def test_an_exception_while_tracing_the_tree_leaves_nothing_stopped(tmp_path, to
 
 
 @only_posix
-def test_kill_tree_stops_the_root_before_listing_and_kills_children_first(tmp_path, token, monkeypatch):
+def test_kill_tree_stops_the_root_before_listing_and_kills_children_first(tmp_path, token, gate, monkeypatch):
     """番号を使い回されたほかの人のプロセスを止めないための順序（kill_posix_tree の説明の 1〜3）:
 
     - 最初に root を一時停止し、その後で一覧を作る
@@ -268,9 +386,10 @@ def test_kill_tree_stops_the_root_before_listing_and_kills_children_first(tmp_pa
                             env={**os.environ, **PARENT_ENV})
     try:
         tree = tree_of(parent)
+        gate.allow(*tree.values())
         events: list[tuple] = []
         real_table = procs.children_table
-        real_kill = os.kill
+        gated_kill = os.kill  # gate（許した番号にだけ本物を送る）
 
         def table():
             result = real_table()
@@ -281,13 +400,14 @@ def test_kill_tree_stops_the_root_before_listing_and_kills_children_first(tmp_pa
             if sig == signal.SIGSTOP and pid == tree["grandchild"]:
                 events.append(("stop-failed", pid))
                 raise ProcessLookupError(errno.ESRCH, "No such process")
-            real_kill(pid, sig)
+            gated_kill(pid, sig)
             events.append((sig, pid))
 
         monkeypatch.setattr(procs, "children_table", table)
         monkeypatch.setattr(procs.os, "kill", kill)
         procs.kill_posix_tree(parent.pid)
         monkeypatch.undo()
+        assert not gate.refused, ("許していない番号に送ろうとした", gate.refused)
         stops = [i for i, e in enumerate(events) if e[0] == signal.SIGSTOP]
         kills = [i for i, e in enumerate(events) if e[0] == signal.SIGKILL]
         tables = [i for i, e in enumerate(events) if e[0] == "table"]
@@ -312,6 +432,146 @@ def test_kill_tree_stops_the_root_before_listing_and_kills_children_first(tmp_pa
         monkeypatch.undo()
         kill_marked(token)  # 一時停止が「もう無い」と答えさせた孫（出力のパイプを持っている）を先に止める
         parent.stop()
+
+
+# 合図を控えるだけの身代わりの木（本物の合図は送らない。D-078）。番号は、どの OS でも動いているプロセスに
+# 当たらない値（Linux の番号の上限 4194304、macOS の 99998 より大きい）
+FAKE_ROOT, FAKE_A, FAKE_B, FAKE_C = 9_000_001, 9_000_002, 9_000_003, 9_000_004
+FAKE_TREE = {FAKE_ROOT: [FAKE_A, FAKE_B], FAKE_B: [FAKE_C]}
+
+
+class FakeTree:
+    """children_table と os.kill の身代わり。合図は控えて状態を変えるだけで、本当には送らない。
+
+    interrupt=(kind, n): "stop" は n 回目の SIGSTOP を届けた後、"kill" は n 回目の SIGKILL を届けた後、
+    "before-stop" は n 回目の SIGSTOP を届ける前に、Interrupted を出す（CPython の os.kill は、送った後に
+    待っている合図を処理するので、Ctrl+C が os.kill の中で KeyboardInterrupt になる。検証 8回目に実測）。
+    gone は、一覧に載ったが、一時停止の前に終わって受け取られていた番号（ESRCH を返す）。"""
+
+    def __init__(self, interrupt: tuple[str, int] | None = None, gone: frozenset[int] = frozenset()) -> None:
+        self.state = {pid: "S" for pid in (FAKE_ROOT, FAKE_A, FAKE_B, FAKE_C)}
+        self.interrupt = interrupt
+        self.gone = gone
+        self.events: list[tuple] = []
+        self.counts = {"stop": 0, "kill": 0}
+
+    def table(self) -> dict[int, list[int]]:
+        return {parent: list(children) for parent, children in FAKE_TREE.items()}
+
+    def kill(self, pid: int, sig: int) -> None:
+        if pid not in self.state:
+            self.events.append(("outside", pid, int(sig)))
+            raise ProcessLookupError(errno.ESRCH, "木の外（身代わりは送らない）")
+        kind = {signal.SIGSTOP: "stop", signal.SIGKILL: "kill"}.get(sig, "other")
+        if kind in self.counts:
+            self.counts[kind] += 1
+        if kind == "stop" and self.interrupt == ("before-stop", self.counts["stop"]):
+            raise Interrupted(f"{self.counts['stop']} 回目の SIGSTOP の前")
+        if pid in self.gone or self.state[pid] == "dead":
+            self.events.append(("missing", pid, int(sig)))
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        self.events.append((int(sig), pid))
+        if kind == "stop":
+            self.state[pid] = "T"
+        elif kind == "kill":
+            self.state[pid] = "dead"
+        if self.interrupt == (kind, self.counts.get(kind)):
+            raise Interrupted(f"{self.counts[kind]} 回目の {kind} の後")
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        self.events.append(("outside-group", pgid, int(sig)))
+        raise ProcessLookupError(errno.ESRCH, "まとまりには送らない（身代わり）")
+
+
+@only_posix
+@pytest.mark.parametrize("where", [
+    *[("before-stop", n) for n in range(1, 5)],
+    *[("stop", n) for n in range(1, 5)],
+    *[("kill", n) for n in range(1, 5)],
+    None,
+], ids=lambda where: "no-interrupt" if where is None else f"{where[0]}-{where[1]}")
+def test_an_interrupt_from_inside_os_kill_leaves_nothing_stopped(monkeypatch, where):
+    """os.kill の中から例外が出ても（送る前でも、送った後でも）、一時停止したものを止まったまま残さない。
+    例外は、全部に SIGKILL を送ってから出し直す（検証 8回目の問題1、レビュー 8回目の軽微1）。
+
+    身代わりの木（root、子 A・B、B の子 C）で流す。合図は控えるだけで、本当には送らない（D-078）。
+    - 一時停止を届けたもの（状態 T）は、どれも、その後で SIGKILL を受ける
+    - 一時停止を送る前に例外が出た番号も、控えているので SIGKILL を受ける（一覧に載った、止めた親の子）
+    - 木の外にも、まとまりにも、送らない"""
+    tree = FakeTree(interrupt=where)
+    monkeypatch.setattr(procs, "os", types.SimpleNamespace(kill=tree.kill, killpg=tree.killpg))
+    monkeypatch.setattr(procs, "children_table", tree.table)
+    try:
+        procs.kill_posix_tree(FAKE_ROOT)
+        raised = None
+    except Interrupted as exc:
+        raised = str(exc)
+    monkeypatch.undo()
+    assert (raised is None) == (where is None), (raised, tree.events)
+    left = [pid for pid, state in tree.state.items() if state == "T"]
+    assert not left, (f"一時停止したまま残った: {left}", tree.events)
+    stopped_ = [e[1] for e in tree.events if e[0] == signal.SIGSTOP]
+    killed = [e[1] for e in tree.events if e[0] == signal.SIGKILL]
+    assert set(stopped_) <= set(killed), ("一時停止したのに、SIGKILL を受けていないものがある", tree.events)
+    assert not [e for e in tree.events if str(e[0]).startswith("outside")], tree.events
+    if where is None:
+        assert killed == [FAKE_C, FAKE_B, FAKE_A, FAKE_ROOT], ("子から先に止めていない", tree.events)
+
+
+@only_posix
+def test_a_pid_that_could_not_be_stopped_gets_no_sigkill(monkeypatch):
+    """一覧に載ったが、一時停止を送ったら「もう無い」（ESRCH）だった番号には、SIGKILL を送らない（その番号は、
+    もう別のプロセスのものかもしれない）。身代わりの木で流す（合図は送らない）。"""
+    tree = FakeTree(gone=frozenset({FAKE_C}))
+    monkeypatch.setattr(procs, "os", types.SimpleNamespace(kill=tree.kill, killpg=tree.killpg))
+    monkeypatch.setattr(procs, "children_table", tree.table)
+    procs.kill_posix_tree(FAKE_ROOT)
+    monkeypatch.undo()
+    killed = [e[1] for e in tree.events if e[0] == signal.SIGKILL]
+    assert killed == [FAKE_B, FAKE_A, FAKE_ROOT], tree.events
+    assert [e for e in tree.events if e[0] == "missing"] == [("missing", FAKE_C, int(signal.SIGSTOP))]
+
+
+@only_posix
+def test_the_gate_sends_only_to_its_own_children_and_marked_members():
+    """gate（Gate）そのものの確かめ。送り先と印の確かめを身代わりにして流す（本物の合図は送らない）。
+
+    - この試験が起動し、まだ受け取っていない子には送る。受け取った後は送らない（番号が使い回されうる）
+    - 許していない番号には送らず、控えて断る（ProcessLookupError）
+    - 許した番号でも、送る直前に印を持たなければ送らない（終わった、使い回された）。断りとは数えない
+    - 許していないまとまりには送らない
+    控えの「受け取っていない子」は、存在しえない番号の身代わり（Popen の代わり）を控えに入れて作る
+    （後始末の前に外す）。"""
+    sent: list[tuple] = []
+    marks: dict[int, bool] = {}
+    local = Gate("unused", send=lambda pid, sig: sent.append((pid, int(sig))),
+                 send_group=lambda pgid, sig: sent.append(("group", pgid, int(sig))),
+                 check=lambda pid, token: marks.get(pid, False))
+    own = types.SimpleNamespace(pid=9_100_001, returncode=None, app_procs_number=procs.mark(), stdin=None)
+    member, stranger = 9_100_002, 9_100_003
+    procs.STARTED.append(own)
+    try:
+        local.kill(own.pid, 0)
+        with pytest.raises(ProcessLookupError):
+            local.kill(member, signal.SIGKILL)  # まだ許していない
+        marks[member] = True
+        local.allow(member)
+        local.kill(member, signal.SIGKILL)
+        marks[member] = False  # 終わった（印を持たなくなった）
+        with pytest.raises(ProcessLookupError):
+            local.kill(member, signal.SIGKILL)
+        with pytest.raises(ProcessLookupError):
+            local.kill(stranger, signal.SIGSTOP)
+        with pytest.raises(ProcessLookupError):
+            local.killpg(os.getpgid(0), signal.SIGKILL)
+        own.returncode = 0  # 受け取った
+        with pytest.raises(ProcessLookupError):
+            local.kill(own.pid, signal.SIGKILL)
+    finally:
+        procs.STARTED.remove(own)
+    assert sent == [(own.pid, 0), (member, int(signal.SIGKILL))], sent
+    assert local.refused == [(member, int(signal.SIGKILL)), (stranger, int(signal.SIGSTOP)),
+                             ("group", os.getpgid(0), int(signal.SIGKILL)), (own.pid, int(signal.SIGKILL))]
 
 
 @only_posix
@@ -386,7 +646,7 @@ def test_a_new_session_keeps_the_number_and_its_guard_ends_with_it(tmp_path, tok
 
 
 @only_posix
-def test_terminal_signals_do_not_reach_the_guard(tmp_path, token):
+def test_terminal_signals_do_not_reach_the_guard(tmp_path, token, gate):
     """見張りは、自分だけのまとまりにいる（本来のコマンドのまとまりに送られる端末の合図を受けない）。"""
     proc = procs.Launched([sys.executable, "-c", SLEEPER, token], cwd=tmp_path, env=dict(os.environ),
                           new_session=True)
@@ -395,6 +655,7 @@ def test_terminal_signals_do_not_reach_the_guard(tmp_path, token):
         guards = [pid for pid in marked(token) if pid != proc.pid]
         assert len(guards) == 1, marked(token)
         assert os.getpgid(guards[0]) != os.getpgid(proc.pid)
+        gate.allow_group(proc.proc)
         os.killpg(proc.pid, signal.SIGINT)  # 端末の Ctrl+C と同じ届き方
         assert proc.wait(timeout=10) != 0
         assert not gone_within(token, 5)
