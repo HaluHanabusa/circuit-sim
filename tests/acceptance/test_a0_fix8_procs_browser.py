@@ -57,6 +57,14 @@ def manual_browser_values() -> list[str]:
     return found
 
 
+def child_result(stdout: str) -> dict:
+    """子の Python が出した結果（JSON の行）。出力の最後の行とは限らない（後ろに別の行が続いても拾う。
+    10回目の検証で、最後の行を見る書き方をそろえて直した: docs/verification/A0-verifier-10.md）。"""
+    found = [line.strip() for line in stdout.splitlines() if line.strip().startswith("{")]
+    assert found, f"子の Python が、結果の JSON を出していない: {stdout!r}"
+    return json.loads(found[-1])
+
+
 def child_env(browser: str) -> dict[str, str]:
     """子の Python の環境変数。BROWSER を value にし、画面と端末の手掛かりを外す（webbrowser が、ほかの
     ブラウザを探すために、別のコマンドを起動しないように）。"""
@@ -104,7 +112,7 @@ def test_the_manual_browser_value_reaches_this_os_webbrowser_whole_and_writes_th
                               env=child_env(browser), stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
         assert done.returncode == 0, (value, done.stderr)
-        result = json.loads(done.stdout.strip().splitlines()[-1])
+        result = child_result(done.stdout)
         assert result["order"][:1] == [browser], (
             f"BROWSER が、区切り {result['pathsep']!r} で分かれた（最初の候補が値の全部でない）", result)
         assert result["opened"] is True, ("最初の候補で開けなかった", result, done.stderr)
@@ -190,7 +198,7 @@ def as_on_windows(value: str) -> dict:
                           env=child_env(value), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=60, check=False)
     assert done.returncode == 0, (value, done.stderr)
-    result = json.loads(done.stdout.strip().splitlines()[-1])
+    result = child_result(done.stdout)
     assert result["windows_default"], ("Windows の道で読み込めていない（まねが効いていない）", result)
     return result
 

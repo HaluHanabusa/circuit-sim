@@ -209,6 +209,21 @@ def test_sleeps_with_an_app_running(tmp_path):
         proc.stop()
 '''
 
+# 中の pytest の要約の行（"3 failed, 1 passed, 2 errors in 8.47s" など。-q でないときの = の囲みも許す）
+_KIND = r"(?:failed|passed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
+SUMMARY_LINE = re.compile(rf"^=*\s*\d+ {_KIND}(?:, \d+ {_KIND})* in \d+(?:\.\d+)?s\b")
+
+
+def pytest_summary(text: str) -> str:
+    """中の pytest の出力から、要約の行を返す（無ければ空）。
+
+    要約の行は、出力の最後の行とは限らない。Windows（PO の PC、0751473 の試験）では、要約の後ろに、終わる
+    ときの `<sys>:0: ResourceWarning: unclosed file …` の行が続いた（docs/verification/A0-verifier-10.md）。
+    だから、最後の行ではなく、要約の形の行のうち最後のものを取る。行の頭から形を見るので、落ちた試験の
+    説明の中の行（E で始まる）は拾わない。"""
+    found = [line.strip() for line in text.splitlines() if SUMMARY_LINE.match(line.strip())]
+    return found[-1] if found else ""
+
 
 def inner_run(tmp_path: Path, source: str) -> tuple[list[str], dict[str, str], Path]:
     """別の pytest で source を流すコマンドと環境変数（実装者の試験の部品を、そのまま読み込める形）。"""
@@ -272,7 +287,7 @@ def test_leaked_processes_are_stopped_and_their_tests_fail(tmp_path):
     done = subprocess.run(command, cwd=tmp_path / "inner", env=env, capture_output=True, timeout=300,
                           stdin=subprocess.DEVNULL, check=False)
     text = (done.stdout + done.stderr).decode("utf-8", "replace")
-    summary = text.strip().splitlines()[-1] if text.strip() else ""
+    summary = pytest_summary(text)
     pids = {path.stem: int(path.read_text(encoding="utf-8")) for path in sorted(out.glob("*.pid"))}
     assert set(pids) == {"started", "middle", "timeout"}, (pids, text[-3000:])
     assert (out / "left.txt").exists(), "別の pytest が、終わりまで進まなかった:\n" + text[-3000:]
@@ -284,7 +299,7 @@ def test_leaked_processes_are_stopped_and_their_tests_fail(tmp_path):
     )
     for wanted in ("3 failed", "1 passed", "2 errors"):
         assert re.search(rf"\b{wanted}\b", summary), (
-            f"残した試験が、失敗になっていない（終わりの行: {summary!r}）\n{text[-3000:]}"
+            f"残した試験が、失敗になっていない（要約の行: {summary!r}）\n{text[-3000:]}"
         )
     assert done.returncode == 1, (done.returncode, summary)
 

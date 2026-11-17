@@ -12,8 +12,8 @@ OS の違いを強制では確かめられない）。
   いるものも無いときだけ、決めた時間まで結び直す。ほかのプログラムが待ち受けていれば待たない（居座らない）。
   前回のプロセスが動いていれば待たない。--port を決めたら、記録は見ない。
 - 記録の読み取り: 壊れた形はどれも「記録なし」。前回のプロセス ID が大きすぎるとき、起動が例外で落ちない
-  （軽微の不具合。xfail）。記録の名前が名前付きパイプ（FIFO）のとき、起動が止まらない（軽微の不具合。xfail。
-  POSIX だけ）。
+  （軽微の不具合。POSIX だけ xfail。Windows では落ちないことを PO の PC で確かめ、10回目の検証で印を
+  外した）。記録の名前が名前付きパイプ（FIFO）のとき、起動が止まらない（軽微の不具合。xfail。POSIX だけ）。
 - 端末の文言: ファイルを渡して起動すると、オプションではなくファイルだと分かる文（UX 確認3回目の改善4）。
 
 ポートは 28470 番台を使わない（決めた空きのポートを、前回のポートとして渡す）。既定の並び（28470 から）は、
@@ -333,13 +333,15 @@ def test_record_that_is_a_folder_reads_as_none(tmp_path):
 
 
 @pytest.mark.xfail(
-    strict=not WINDOWS,
+    not WINDOWS,
+    strict=True,
     reason=(
         "製品の不具合(軽微): 記録の pid が C の long に入らない（2^31 以上）と、POSIX の pid_alive の "
         "os.kill が "
         "OverflowError を出し、前回のポートが使用中なら起動が例外（トレースバック、終了コード 1）で落ちる。"
         "記録はアプリ本体が書くので、壊れたときか書き換えたときだけ。"
-        "Windows は ctypes が切り詰めるので落ちない"
+        "Windows は ctypes が切り詰めるので落ちない（PO の PC で 2 通りとも通った。10回目の検証で、"
+        "Windows では印を外した: docs/verification/A0-verifier-10.md）"
     ),
 )
 @pytest.mark.parametrize("pid", [2 ** 31, 10 ** 30])
