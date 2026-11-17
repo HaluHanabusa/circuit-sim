@@ -118,9 +118,28 @@ import os
 import socket
 
 import app_procs
+import pytest
 from test_app_cli import launch, no_process_left_behind, read_lines_until_url, run_to_end  # noqa: F401
 
 OUT = os.environ["A0V6_OUT"]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def last_resort():
+    """この実行の終わり（どの試験の見張りよりも後）に、まだ動いているものを控えてから、止める。
+
+    控え（left.txt）が空なら、実装者の部品と見張りが、すべて止めていた。止めるのは、起動したときの
+    持ち物（Popen）で（番号で止めない）。この試験が、PC にプロセスを残さないための最後の歯止め。"""
+    yield
+    left = [proc for proc in app_procs.STARTED if proc.poll() is None]
+    with open(os.path.join(OUT, "left.txt"), "w", encoding="utf-8") as f:
+        f.write("".join(f"{proc.pid}\n" for proc in left))
+    for proc in left:
+        try:
+            proc.kill()
+            proc.wait(timeout=20)
+        except Exception:
+            pass
 
 
 def note(name, pid):
@@ -240,16 +259,23 @@ def test_leaked_processes_are_stopped_and_their_tests_fail(tmp_path):
     - 途中で例外で抜けた、出力を待つ時間が切れた: 見張り（no_process_left_behind）が、試験の終わりに止めて、
       その試験をエラーにする
     - 残していない試験は、巻き添えにならない
-    Windows では、止める道は taskkill /F /T（tests/app_procs.py の kill_tree）。"""
+    Windows では、止める道は taskkill /F /T（tests/app_procs.py の kill_tree）。
+    「まだ動いているか」は、別の pytest の中で、起動したときの持ち物（Popen）で見る（プロセスの一覧に
+    頼らない。見つけたものは、その場で止める）。"""
     command, env, out = inner_run(tmp_path, LEAKING_TESTS)
     done = subprocess.run(command, cwd=tmp_path / "inner", env=env, capture_output=True, timeout=300,
                           stdin=subprocess.DEVNULL, check=False)
     text = (done.stdout + done.stderr).decode("utf-8", "replace")
     summary = text.strip().splitlines()[-1] if text.strip() else ""
     pids = {path.stem: int(path.read_text(encoding="utf-8")) for path in sorted(out.glob("*.pid"))}
-    left = {name: command for name, pid in pids.items() if (command := gone_or_killed(pid)) is not None}
     assert set(pids) == {"started", "middle", "timeout"}, (pids, text[-3000:])
-    assert not left, f"試験が残したアプリ本体が、試験の後も動いていた（止めた）: {left}\n{text[-3000:]}"
+    assert (out / "left.txt").exists(), "別の pytest が、終わりまで進まなかった:\n" + text[-3000:]
+    still = {int(line) for line in (out / "left.txt").read_text(encoding="utf-8").split()}
+    left = sorted(name for name, pid in pids.items() if pid in still)
+    assert not left and not still, (
+        f"試験が残したアプリ本体が、試験の見張りの後も動いていた（この試験が止めた）: {left or still}\n"
+        + text[-3000:]
+    )
     for wanted in ("3 failed", "1 passed", "2 errors"):
         assert re.search(rf"\b{wanted}\b", summary), (
             f"残した試験が、失敗になっていない（終わりの行: {summary!r}）\n{text[-3000:]}"
