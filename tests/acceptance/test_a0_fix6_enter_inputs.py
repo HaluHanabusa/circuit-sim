@@ -434,3 +434,54 @@ def test_app_keeps_running_and_invents_no_enter_when_the_input_gives_none(tmp_pa
         app.stop()
         if held is not None:
             held.close()
+
+
+# ------------------------------------------------------------ 5. 端末の文は、行ごとに混ざらない（軽微）
+
+
+class SlowTerminal:
+    """端末の身代わり: 書かれたものを順に控える。1回書くたびに少し待つ（その間に、ほかのスレッドが書ける）。
+
+    本物でも、書くたびに OS へ渡す出力（端末、PYTHONUNBUFFERED=1 や -u のパイプ）では、書いている間に
+    ほかのスレッドが動く。"""
+
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.chunks.append(text)
+        time.sleep(0.05)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "軽微（A0 の検証 6回目。22d2fdc からある）: 端末の文を出す say が、文と改行を別々に書くので、2つの"
+    "スレッド（止める知らせと、Enter の新しい URL など）の文が1行に混ざることがある"
+))
+def test_messages_from_two_threads_do_not_run_into_each_other(monkeypatch):
+    """端末の文は、2つのスレッドから同時に出ても、文ごとにまとまって出る（1行に混ざらない）。
+
+    アプリ本体は、主スレッド（止めるときの知らせ）、Enter を読むスレッド（新しい URL）、要求を受ける
+    スレッド（使い終わった URL の案内）、ブラウザを開くスレッド（開けなかった案内）から、端末に文を出す。
+    混ざると、たとえば「…もう一度 Ctrl+C を押してください。新しい URL（…）: http://…」と1行になり、
+    次の行が空になる（この環境の試験で、実際に出た。PYTHONUNBUFFERED=1 のとき）。
+    身代わりの端末で、片方が書いている最中に、もう片方が書く形を作る（待ちの長さは、順序を決めるため）。"""
+    from circuit_sim.app import cli  # noqa: PLC0415  製品の部品を、そのまま確かめる
+
+    terminal = SlowTerminal()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    first = threading.Thread(target=cli.say, args=("warning line 1\nwarning line 2",))
+    second = threading.Thread(target=cli.say, args=("new url line",))
+    first.start()
+    time.sleep(0.02)    # first が書いている最中に
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    monkeypatch.undo()
+    written = "".join(terminal.chunks)
+    assert sorted(written.splitlines()) == ["new url line", "warning line 1", "warning line 2"], (
+        f"2つのスレッドの文が混ざった: {written!r}"
+    )
