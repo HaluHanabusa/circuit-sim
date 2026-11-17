@@ -494,3 +494,46 @@ def test_messages_from_two_threads_do_not_run_into_each_other(monkeypatch):
     assert sorted(written.splitlines()) == ["new url line", "warning line 1", "warning line 2"], (
         f"2つのスレッドの文が混ざった: {written!r}"
     )
+
+
+# ------------------------------------------------------------ 6. 止めている最中は、ブラウザを開かない
+
+
+class StoppingServer:
+    """uvicorn のサーバーの身代わり（open_when_ready が見るのは、この2つだけ）。"""
+
+    def __init__(self, started: bool, should_exit: bool) -> None:
+        self.started = started
+        self.should_exit = should_exit
+
+
+def test_browser_is_not_opened_and_nothing_is_said_once_the_app_is_stopping(monkeypatch):
+    """受け付けを始める前に止められたら、ブラウザを開かない。開いた後に止められたら、案内を出さない。
+
+    止めると、転送用の HTML は消える（消えた場所をブラウザに開かせない）。止めた後の端末に、「ブラウザで
+    作業画面が開かないときは…」と、もう使えない URL を出さない。
+    実装者の試験からは、この確かめが消えている（レビュー 6回目の軽微2）。22d2fdc にも無かった。"""
+    from circuit_sim.app import cli  # noqa: PLC0415  製品の部品を、そのまま確かめる
+
+    opened: list[str] = []
+    said: list[str] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda target: opened.append(target) or True)
+    texts = cli.Texts("ja")
+    # 受け付けを始める前に、止められた
+    cli.open_when_ready(StoppingServer(started=False, should_exit=True), "file:///x/open-1.html",
+                        "http://127.0.0.1:1/?k=n", said.append, texts, lambda: False, wait=0.3)
+    assert opened == [] and said == [], (opened, said)
+    # 開いた後、番号が使われないまま、止められた
+    server = StoppingServer(started=True, should_exit=False)
+
+    def used() -> bool:
+        server.should_exit = True   # 番号が使われたかを見ている間に、止められる
+        return False
+
+    cli.open_when_ready(server, "file:///x/open-2.html", "http://127.0.0.1:1/?k=n", said.append, texts,
+                        used, wait=0.3)
+    assert opened == ["file:///x/open-2.html"] and said == [], (opened, said)
+    # 対照: 止められていなければ、開いて、番号が使われないときは案内を出す
+    cli.open_when_ready(StoppingServer(started=True, should_exit=False), "file:///x/open-3.html",
+                        "http://127.0.0.1:1/?k=n", said.append, texts, lambda: False, wait=0.3)
+    assert opened[-1] == "file:///x/open-3.html" and len(said) == 1 and "http://127.0.0.1:1/?k=n" in said[0]

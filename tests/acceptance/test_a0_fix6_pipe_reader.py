@@ -172,16 +172,20 @@ def posix_arrived(fd: int) -> int:
 
 def posix_stand_in(fd: int):
     """windows_pipe_ready の身代わり（POSIX）。約束は同じ: 届いた量、届いていなければ 0、空で書く側が
-    閉じていたら None。"""
+    閉じていたら None。
+
+    先に「書く側が閉じたか」を見てから、量を見る（閉じた後に届くものは無いので、閉じていて量が 0 なら、
+    確かに終わり）。逆の順だと、量を見た後・閉じたかを見る前に「書いて、閉じる」が挟まったとき、届いた分を
+    残したまま終わりと答えてしまう（レビュー 6回目の軽微1 が、実装者の身代わりで指摘した競合）。"""
     import select
 
     def ready() -> int | None:
-        count = posix_arrived(fd)
-        if count:
-            return count
         poller = select.poll()
         poller.register(fd, select.POLLIN)
         closed = any(event & select.POLLHUP for _, event in poller.poll(0))
+        count = posix_arrived(fd)
+        if count:
+            return count
         return None if closed else 0
 
     return ready
@@ -588,12 +592,13 @@ def stand_in(fd):
         state["checks"] += 1
         if state["checks"] == 1:
             log("checked")
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        closed = any(event & select.POLLHUP for _, event in poller.poll(0))  # 先に見る（量は、その後）
         count = arrived(fd)
         if count:
             return count
-        poller = select.poll()
-        poller.register(fd, select.POLLIN)
-        if any(event & select.POLLHUP for _, event in poller.poll(0)):
+        if closed:
             log("closed")
             return None
         return 0
