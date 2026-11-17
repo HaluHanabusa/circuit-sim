@@ -31,3 +31,11 @@ D-058 に従い、前の作業単位で出た軽微と注意を、A1（スコー
 17. 受け入れ試験 `test_a0_fix8_procs_browser.py` 75〜85: `OPEN_FIRST` が、BROWSER が候補の先頭かを確かめる前に開く。
 18. 受け入れ試験 `test_a0_fix5_watch.py` 591〜595: Linux 以外では止めない後始末（落ちたとき最大 120 秒残る）。
 19. 受け入れ試験 `test_a0_fix9_kill_windows.py` 106〜108: 写しが名前空間だけを差し替えている（部品が補助関数経由で送ると、本物の os.kill に届く）。ファイル名（中身は POSIX だけ）と試験名 `..._before_the_final_loop` を中身に合わせる。`test_a0_fix8_procs_browser.py` の「b3c5b73 で直った」は 7e00e21。
+
+## A0 の UX 確認（5回目）から
+
+20. **A0d で行う**: 設計書 `app-design.md` 8.5（PO が手で確かめる項目）の書き直し。保存していない変更を作る手段（別の窓から `/api/session` に `dirty: true` を送る1行）、準備の手順（版の確かめ、`pip install -e .`）、Ctrl+Break の押し方（Fn の組み合わせ、届かなかったときの扱い）、起動し直しで最大 5 秒黙ること、BROWSER の行の後始末（`del opened.txt`、`set BROWSER=`、15 秒後の案内は正しい動き）、Git Bash の見分け方（`stat.S_ISFIFO`、`python.exe`、文字化けの見込み、見る物）、窓を閉じたときの見方（次の起動のポート）、番号つきの順序と記録の渡し方。PO の手の確認は、A0d の Windows の確認のときに行う。
+21. 起動し直すと、画面が送り直す作業の状態がいつも「保存済み」になる（`App.tsx` の `putSession(docRef.current, false)`）。値を直せるようになると、起動し直した後の Ctrl+C が知らせずに止まる。画面が保存していない印も送り直す。
+22. Git Bash（パイプ）での日本語の文字化け（見込み）。8.5 の結果で確かめ、化けるならパイプへ出す文字コードの扱いを決める。
+23. 画面仕様に端末の節を作る: 止め方は「Ctrl+C（Windows の Ctrl+Break も同じ）」、Enter への反応、続けて届いた Enter を1回と数える。`screens-v0.1.md` 14章 #11（窓を閉じたときは知らせない）を Windows の実態に合わせて書き直す。
+24. `app-design.md` の冒頭の「最終更新」と責任者の記載を、8章の追記に合わせる。4回目の UX 確認の改善1〜4（起動し直しの黙った待ちなど）は未対応のまま。
