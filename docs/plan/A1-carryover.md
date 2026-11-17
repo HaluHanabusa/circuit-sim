@@ -17,3 +17,17 @@ D-058 に従い、前の作業単位で出た軽微と注意を、A1（スコー
 8. 止め終えた後、プロセスが終わるまでの間に2回目の合図（Ctrl+C、Ctrl+Break）が届くと、「止めました」は出るが終了コードが 0 にならない。
 9. Windows で端末の窓を閉じたとき、保存していない変更の知らせを人が読めず、後始末まで進むとは限らない（未確認）。
 10. A0 の UX 確認で「A1 の仕様で書く」とした項目（画面仕様第2版の未決28）。D-064 の (1): 起動コードの説明をそろえる。
+
+## A0 の Windows の修正から（レビュー 9・10回目、検証 9回目。試験の部品と受け入れ試験の軽微）
+
+製品の誤りではない。試験の道具の安全と、試験の名前の整理。
+
+11. `tests/app_procs.py` 209〜212・224〜227: `except OSError` と `stopped.remove` の間に Ctrl+C が入ると、一時停止に失敗した番号へ SIGKILL を送ることがある。案: `kill_posix_tree` の間だけ SIGINT を控えて後で出す。
+12. `tests/app_procs.py` 231〜237: `os.kill` の中で、SIGKILL を送る前に例外が出ると（監査フックの中の Ctrl+C）、その 1 つが一時停止のまま残る。部品の説明と食い違う。案: `except BaseException` の中で、その番号にもう一度 SIGKILL。
+13. `tests/app_procs.py` 229〜239: SIGKILL の段で出た 2 つ目以降の例外は捨てられる。説明の「最初の例外」の範囲を一言。試験は最初と最後のどちらを出し直すかを見分けない。
+14. 受け入れ試験 `test_a0_fix7_procs.py` 367〜373: 後始末の gate が、空いた番号も許したまま。
+15. 受け入れ試験 `test_a0_fix7_procs.py` 316〜327: `start_tree` で落ちると木が最大 120 秒残る。
+16. 受け入れ試験 `test_a0_fix5_enter_break.py` 181〜189: Windows で、印の確かめ（PowerShell の一覧）から送るまでの間に番号の使い回しの窓。
+17. 受け入れ試験 `test_a0_fix8_procs_browser.py` 75〜85: `OPEN_FIRST` が、BROWSER が候補の先頭かを確かめる前に開く。
+18. 受け入れ試験 `test_a0_fix5_watch.py` 591〜595: Linux 以外では止めない後始末（落ちたとき最大 120 秒残る）。
+19. 受け入れ試験 `test_a0_fix9_kill_windows.py` 106〜108: 写しが名前空間だけを差し替えている（部品が補助関数経由で送ると、本物の os.kill に届く）。ファイル名（中身は POSIX だけ）と試験名 `..._before_the_final_loop` を中身に合わせる。`test_a0_fix8_procs_browser.py` の「b3c5b73 で直った」は 7e00e21。
