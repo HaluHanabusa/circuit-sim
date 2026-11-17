@@ -9,9 +9,10 @@
 2. わざと残す試験を、実装者の部品と見張りで流す（別の pytest）。残したプロセスは止まり、残した試験は
    失敗になる: 「起動に失敗して終わるはず」が起動に成功した（PO の PC で起きた形）、途中で例外で抜けた、
    出力を待つ時間が切れた。Windows でも流れる（taskkill /T の道が、ここで初めて流れる）。
-3. 軽微（xfail）: ハーネス（scripts/cycle.py の kill_tree。scripts/local_ci.py が、時間切れと中断で使う）が
-   確認をまとまりごと止めたとき、実装者の部品で起動したアプリ本体が残る（POSIX）。部品が、起動するものを
-   新しいまとまり（start_new_session）に入れるため。22d2fdc の起動（そのままの Popen）では残らない。
+3. ハーネス（scripts/cycle.py の kill_tree。scripts/local_ci.py が、時間切れと中断で使う）が確認を
+   まとまりごと止めたとき、実装者の部品で起動したアプリ本体も止まる（POSIX）。6回目の検証では残った
+   （部品が、起動するものを新しいまとまりに入れていた。xfail(strict) にしていた）。91213f3 で直り、
+   7回目の検証（docs/verification/A0-verifier-7.md）で印を外した。
 
 受け入れ試験は、実装者の試験の部品を「確かめる対象」として使う（頼って何かを確かめるのではない）。
 """
@@ -293,10 +294,6 @@ def load_harness():
 
 
 @pytest.mark.skipif(WINDOWS, reason="POSIX のプロセスのまとまりの話。Windows は taskkill /T が親子をたどる")
-@pytest.mark.xfail(strict=True, reason=(
-    "軽微（A0 の検証 6回目の問題）: tests/app_procs.py の spawn が、起動するものを新しいまとまり"
-    "（start_new_session）に入れるので、ハーネスが確認をまとまりごと止めても、アプリ本体が残る"
-))
 def test_apps_started_by_the_app_tests_die_when_the_harness_kills_the_check(tmp_path):
     """ハーネスが確認（pytest）を止めたら、その試験が起動したアプリ本体も止まる（POSIX）。
 
