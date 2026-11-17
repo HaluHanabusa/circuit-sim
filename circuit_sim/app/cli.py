@@ -31,7 +31,8 @@ Windows で端末の窓を閉じたとき（ログオフ、シャットダウン
 端末の Enter は、起動の直後から読む（ブラウザを開く呼び出しが戻るのを待たない）。Windows で標準入力が
 パイプのときは、待たない読み方をする（watch_enter。届いている量を調べて、届いた分だけ読む）。
 パイプを読んで待っていると、同じパイプを標準入力に受け継いだプログラム（環境変数 BROWSER のコマンドなど）が
-始まれないため（実機で確かめた。docs/design/app-design.md の 8.3）。
+始まれないため（実機で確かめた。docs/design/app-design.md の 8.3）。待たない読み方でも残る制限（受け継いだ
+側が標準入力を読むとき、端末（コンソール）のとき、など）は、watch_enter と 8.3 に書く。
 
 端末に出す文言は、OS の言語で日本語か英語にする（LC_ALL、LC_MESSAGES、LANG の順。無ければ Windows の
 表示言語。ja で始まれば日本語）。
@@ -494,19 +495,30 @@ PIPE_ENDED = frozenset({ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED})
 
 
 def windows_pipe_ready(fd: int) -> Callable[[], int | None]:
-    """Windows: パイプ fd に届いているバイト数を、読まずに・待たずに調べる関数を作る。
+    """Windows: パイプ fd に届いているバイト数を、読まずに調べる関数を作る。
 
     作った関数は、届いているバイト数（届いていなければ 0）を返す。書く側が閉じていれば None。パイプとして
     調べられない入力なら OSError。
 
     調べ方は PeekNamedPipe(ハンドル, NULL, 0, NULL, &届いている量, NULL)（Microsoft の文書 PeekNamedPipe:
     名前付きパイプにも、無名パイプの読む側にも使える。バッファを渡さなければ読まない。成功は 0 でない値、
-    失敗は 0 で、理由は GetLastError）。CPython の _winapi.PeekNamedPipe も、同じ形で呼ぶ。
+    失敗は 0 で、理由は GetLastError。量の受け取り先と 6 番目（このメッセージの残り）は NULL でよい）。
+    CPython の _winapi.PeekNamedPipe も、バッファを渡さない形で呼ぶ。違うのは 6 番目だけで、CPython は
+    受け取り先を渡す（PeekNamedPipe(handle, NULL, 0, NULL, &navail, &nleft)）。
+
+    待つか: 文書は「1つのスレッドのアプリケーションでは、いつもすぐ戻る」とし、注記で「複数のスレッドの
+    アプリケーションで、同期のハンドルに使うと、ほかの入出力と同じように待つことがある」と書く。だから、
+    すぐ戻るのは、同じハンドル（同じパイプ）をほかに読んでいるものが無いときだけ:
+    - この関数は、Enter を読むスレッド（watch_enter）の中だけで呼ぶ。ほかのスレッドから呼ばない
+    - 標準入力を受け継いだ別のプログラム（BROWSER のコマンドなど）が標準入力を読んで待っていると、この
+      調べも、その読み取りが終わるまで待つ見込み（受け継いだハンドルは、同じパイプの操作を共有する。
+      実機では確かめていない。docs/design/app-design.md の 8.3）
 
     なぜ待たない読み方が要るか: Windows の同期のハンドルは、操作を1つずつしか通さない。アプリ本体が
     標準入力のパイプを読んで待っている間は、そのパイプを標準入力に受け継いだプログラム（標準入力を
     差し替えずに起動されるもの。webbrowser がコマンドで起動するブラウザなど）が、起動のときに標準入力を
-    調べる所で止まる（実機で確かめた。docs/design/app-design.md の 8.3）。調べるだけなら、待ちは残らない。"""
+    調べる所で止まる（実機で確かめた。docs/design/app-design.md の 8.3）。調べる呼び出しは、上の場合を
+    除いてすぐ戻るので、読み取りの待ちをパイプに残さない。"""
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -537,10 +549,23 @@ def watch_enter(on_enter: Callable[[], None], source: str, fd: int = 0,
     読み方は入力で決まる:
     - Windows のパイプ: 待たない読み方。届いている量を調べ（ready。省くと windows_pipe_ready）、届いた分だけ
       読む。届いていなければ PIPE_POLL_SECONDS 眠る（stop が立てば、すぐ抜ける）。書く側が閉じたら終わる。
-      読み取りの待ちをパイプに残さないので、アプリ本体が起動するプログラムを止めない
-    - 端末（どの OS でも）と、Windows でない OS のパイプ: 待つ読み方（os.read が戻るまで待つ）
+      ほかに同じパイプを読むものが無ければ、読み取りの待ちをパイプに残さないので、アプリ本体が起動する
+      プログラムを止めない
+    - 端末（どの OS でも。Windows のコンソールも）と、Windows でない OS のパイプ: 待つ読み方（os.read が
+      戻るまで待つ）。Windows のコンソールで BROWSER にコマンドを指定したとき、そのコマンドが始まれるかは、
+      実機で確かめていない（docs/design/app-design.md の 8.3）
     ready を渡すと、どの入力でも待たない読み方にする（試験が、Windows でない OS でこの道を流すため）。
-    パイプとして調べられない入力（ready が OSError）は、待つ読み方に戻す。"""
+    パイプとして調べられない入力（ready が OSError）と、調べる用意ができないとき（windows_pipe_ready が
+    失敗する）は、待つ読み方に戻す。
+
+    待たない読み方に残る制限（docs/design/app-design.md の 8.3）:
+    - 調べる（ready）のも読む（os.read）のも、このスレッドだけ。ほかのスレッドから ready を呼ばない
+    - 標準入力を受け継いだ別のプログラムが標準入力を読むと、Enter はそちらが取る。そのプログラムが読んで
+      待っている間は、調べる呼び出しも待つ見込みで、その間 Enter は効かない
+    - 調べてから読むまでの間に、別の読み手が届いた分を先に取ると、os.read は次に届くまで待つ
+    - 眠り（PIPE_POLL_SECONDS）の間に続けて届いた Enter は、1回の読み取りに入り、1回と数える
+    - Windows で端末がパイプに見える環境（Git Bash の mintty など）では、人が打つ Enter もこの道を通る
+      見込み（確かめていない）"""
     stop = stop if stop is not None else threading.Event()
     if source == "tty" and not WINDOWS:
         # 後でバックグラウンドへ回されても止められず、読み取りが失敗して終わるように
@@ -664,7 +689,10 @@ def open_when_ready(server: uvicorn.Server, target: str, url: str, say: Callable
 
     webbrowser.open は、コマンドで起動するブラウザ（環境変数 BROWSER の指定など）が終わるまで戻らない
     ことがある（Python が名前を知らないコマンドは、終わりを待つ）。その間も、端末の Enter は効く
-    （Enter は別のスレッドが、起動の直後から読んでいる）。"""
+    （Enter は別のスレッドが、起動の直後から読んでいる）。ただし、そのコマンドが標準入力を読むときは、
+    Enter はコマンドの方が取る（watch_enter の制限）。
+
+    止めている最中（server.should_exit）は、ブラウザを開かない。開いた後に止められたら、案内を出さない。"""
     while not server.started and not server.should_exit:
         time.sleep(0.02)
     if server.should_exit:
