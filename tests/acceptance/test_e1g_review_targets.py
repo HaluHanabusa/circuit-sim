@@ -1,7 +1,7 @@
 """E1g の独立検証: レビュー（1回目）の指摘と D-075 を受けて、直した後に満たすべきことの的。
 
-E1g の実装 d9e5040 では、この試験の一部が落ちる（落ちるのが正しい。xfail の印は付けない）。直した後に、
-全部が通ること。
+E1g の実装 d9e5040 では、この試験の一部が落ちた（落ちるのが正しい。xfail の印は付けなかった）。差し戻しの
+直し 48def1c で、全部が通る。
 
   的1（レビューの中1）  制御周期が長い回路で、進み具合が、時間ステップの終わる前に 0.99 以上にならない。
                         知らせの間隔が 0.2 秒以内。
@@ -12,11 +12,11 @@ E1g の実装 d9e5040 では、この試験の一部が落ちる（落ちるの�
   的3（レビューの軽2）  極端な値の回路で、発散の大きさの見積もりが番号の無い例外を出さない。
   的4（レビューの軽3）  値があふれるほど発散しても、警告（RuntimeWarning）を出さず、発散のエラーを返す。
 
-決まっていない点の扱い（決まったら、この試験を締める）:
-  - 注意のファイルの名前: D-075 は <CSV の名前>.notes.txt。CSV が out.csv のとき、out.csv.notes.txt と
-    out.notes.txt のどちらとも読める。ここでは、同じフォルダに、CSV の名前（拡張子を除く）で始まり
-    .notes.txt で終わるファイルが、ちょうど 1 つあることを確かめる。
-  - Result.to_csv の改行の引数の名前: newline、lineterminator、line_terminator、line_ending、eol のどれか。
+2回目の検証（2026-11-17、検証役。オーケストレーターの依頼による書き換え）で変えたこと:
+  - D-076 で決まった名前に締めた。注意のファイルは <CSV のファイル名>.notes.txt ちょうど（out.csv なら
+    out.csv.notes.txt）。Result.to_csv の改行の引数は newline。1回目は、決まる前だったので、どちらの読み方でも
+    通る形にしていた（out.notes.txt も、lineterminator なども通った）。
+  - 「済みうる計算」の丸めを直した（下の check_against_work）。確かめる中身は弱めていない。
 """
 from __future__ import annotations
 
@@ -44,6 +44,20 @@ LIMIT_S = 0.2
 q = hp.q
 
 # ------------------------------------------------------------------ 的1: 制御周期が長い回路の進み具合
+
+def check_against_work(seen):
+    """hp.check_progress_against_work に渡す前に、「済みうる計算」の丸めを直す。
+
+    済みうる計算は (制御器が最後に呼ばれた時刻 + 2·制御周期) / 終了時刻 で見積もる。時間ステップが済んだ
+    ときに、これが丸めで 1 にわずかに届かない組み合わせがある（制御周期 0.2 s × 3、h = 1e-6 s:
+    (200000·1e-6 + 0.4) / (3·0.2) = 0.9999999999999998）。そのとき、時間ステップの終わりの値 0.99 が
+    「時間ステップが済む前の 0.99」と誤って判定される。直しの後は、その値が知らせを間引く時刻しだいで届く
+    ので、試験が 10 回に 1 回ほど落ちた（製品の誤りではなく、この試験の見積もりの丸め）。
+    1 との差が 1e-9 以下なら 1 とみなす（見積もりの刻みは 1 制御周期 = 0.2 以上なので、取り違えない）。
+    """
+    snapped = [(fraction, 1.0 if done > 1.0 - 1e-9 else done) for fraction, done in seen]
+    hp.check_progress_against_work(snapped)
+
 
 
 def sample_with_slow_control(t_end=50e-3):
@@ -79,7 +93,7 @@ def test_progress_and_its_intervals_with_a_long_control_period_template():
     worst = []
     for _ in range(3):
         seen, gap = hp.watch_with_work(lambda p: ex.run(progress=p), pid, 1e-2, ex.t_end)
-        hp.check_progress_against_work(seen)
+        check_against_work(seen)
         worst.append(gap)
         if gap <= LIMIT_S:
             break
@@ -92,7 +106,7 @@ def test_progress_and_its_intervals_with_a_long_control_period_engine():
     for _ in range(3):
         run, ctl, period, t_end = slow_engine_case(5)
         seen, gap = hp.watch_with_work(run, ctl, period, t_end)
-        hp.check_progress_against_work(seen)
+        check_against_work(seen)
         worst.append(gap)
         if gap <= LIMIT_S:
             break
@@ -108,7 +122,7 @@ def test_progress_does_not_jump_ahead_when_the_controller_takes_time_template():
     pid = next(c for c in ex.controllers if c.inputs)
     seen, _ = hp.watch_with_work(lambda p: ex.run(progress=p), pid, 1e-2, ex.t_end, delay=0.06)
     assert len(seen) >= 5
-    hp.check_progress_against_work(seen)
+    check_against_work(seen)
 
 
 def test_progress_does_not_jump_ahead_when_the_controller_takes_time_engine():
@@ -116,7 +130,7 @@ def test_progress_does_not_jump_ahead_when_the_controller_takes_time_engine():
     run, ctl, period, t_end = slow_engine_case(3)
     seen, _ = hp.watch_with_work(run, ctl, period, t_end, delay=0.06)
     assert len(seen) >= 5
-    hp.check_progress_against_work(seen)
+    check_against_work(seen)
 
 
 def test_progress_never_runs_ahead_when_the_setup_block_is_small():
@@ -129,7 +143,7 @@ def test_progress_never_runs_ahead_when_the_setup_block_is_small():
             lambda p: simulate(commanded_rc(), n_periods * period, h, controllers=[ctl], progress=p),
             ctl, period, n_periods * period)
     assert len(seen) >= 5
-    hp.check_progress_against_work(seen)
+    check_against_work(seen)
 
 
 # ------------------------------------------------------------------ 的2: CSV の形（D-075）
@@ -145,9 +159,13 @@ def run_cli(tmp_path, spec: Spec, capsys, name="out.csv"):
 
 
 def notes_files(csv_path: Path) -> list[Path]:
-    stem = csv_path.name.rsplit(".", 1)[0]
-    return sorted(p for p in csv_path.parent.iterdir()
-                  if p.name.startswith(stem) and p.name.endswith(".notes.txt"))
+    """同じフォルダにある、.notes.txt で終わるファイルの全部（D-076 の名前のもの 1 つだけのはず）。"""
+    return sorted(p for p in csv_path.parent.iterdir() if p.name.endswith(".notes.txt"))
+
+
+def notes_file_of(csv_path: Path) -> Path:
+    """D-076 の名前: CSV のファイル名の後ろに .notes.txt（拡張子を取り替えない）。"""
+    return csv_path.with_name(csv_path.name + ".notes.txt")
 
 
 SPEC_WITH_NOTES = lambda: hp.buck_spec("average", sim={"t_end": 3e-4})          # noqa: E731
@@ -183,7 +201,8 @@ def test_cli_writes_the_notes_next_to_the_csv_with_codes(tmp_path, capsys):
     res = expand(spec).run()
     target, out = run_cli(tmp_path, spec, capsys)
     found = notes_files(target)
-    assert len(found) == 1, [p.name for p in tmp_path.iterdir()]
+    assert found == [notes_file_of(target)], [p.name for p in tmp_path.iterdir()]    # out.csv.notes.txt だけ
+    assert found[0].name == "out.csv.notes.txt"
     lines = [line for line in found[0].read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == len(res.notes)                           # 1 行 1 件
     for line, note in zip(lines, res.notes, strict=True):
@@ -214,9 +233,6 @@ def test_cli_without_csv_writes_no_file(tmp_path, capsys):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["spec.json"]
 
 
-NEWLINE_NAMES = ("newline", "lineterminator", "line_terminator", "line_ending", "eol")
-
-
 def test_to_csv_never_writes_note_rows_and_lets_the_caller_choose_the_line_ending(tmp_path):
     res = expand(SPEC_WITH_NOTES()).run()
     assert res.notes
@@ -224,10 +240,9 @@ def test_to_csv_never_writes_note_rows_and_lets_the_caller_choose_the_line_endin
     res.to_csv(tmp_path / "default.csv", ["v(out)"], units=True)
     raw = (tmp_path / "default.csv").read_bytes()
     assert raw.count(b"\r\n") == 1 + len(res.t) == raw.count(b"\n") and b"#" not in raw
-    # 改行を選ぶ引数
-    names = [name for name in inspect.signature(Result.to_csv).parameters if name in NEWLINE_NAMES]
-    assert len(names) == 1, f"to_csv に、改行を選ぶ引数が無い（{NEWLINE_NAMES} のどれか）"
-    res.to_csv(tmp_path / "lf.csv", ["v(out)"], units=True, **{names[0]: "\n"})
+    # 改行を選ぶ引数の名前は newline（D-076）。既定は CR LF
+    assert inspect.signature(Result.to_csv).parameters["newline"].default == "\r\n"
+    res.to_csv(tmp_path / "lf.csv", ["v(out)"], units=True, newline="\n")
     raw_lf = (tmp_path / "lf.csv").read_bytes()
     assert b"\r" not in raw_lf and raw_lf.count(b"\n") == 1 + len(res.t)
     assert raw_lf == raw.replace(b"\r\n", b"\n")                  # 中身は同じで、改行だけが違う
