@@ -232,8 +232,8 @@ class FakeTree:
     """一覧（children_table）と os.kill の身代わり。合図は控えるだけで、本当には送らない。
 
     interrupt: ("table", n) は n 回目の一覧で、("stop", n) は n 回目の SIGSTOP を届けた後に、
-    ("kill", n) は n 回目の SIGKILL を届けた後に、Interrupted を出す。gone は、一時停止の前に終わっていた
-    番号（ESRCH）。"""
+    ("kill", n) は n 回目の SIGKILL を届けた後に、Interrupted を出す。gone は、一覧に載った後、一時停止の
+    前に終わって受け取られていた番号（一覧には載るが、合図は ESRCH）。"""
 
     def __init__(self, interrupt: tuple[str, int] | None = None, gone: frozenset[int] = frozenset()) -> None:
         self.state = {pid: "S" for pid in (FAKE_ROOT, FAKE_A, FAKE_B, FAKE_C)}
@@ -250,7 +250,7 @@ class FakeTree:
     def table(self) -> dict[int, list[int]]:
         self.events.append(("table",))
         self._maybe_interrupt("table")
-        return {parent: [c for c in children if self.state[c] != "dead" and c not in self.gone]
+        return {parent: [c for c in children if self.state[c] != "dead"]
                 for parent, children in FAKE_TREE.items() if self.state[parent] != "dead"}
 
     def kill(self, pid: int, sig: int) -> None:
@@ -339,7 +339,11 @@ def test_kill_posix_tree_stops_first_and_kills_only_what_it_stopped_children_fir
     assert kills and min(kills) > max(stops), ("一時停止が済む前に SIGKILL を送った", events)
     killed = [events[i][1] for i in kills]
     assert sorted(killed) == sorted(stopped), ("一時停止したものだけに SIGKILL を送っていない", events)
-    assert not set(gone) & set(killed), ("一時停止が失敗した番号に SIGKILL を送った", events)
+    tried_on_gone = [e for e in events if e[0] == "missing" and e[2] == signal.SIGKILL]
+    assert not tried_on_gone, ("一時停止が失敗した番号に、SIGKILL を送ろうとした", events)
+    if gone:
+        assert ("missing", FAKE_C, signal.SIGSTOP) in events, (
+            "終わっていた孫を、一時停止しようとしていない", events)
     for pid in killed:
         parent = next((p for p, children in FAKE_TREE.items() if pid in children), None)
         if parent in killed:
