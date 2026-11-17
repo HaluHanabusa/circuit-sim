@@ -1537,7 +1537,12 @@ def test_ctrl_c_on_a_terminal_stops_and_enter_still_works_after_a_warning(tmp_pa
     """端末で Ctrl+C を押して止める道（端末が、前にいるプロセスへ SIGINT を送る）。
 
     保存していない変更があれば、1回目は知らせて止めない。その後も Enter は効く。2回目で止まり、
-    「止めました」を出して、終了コード 0 で終わる。"""
+    「止めました」を出して、終了コード 0 で終わる。
+
+    知らせは 2 行の文。Enter は、2 行目（と、その終わりの改行）が出てから送る。製品は、文と改行を別々に
+    書く（print）。出力をためない設定（PYTHONUNBUFFERED=1、-u）では、1 行目を見てすぐ Enter を送ると、
+    知らせの終わりの改行より先に、Enter を読むスレッドの新しい URL が出て、知らせの 2 行目の後ろに1行で
+    続くことがある（「新しい URL」で始まる行にならない。40 回に 3〜5 回。検証 6回目の問題1）。"""
     proc, master = launch_on_a_tty(tmp_path)
     try:
         url, _ = read_lines_until_url(proc)
@@ -1547,6 +1552,7 @@ def test_ctrl_c_on_a_terminal_stops_and_enter_still_works_after_a_warning(tmp_pa
         client.json("api/session", {"doc": doc, "dirty": True}, "PUT")
         os.write(master, b"\x03")  # Ctrl+C
         assert "mine.json" in proc.wait_line("保存していない変更があります", timeout=5)
+        proc.wait_line("保存せずに止めるには", contains="もう一度 Ctrl+C を押してください", timeout=5)
         os.write(master, b"\n")
         assert URL_RE.search(proc.wait_line("新しい URL", timeout=5)).group(0) != url
         os.write(master, b"\x03")
