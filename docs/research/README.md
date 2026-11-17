@@ -12,6 +12,7 @@
 ライセンスの判定は3段階（○ 明確に緩い / △ 緩いが同梱物や依存に一覧の外のライセンスが混ざる / × 使えない）。△ の扱いは PO の判断待ち。
 
 | `vendor-tools.md` | 半導体メーカーの無料の設計ツール（LTpowerCAD、WEBENCH、DCDT、ST-WDS ほか）と v0.1 の比較 | 調査担当 | 2026-11-17 |
+| `pear-sim.md` | PEAR-sim（Apache-2.0）と Pulsim（MIT＋Eigen）の判定と、circuit-sim にとっての意味。前回の調査の見落としの訂正 | 調査担当 | 2026-11-17 |
 
 4つの検討をまとめた提案は `docs/plan/direction-proposal.md`。
 
