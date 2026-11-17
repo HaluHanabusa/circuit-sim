@@ -182,7 +182,7 @@
 
 | モジュール | 責務 | 公開する主なもの | 状態 |
 |---|---|---|---|
-| `__init__.py`、`__main__.py` | 公開する名前をまとめる。計算のコマンドライン | `main` | 実装済み |
+| `__init__.py`、`__main__.py` | 公開する名前をまとめる。計算のコマンドライン（要約の表示、CSV と注意のファイルの書き出し） | `main`、`notes_path` | 実装済み |
 | `ir.py` | 層A と層B の形と、形だけで分かる検証（素子の値が正、節点の重複、基準節点） | `Spec`、`Quantity`、`SimulationSettings`、`Netlist`、`Component`、`DC`、`Step`、`Sine`、`SCHEMA_VERSION`、`Command`、`SUPPORTED_SCHEMA_VERSIONS` | 実装済み |
 | `units.py` | 単位の文字列を（次元、10 の指数）に分け、SI に換算する | `parse_unit`、`to_si`、`UnitError` | 実装済み |
 | `mna.py` | 行列の組み立て。スイッチング状態ごとのコンダクタンス | `build_system`、`System`、`state_conductance`、`CircuitError` | 実装済み |
