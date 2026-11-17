@@ -428,7 +428,7 @@ def test_c14_slowly_decaying_oscillation_shortens_the_default_time_and_says_so()
     period = 2 * math.pi * math.sqrt(1e-3 * 10e-6)
     assert len(res.t) - 1 == DEFAULT_STEP_BUDGET
     assert period / ex.h == pytest.approx(200, rel=0.01)                  # 振動は 1 周期 200 点のまま
-    short = [n for n in ex.notes if "計算時間" in n]
+    short = [n for n in ex.notes if "終了時刻" in n]   # E1g（D-063）: 「計算時間」→「終了時刻」
     assert len(short) == 1 and "simulation.t_end" in short[0] and "減衰が遅い" in short[0]
     v, _ = rlc_exact(res.t, 10.0, 0.01, 1e-3, 10e-6)
     assert max_err(res["v(out)"][:2001], v[:2001], 10.0) < TOL             # 最初の 10 周期は 1% 以内

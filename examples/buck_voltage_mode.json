@@ -1,0 +1,24 @@
+{
+  "schema_version": "0.2",
+  "template": "buck_voltage_mode",
+  "plant": {
+    "Vin": {"value": 24, "unit": "V", "source": "手入力"},
+    "L": {"value": 47, "unit": "uH", "source": "手入力"},
+    "C": {"value": 100, "unit": "uF", "source": "手入力"},
+    "R_load": {"value": 6, "unit": "ohm", "source": "手入力"}
+  },
+  "control": {
+    "f_sw": {"value": 100, "unit": "kHz", "source": "手入力"},
+    "f_ctrl": {"value": 100, "unit": "kHz", "source": "手入力"},
+    "Vref": {"value": 12, "unit": "V", "source": "手入力"},
+    "Kp": {"value": 0.0117, "unit": "1/V", "source": "手入力"},
+    "Ki": {"value": 147, "unit": "1/(V·s)", "source": "手入力"},
+    "Kd": {"value": 2.74e-6, "unit": "s/V", "source": "手入力"},
+    "Tf": {"value": 2.5, "unit": "us", "source": "手入力"},
+    "d_min": {"value": 0, "unit": "1", "source": "手入力"},
+    "d_max": {"value": 0.9, "unit": "1", "source": "手入力"}
+  },
+  "targets": {},
+  "simulation": {"fidelity": "switching"},
+  "missing": []
+}

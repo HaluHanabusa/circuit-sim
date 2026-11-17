@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.linalg import LinAlgWarning, lu_factor, lu_solve, null_space
 
+from .messages import Message, Value
 from .mna import CircuitError
 
 DAMPING_SUBSTEPS = 1024   # 減衰ステップ1つを、この数の後退オイラーに刻む（2 のべき）
@@ -83,9 +84,9 @@ def _solve_or_raise(M: np.ndarray, rhs: list[np.ndarray], h: float) -> list[np.n
             lu = lu_factor(M)
             out = [lu_solve(lu, r) for r in rhs]
         except (LinAlgWarning, np.linalg.LinAlgError, ValueError) as exc:
-            raise CircuitError(f"時間刻み h={h} で行列が解けない: {exc}") from exc
+            raise CircuitError(Message("MATRIX_SINGULAR_DETAIL", h=Value(h, "s"), detail=str(exc))) from exc
     if not all(np.isfinite(r).all() for r in out):
-        raise CircuitError(f"時間刻み h={h} で行列が解けない")
+        raise CircuitError(Message("MATRIX_SINGULAR", h=Value(h, "s")))
     return out
 
 
@@ -103,10 +104,7 @@ def consistent_maps(E: np.ndarray, G: np.ndarray, B: np.ndarray) -> tuple[np.nda
     dE, dA = _row_scale(E), _row_scale(A_alg)
     S = np.vstack([dE[:, None] * E, dA[:, None] * A_alg])
     if np.linalg.matrix_rank(S) < n:
-        error = CircuitError(
-            "回路が一意に解けない。基準節点から浮いた部分、電圧源だけのループ、"
-            "電圧源とコンデンサの直結、電流源とインダクタの直列、インダクタどうしの直列などが無いか確認する"
-        )
+        error = CircuitError(Message("CIRCUIT_UNSOLVABLE"))
         # 決まらない方向（S の零空間）に成分を持つ未知数を、原因の手がかりとして添える
         _, sv, vt = np.linalg.svd(S)
         free = vt[np.sum(sv > sv.max() * max(S.shape) * np.finfo(float).eps):]
@@ -152,7 +150,7 @@ def prepare(
     Qd_end = M[:n, n + n_u:] / DAMPING_SUBSTEPS
     Qd_start = M[:n, n:n + n_u] - Qd_end
     if not (np.isfinite(Pd).all() and np.isfinite(Qd_start).all() and np.isfinite(Qd_end).all()):
-        raise CircuitError(f"時間刻み h={h} で行列が解けない")
+        raise CircuitError(Message("MATRIX_SINGULAR", h=Value(h, "s")))
 
     ops = Operators(P=P, Q=Q, Rx=Rx, Ru=Ru, Rex=Rex, Pd=Pd, Qd_start=Qd_start, Qd_end=Qd_end)
     if backward_euler:
@@ -186,11 +184,15 @@ def run(
     Qd_start: np.ndarray | None = None,
     Qd_end: np.ndarray | None = None,
     n_damp: int = 0,
-) -> None:
-    """固定刻みで n_steps 進め、結果を out に書く。
+    damp: int = -1,
+) -> int:
+    """固定刻みで n_steps 進め、結果を out に書く。戻り値は、続きの区間に持ち越す減衰ステップの残り。
 
     計算の先頭と電源の不連続点から n_damp ステップは減衰ステップ（Pd, Qd_start, Qd_end）、
     それ以外は台形則。台形則だけだと、刻みより速い成分が符号を変えながら残る。
+    damp   : この区間の初めに残っている減衰ステップの数（-1 なら n_damp。計算の先頭）。
+             計算を区間に区切って呼ぶとき（進み具合と中断のため）は、前の区間の戻り値を渡す。
+             区切っても、区切らないときと同じ演算を同じ順に行うので、結果はビット単位で同じ。
 
     u_start[k] : 時刻 t[k]   での電源値（不連続点では切り替わった後の値）
     u_end[k]   : 時刻 t[k+1] での電源値（不連続点では切り替わる前の値）
@@ -200,7 +202,8 @@ def run(
     n_steps = u_start.shape[0]
     x = x0.copy()
     out[0] = x
-    damp = n_damp
+    if damp < 0:
+        damp = n_damp
     for k in range(n_steps):
         if event[k]:
             x = Rx @ x + Ru @ u_start[k]
@@ -212,6 +215,7 @@ def run(
         else:
             x = P @ x + Q @ (0.5 * (u_start[k] + u_end[k]))
         out[k + 1] = x
+    return damp
 
 
 # ---------------------------------------------------------------- スイッチング
@@ -250,6 +254,7 @@ def run_switched(
     u_mid: np.ndarray,
     u_end: np.ndarray,
     event: np.ndarray,
+    record_after: np.ndarray,
     sw_code: np.ndarray,
     x: np.ndarray,
     ctl: np.ndarray,
@@ -290,7 +295,11 @@ def run_switched(
       slot_code[:n_slots] : 各スロットの回路状態の符号
     入力（時間格子上の配列）
       u_start[k], u_end[k] : 区間 [t[k], t[k+1]] の両端の電源値。u_mid[k] はその平均
-      event[k]   : t[k] で電源が不連続に変わるなら True
+      event[k]   : t[k] で電源が不連続に変わるなら True（時刻で決まる電源のステップと、指令で値が決まる
+                   電源の変わり目）。その直後を減衰ステップにする
+      record_after[k] : t[k] の記録を、電源が変わった後の値にするなら True（時刻で決まる電源のステップ。
+                   D-019）。False なら変わる前の値のまま（指令で値が決まる電源だけが変わる点。スイッチの
+                   切り替え点と同じ。D-048）。event[k] が True の点でだけ見る
       sw_code[k] : 区間 [t[k], t[k+1]) のスイッチのビット
       d_pos, d_neg : ダイオードのアノード・カソードの未知数の番号（基準節点は -1）
     進行状態（書き換える）
@@ -298,7 +307,8 @@ def run_switched(
       ctl : 上の CTL_* の並び
     記録
       out[k]      : t[k] の値。スイッチやダイオードが t[k] で切り替わる場合は切り替わる前の値、
-                    電源が t[k] で不連続に変わる場合は変わった後の値（回路状態は直前のまま）
+                    時刻で決まる電源が t[k] でステップする場合は変わった後の値（record_after[k]）、
+                    指令で値が決まる電源だけが変わる場合は変わる前の値
       code_out[k] : 区間 [t[k], t[k+1]) の回路状態の符号
 
     戻り値は DONE / NEED_STATE / NOT_SETTLED。NEED_STATE のときは、呼び出し側が
@@ -411,7 +421,7 @@ def run_switched(
 
         # --- 採用 ---
         n_retries += flips
-        if event[k]:
+        if disc and record_after[k]:
             out[k] = xk
         if be or disc:
             n_changes += 1

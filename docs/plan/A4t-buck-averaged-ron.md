@@ -19,7 +19,7 @@ E1b の修正で、平均モデルのレグが「Vleg = duty × Vin」から「V
 
 ## 受け入れ基準
 
-1. 付録A.4 の平均モデルの図と信号の説明が、E1b の実装（`circuit_sim/templates/buck.py`、`circuit_sim/control/legs.py` ほか、ブランチ E1b）と食い違わない。
+1. 付録A.4 の平均モデルの図と信号の説明が、E1b の実装（`circuit_sim/templates/buck.py`、`circuit_sim/templates/legs.py` ほか、ブランチ E1b）と食い違わない。
 2. 内部の信号の扱い（出すか、出さないか、出すならどの名前と説明か）が決まっている。
 3. 変えた文言が日英のキーの表にあり、辞書の生成が拾える形になっている。
 4. `python scripts/check.py` が通る。

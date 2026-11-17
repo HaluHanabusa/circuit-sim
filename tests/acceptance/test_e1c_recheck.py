@@ -176,4 +176,4 @@ def test_heavily_damped_complex_poles_are_accurate_or_noted(zeta, t_end):
 )
 def test_leakage_through_low_off_resistance_is_not_an_interruption():
     res = simulate(buck(10e-3, 6.0, 1e5), 2e-4, gates=GATE)
-    assert [n for n in res.notes if "行き場" in n] == []
+    assert [n for n in res.notes if "還流経路" in n] == []   # E1g（D-063）: 「行き場」→「還流経路」

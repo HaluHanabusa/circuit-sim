@@ -6,8 +6,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..control import Controller, Pwm
 from ..ir import Component, Netlist, Spec, Step
+from ..messages import CodedError, Message, Names, Value
+from ..signals import SignalInfo, merge_signal_info
+from ..simulate import Result, simulate
 from ..units import DIMENSION_LABEL, UnitError, parse_unit, to_si
+from .items import MissingValueError, units_error
 
 DEFAULT_MAX_STEPS = 20_000    # 既定の刻みと計算時間で出すステップ数の上限（画面の横1列あたり約10点）
 PHASE_NOTE = 0.008            # 振動の位相のずれの見積もりが入力のこの比を超えたら知らせる。
@@ -25,54 +30,71 @@ def _readable(unit: str) -> bool:
     return True
 
 
-class MissingValueError(ValueError):
-    """仕様に値が入っていないパラメータがある。"""
-
-    def __init__(self, names: list[str]):
-        self.names = names
-        super().__init__(f"値が入っていないパラメータ: {names}")
-
-
 @dataclass
 class Expanded:
+    """テンプレートを展開した結果（層Bと、計算に渡すもの）。
+
+    probes      : 要約に出す信号の名前
+    notes       : 単位の換算、既定の刻みの調整など、利用者に伝えること（番号つき。messages.Message）
+    gates, controllers : simulate() に渡すゲート信号と制御器（スイッチや制御の無い回路では空）
+    signals     : 結果の信号の構造化した情報（signals.SignalInfo: 名前、単位、既定で表示するか、種類、
+                  節点・素子・正の向き、内部の印）。表示する信号（画面仕様 付録A の信号の表の順）と、
+                  画面に出さない内部の信号（internal=True）の両方を、結果の名前に漏れなく並べる。
+                  説明の文言は画面の辞書が持つ
+    fidelity    : モデルの種類（"switching" / "average"。モデルを選べないテンプレートでは None）
+    """
+
     netlist: Netlist
     t_end: float
     h: float
     probes: list[str]
-    notes: list[str] = field(default_factory=list)    # 単位の換算、既定の刻みの調整など、利用者に伝えること
+    notes: list[Message] = field(default_factory=list)
+    gates: list[Pwm] = field(default_factory=list)
+    controllers: list[Controller] = field(default_factory=list)
+    signals: list[SignalInfo] = field(default_factory=list)
+    fidelity: str | None = None
+
+    def run(self, **kwargs) -> Result:
+        """展開した回路を計算する（simulate() に、刻み・ゲート信号・制御器を渡す）。
+
+        kwargs は simulate() にそのまま渡す（progress、cancel、max_steps など）。
+        結果の notes の先頭には、展開で出た注意（self.notes）が入る。結果の signal_info には、
+        テンプレートが決めた表示する信号と内部の信号の区別が入る（決めていない名前は内部とみなす）。
+        """
+        res = simulate(
+            self.netlist, self.t_end, self.h, gates=self.gates, controllers=self.controllers, **kwargs
+        )
+        res.notes[:0] = self.notes
+        res.signal_info = merge_signal_info(res.signal_info, self.signals)
+        return res
 
 
-def _values(spec: Spec, names: list[str], notes: list[str]) -> dict[str, float]:
+def _values(spec: Spec, names: list[str], notes: list[Message]) -> dict[str, float]:
     """必要な値をまとめて取り出し、SI単位に換算する。足りないものは一度に全部報告する。"""
     missing = [n for n in names if n not in spec.plant or spec.plant[n].value is None]
     if missing:
         raise MissingValueError(missing)
     values: dict[str, float] = {}
-    wrong_units = []
-    kinds = set()      # "読めない" / "量の種類が違う"
+    problems = []      # （項目、書かれた単位、項目の単位、読めないか、UnitError）
     for n in names:
         q = spec.plant[n]
+        si = DIMENSION_LABEL[DIMENSIONS[n]][1]
         try:
             values[n] = to_si(float(q.value), q.unit, DIMENSIONS[n])
         except UnitError as exc:
-            wrong_units.append(f"{n}: {exc}")
-            kinds.add("読めない" if not _readable(q.unit) else "量の種類が違う")
+            problems.append((n, q.unit, si, not _readable(q.unit), exc))
             continue
         if values[n] != q.value:
-            si = DIMENSION_LABEL[DIMENSIONS[n]][1]
-            notes.append(f"{n}: {q.value:g} {q.unit.strip()} を {values[n]:g} {si} に換算した")
-    if wrong_units:
-        heading = {
-            frozenset({"読めない"}): "単位を読めない項目がある。",
-            frozenset({"量の種類が違う"}): "単位の量の種類が違う項目がある。",
-        }.get(frozenset(kinds), "単位を読めない、または量の種類が違う項目がある。")
-        raise UnitError(heading + "。".join(wrong_units))
+            notes.append(Message("UNIT_CONVERTED", key=n, value=Value(q.value, q.unit.strip()),
+                                 si=Value(values[n], si)))
+    if problems:
+        raise units_error(problems)
     bad = [n for n in names if n != "Vin" and values[n] <= 0]
     if bad:
-        raise ValueError(f"正の値が必要なパラメータ: {bad}")
+        raise CodedError("VALUES_NOT_POSITIVE", names=Names(bad))
     unused = [n for n in spec.plant if n not in names]
     if unused:
-        notes.append(f"このテンプレートが使わない項目を無視した: {unused}")
+        notes.append(Message("UNUSED_ITEMS", items=Names(unused)))
     return values
 
 
@@ -102,10 +124,10 @@ def _phase_error(poles: np.ndarray, t_end: float, h: float) -> tuple[float, floa
     return worst, worst_raw, which
 
 
-def _timing(spec: Spec, poles: np.ndarray, notes: list[str]) -> tuple[float, float]:
-    """極から計算時間と刻みを決める。仕様に指定があればそれを使う。
+def _timing(spec: Spec, poles: np.ndarray, notes: list[Message]) -> tuple[float, float]:
+    """極から終了時刻と刻みを決める。仕様に指定があればそれを使う。
 
-    既定: 刻みは最も速い極の周期の1/200、計算時間は最も遅い減衰の時定数の5倍。
+    既定: 刻みは最も速い極の周期の1/200、終了時刻は最も遅い減衰の時定数の5倍。
     極が大きく離れていてステップ数が DEFAULT_MAX_STEPS を超えるときは、次のどれかにして知らせる。
       - 最も速い極が振動（複素数）で、計算時間の指定が無い: 刻みを保ち、計算時間を短くする
         （刻みを粗くすると振動が折り返す）。
@@ -129,46 +151,63 @@ def _timing(spec: Spec, poles: np.ndarray, notes: list[str]) -> tuple[float, flo
             oscillating = abs(fastest.imag) > abs(fastest.real)
             if oscillating and spec.simulation.t_end is None:
                 t_end = DEFAULT_MAX_STEPS * h
-                notes.append(
-                    f"減衰が遅い（収まるまで約 {t_full:.3g} s）ので、既定の計算時間を {t_end:.3g} s"
-                    f"（{DEFAULT_MAX_STEPS} ステップ）に短くした。全体を見るには simulation.t_end を指定する"
-                )
+                notes.append(Message("DEFAULT_T_END_SHORTENED", t_full=Value(t_full, "s"),
+                                     t_end=Value(t_end, "s"), n=DEFAULT_MAX_STEPS))
             elif oscillating:
                 period = 2.0 * math.pi / abs(fastest.imag)
                 h = t_end / DEFAULT_MAX_STEPS
-                notes.append(
-                    f"指定の t_end={t_end:.6g} s は回路の振動の周期 {period:.3g} s の"
-                    f" {t_end / period:.3g} 倍あり、"
-                    f"既定の刻み（1周期 200 点）では {DEFAULT_MAX_STEPS} ステップを超えるので、"
-                    f"刻みを {h:.3g} s（1周期 {period / h:.3g} 点、{DEFAULT_MAX_STEPS} ステップ）に粗くした"
-                )
+                notes.append(Message(
+                    "DEFAULT_H_COARSENED", t_end=Value(t_end, "s"), period=Value(period, "s"),
+                    ratio=Value(t_end / period), n=DEFAULT_MAX_STEPS, h=Value(h, "s"),
+                    points=Value(period / h),
+                ))
             else:
                 h = t_end / DEFAULT_MAX_STEPS
-                notes.append(
-                    f"回路の速い成分（{1.0 / abs(fastest):.3g} s）と遅い成分（{1.0 / slowest_decay:.3g} s）が"
-                    f"大きく離れているので、既定の刻みを遅い側に合わせて {h:.3g} s"
-                    f"（{DEFAULT_MAX_STEPS} ステップ）にした。"
-                    "速い成分の変化を見るには simulation.h と simulation.t_end を指定する"
-                )
+                notes.append(Message(
+                    "DEFAULT_H_STIFF", fast=Value(1.0 / abs(fastest), "s"),
+                    slow=Value(1.0 / slowest_decay, "s"),
+                    h=Value(h, "s"), n=DEFAULT_MAX_STEPS,
+                ))
         h = t_end / max(1, round(t_end / h))
     error, raw, pole = _phase_error(poles, t_end, h)
     if error > PHASE_NOTE and pole is not None:
         period = 2.0 * math.pi / abs(pole.imag)
         # 頭打ちにする前のずれは (ωh)² に比例するので、ずれを PHASE_TARGET にする刻み
         h_fine = h * math.sqrt(PHASE_TARGET / raw)
-        notes.append(
-            f"回路の振動（周期 {period:.3g} s）を1周期 {period / h:.3g} 点で計算するので、"
-            "台形則の位相のずれが"
-            f"積み上がり、計算の精度が落ちる（振動の波形が入力の約 {error:.1%} ずれる見込み）。"
-            f"ずれを入力の {PHASE_TARGET:.1%} 程度にするには、simulation.h を {h_fine:.3g} s 以下"
-            f"（1周期 {period / h_fine:.3g} 点以上）にするか、simulation.t_end を短くする"
-        )
+        notes.append(Message(
+            "PHASE_DRIFT", period=Value(period, "s"), points=Value(period / h), error=Value(error),
+            target=Value(PHASE_TARGET), h_fine=Value(h_fine, "s"), points_fine=Value(period / h_fine),
+            h=Value(h, "s"),
+        ))
     return t_end, h
+
+
+def _fidelity_note(spec: Spec, notes: list[Message]) -> None:
+    """スイッチの無いテンプレートはモデルを選べない。simulation.fidelity の指定は使わず、知らせる。"""
+    if spec.simulation.fidelity is not None:
+        notes.append(Message("FIDELITY_IGNORED", fidelity=spec.simulation.fidelity))
+
+
+# 結果の信号（画面仕様 付録A.2 の信号の表と同じ順。説明の文言は画面の辞書が持つ）
+RC_SIGNALS = (
+    SignalInfo("v(out)", "V", True, "node_voltage", node="out"),
+    SignalInfo("i(V1)", "A", True, "element_current", element="V1", positive=("in", "0")),
+    SignalInfo("v(in)", "V", False, "node_voltage", node="in"),
+)
+# 付録A.3 の信号の表と同じ順
+RLC_SIGNALS = (
+    SignalInfo("v(out)", "V", True, "node_voltage", node="out"),
+    SignalInfo("i(L1)", "A", True, "element_current", element="L1", positive=("a", "out")),
+    SignalInfo("v(in)", "V", False, "node_voltage", node="in"),
+    SignalInfo("v(a)", "V", False, "node_voltage", node="a"),
+    SignalInfo("i(V1)", "A", False, "element_current", element="V1", positive=("in", "0")),
+)
 
 
 def rc_lowpass(spec: Spec) -> Expanded:
     """電圧源(ステップ) - R - C。出力はコンデンサ電圧 v(out)。"""
-    notes: list[str] = []
+    notes: list[Message] = []
+    _fidelity_note(spec, notes)
     p = _values(spec, ["Vin", "R", "C"], notes)
     netlist = Netlist(components=[
         Component(id="V1", type="V", nodes=("in", "0"), waveform=Step(final=p["Vin"])),
@@ -177,12 +216,13 @@ def rc_lowpass(spec: Spec) -> Expanded:
     ])
     poles = np.array([-1.0 / (p["R"] * p["C"])], dtype=complex)
     t_end, h = _timing(spec, poles, notes)
-    return Expanded(netlist, t_end, h, probes=["v(out)", "i(V1)"], notes=notes)
+    return Expanded(netlist, t_end, h, probes=["v(out)", "i(V1)"], notes=notes, signals=list(RC_SIGNALS))
 
 
 def rlc_series(spec: Spec) -> Expanded:
     """電圧源(ステップ) - R - L - C の直列。出力はコンデンサ電圧 v(out)。"""
-    notes: list[str] = []
+    notes: list[Message] = []
+    _fidelity_note(spec, notes)
     p = _values(spec, ["Vin", "R", "L", "C"], notes)
     netlist = Netlist(components=[
         Component(id="V1", type="V", nodes=("in", "0"), waveform=Step(final=p["Vin"])),
@@ -193,4 +233,4 @@ def rlc_series(spec: Spec) -> Expanded:
     # s^2 + (R/L) s + 1/(LC) = 0
     poles = np.roots([1.0, p["R"] / p["L"], 1.0 / (p["L"] * p["C"])]).astype(complex)
     t_end, h = _timing(spec, poles, notes)
-    return Expanded(netlist, t_end, h, probes=["v(out)", "i(L1)"], notes=notes)
+    return Expanded(netlist, t_end, h, probes=["v(out)", "i(L1)"], notes=notes, signals=list(RLC_SIGNALS))
