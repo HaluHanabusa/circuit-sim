@@ -98,7 +98,10 @@ def test_no_load_matches_the_large_load_limit(circuit):
 
 
 @pytest.mark.parametrize("value", [-math.inf, math.nan, 1e31, math.nextafter(1e30, math.inf), 10**400,
-                                   10**31], ids=repr)
+                                   10**31],
+                         # 試験の ID は 200 文字まで（test_a0_fix5_watch.py）。ids=repr では 10**400 が
+                         # 401 桁の ID になるので、値の書き方を短く書く（値そのものは変えない）
+                         ids=["-inf", "nan", "1e31", "nextafter(1e30,inf)", "int-10**400", "int-10**31"])
 def test_other_infinite_or_too_large_loads_are_still_refused(value):
     """inf のほかは D-059 のまま: −inf、NaN、1e30 Ω より大きい有限の値、倍精度にできない整数は断る。"""
     result, g, msg = _run((24.0, 22e-6, 100e-6, value), 200e3)

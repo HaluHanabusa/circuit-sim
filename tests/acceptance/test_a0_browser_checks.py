@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from circuit_sim.templates import TEMPLATES
+
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLE = (ROOT / "circuit_sim" / "app" / "samples" / "rlc_series.json").read_bytes()
 BROWSERS = [
@@ -46,10 +48,16 @@ BROWSERS = [
 CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uff01-\uff60]")
 # 日本語の表示に出てよい英字の語（10.4 の「変わらない」もの: アプリ名、言語名、記号・単位、ファイル名、
 # テンプレートの名前と JSON の欄の名前（データ）、ショートカットの書き方）
-LATIN_OK = {"circuit", "sim", "English", "JSON", "json", "RLC", "rlc_series", "rc_lowpass", "Ctrl", "Enter",
+# テンプレートの名前は、開けないテンプレートの画面（N-OPEN-TEMPLATE）が「使えるテンプレート」として、
+# エンジンの一覧（circuit_sim.templates.TEMPLATES）をそのまま見せる（データ）。main で buck_voltage_mode が
+# 足されたので、決め打ちせずに一覧から作る。語は識別子の全体（buck_voltage_mode）で許すので、部分（buck
+# など）は許さない。一覧に出たものが開けることは test_a0_merge_main_engine.py が確かめる
+TEMPLATE_NAMES = set(TEMPLATES)
+LATIN_OK = {"circuit", "sim", "English", "JSON", "json", "RLC", "Ctrl", "Enter",
             "UTF", "PC", "kHz", "MHz", "null", "plant", "value", "template", "schema_version", "targets",
             "missing",
-            "zzz", "nope"}  # この試験が開かせる誤りのファイルに書いた、欄の名前とテンプレート名（データ）
+            "zzz", "nope",  # この試験が開かせる誤りのファイルに書いた、欄の名前とテンプレート名（データ）
+            } | TEMPLATE_NAMES
 
 sync_api = pytest.importorskip(
     "playwright.sync_api",
