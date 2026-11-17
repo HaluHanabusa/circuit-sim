@@ -8,6 +8,8 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+from ..messages import CodedError, Value
+
 AntiWindup = Literal["clamp", "none"]
 DerivativeOn = Literal["error", "measurement"]
 
@@ -17,7 +19,7 @@ class Limiter:
 
     def __init__(self, lower: float = -math.inf, upper: float = math.inf):
         if math.isnan(lower) or math.isnan(upper) or lower > upper:
-            raise ValueError(f"リミッタの下限（{lower}）は上限（{upper}）以下にする")
+            raise CodedError("LIMITER_ORDER", lower=Value(lower), upper=Value(upper))
         self.lower = float(lower)
         self.upper = float(upper)
 
@@ -30,7 +32,7 @@ class Limiter:
 
 
 class Pid:
-    """離散時間のPID（並列形）。出力の上下限と、積分の飽和を防ぐ処理つき。
+    """離散時間のPID（並列形）。出力の上下限と、アンチワインドアップつき。
 
     1回の update(e) が1サンプル（周期 Ts = period）。差分方程式:
       P[k] = Kp·e[k]
@@ -42,10 +44,11 @@ class Pid:
     微分を掛けるもの（derivative_on）:
       "error"      : 偏差 e に掛ける（上の式。既定）。
       "measurement": 測定値 y に掛ける。D[k] = a·D[k−1] − b·(y[k] − y[k−1])（y[−1] = y[0]）。
-                     偏差 e = r − y の微分から指令値 r の変化を除いたもので、指令値の段差で出力が跳ねない。
+                     偏差 e = r − y の微分から指令値 r の変化を除いたもので、
+                     指令値のステップで出力が跳ねない。
                      帰還の経路（y から u）は "error" と同じなので、開ループと安定余裕は変わらない。
                      update() に測定値を渡す。
-    積分の飽和を防ぐ処理（anti_windup）:
+    アンチワインドアップ（anti_windup）:
       "clamp": 積分を進める前の出力 P[k] + I[k−1] + D[k] が上限以上、かつ Ki·e[k] > 0
                （下限以下、かつ Ki·e[k] < 0）のときは、積分を進めない（I[k] = I[k−1]）。
                出力が上下限に張り付いている間、積分は張り付く向きには増えない。
@@ -68,15 +71,15 @@ class Pid:
     ):
         for name, v in (("kp", kp), ("ki", ki), ("kd", kd)):
             if not math.isfinite(v):
-                raise ValueError(f"PIDの {name} は有限値が必要（現在 {v}）")
+                raise CodedError("PID_GAIN_NOT_FINITE", name=name, value=Value(v))
         if not (math.isfinite(period) and period > 0):
-            raise ValueError(f"PIDの周期 period は正の有限値が必要（現在 {period}）")
+            raise CodedError("PID_PERIOD", value=Value(period, "s"))
         if not (math.isfinite(t_filter) and t_filter >= 0):
-            raise ValueError(f"微分のフィルタの時定数 t_filter は 0 以上の有限値にする（現在 {t_filter}）")
+            raise CodedError("PID_FILTER", value=Value(t_filter, "s"))
         if anti_windup not in ("clamp", "none"):
-            raise ValueError(f"anti_windup は 'clamp' か 'none'（現在 {anti_windup!r}）")
+            raise CodedError("PID_ANTI_WINDUP", value=repr(anti_windup))
         if derivative_on not in ("error", "measurement"):
-            raise ValueError(f"derivative_on は 'error' か 'measurement'（現在 {derivative_on!r}）")
+            raise CodedError("PID_DERIVATIVE_ON", value=repr(derivative_on))
         self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
         self.period = float(period)
         self.t_filter = float(t_filter)
@@ -98,7 +101,7 @@ class Pid:
         e = float(e)
         if self.derivative_on == "measurement":
             if measurement is None:
-                raise ValueError("微分を測定値に掛けるPIDには、update() に測定値を渡す")
+                raise CodedError("PID_MEASUREMENT_REQUIRED")
             d_in = -float(measurement)
         else:
             d_in = e

@@ -13,6 +13,8 @@ SI単位の値だけを受け取り、単位を知らない。
 """
 from __future__ import annotations
 
+from .messages import MESSAGES, CodedError, Message, Names
+
 # 接頭語 → 10 の指数。µ は3通りの書き方を受け付ける（u、U+00B5 マイクロ記号、U+03BC ギリシャ文字ミュー）
 PREFIX_EXPONENT = {
     "f": -15, "p": -12, "n": -9, "u": -6, "µ": -6, "μ": -6, "m": -3, "k": 3, "M": 6, "G": 9,
@@ -41,25 +43,27 @@ EXACT_UNITS = {
     "1": ("ratio", 0), "%": ("ratio", -2),
 }
 
-# 次元 → （日本語の呼び名、SI単位の記号）
-DIMENSION_LABEL = {
-    "voltage": ("電圧", "V"),
-    "current": ("電流", "A"),
-    "resistance": ("抵抗", "ohm"),
-    "inductance": ("インダクタンス", "H"),
-    "capacitance": ("キャパシタンス", "F"),
-    "frequency": ("周波数", "Hz"),
-    "time": ("時間", "s"),
-    "power": ("電力", "W"),
-    "per_voltage": ("比例ゲイン（1/電圧）", "1/V"),
-    "per_voltage_time": ("積分ゲイン（1/(電圧·時間)）", "1/(V·s)"),
-    "time_per_voltage": ("微分ゲイン（時間/電圧）", "s/V"),
-    "ratio": ("無次元の量", "1"),
+# 次元 → SI単位の記号
+SI_SYMBOL = {
+    "voltage": "V",
+    "current": "A",
+    "resistance": "ohm",
+    "inductance": "H",
+    "capacitance": "F",
+    "frequency": "Hz",
+    "time": "s",
+    "power": "W",
+    "per_voltage": "1/V",
+    "per_voltage_time": "1/(V·s)",
+    "time_per_voltage": "s/V",
+    "ratio": "1",
 }
+# 次元 → （日本語の呼び名、SI単位の記号）。呼び名は文面の辞書（messages の DIM_<次元>）から取る
+DIMENSION_LABEL = {d: (MESSAGES[f"DIM_{d}"][0], symbol) for d, symbol in SI_SYMBOL.items()}
 
 
-class UnitError(ValueError):
-    """単位が読めない、または期待した次元と違う。"""
+class UnitError(CodedError):
+    """単位が読めない、または期待した次元と違う（番号 UNIT_*、UNITS_*）。"""
 
 
 def parse_unit(text: str) -> tuple[str, int]:
@@ -75,29 +79,27 @@ def parse_unit(text: str) -> tuple[str, int]:
     for symbol, dimension in UNIT_DIMENSION.items():
         if unit.endswith(symbol) and unit[: -len(symbol)] in PREFIX_EXPONENT:
             return dimension, PREFIX_EXPONENT[unit[: -len(symbol)]]
-    raise UnitError(f"単位 '{text}' は読めない")
+    raise UnitError("UNIT_UNREADABLE", unit=text)
 
 
-def _how_to_write(dimension: str) -> str:
+def _how_to_write(dimension: str) -> Message:
     """その次元の単位の書き方の案内。制御の値の単位（EXACT_UNITS）は接頭語を受け付けない。"""
     exact = [u for u, (d, _) in EXACT_UNITS.items() if d == dimension]
     if exact:
-        return f"{' か '.join(exact)} と書く。接頭語は付けない"
-    si_symbol = DIMENSION_LABEL[dimension][1]
-    return f"{si_symbol} か、mH や kohm のような接頭語つきで書く。m はミリ、M はメガ"
+        return Message("HOW_EXACT", units=Names(exact))
+    return Message("HOW_PREFIXED", si=SI_SYMBOL[dimension])
 
 
 def to_si(value: float, unit: str, dimension: str) -> float:
     """値を SI単位に換算する。単位が読めない、または次元が dimension と違えば UnitError。"""
-    expected, si_symbol = DIMENSION_LABEL[dimension]
+    expected = Message(f"DIM_{dimension}")
     try:
         found, exponent = parse_unit(unit)
-    except UnitError as exc:
-        raise UnitError(f"{exc}（{expected}を期待。{_how_to_write(dimension)}）") from None
+    except UnitError:
+        raise UnitError("UNIT_UNREADABLE_EXPECTED", unit=unit, expected=expected,
+                        how=_how_to_write(dimension), dimension=dimension) from None
     if found != dimension:
-        raise UnitError(
-            f"単位 '{unit}' は{DIMENSION_LABEL[found][0]}の単位。ここには{expected}の単位が要る"
-            f"（{_how_to_write(dimension)}）"
-        )
+        raise UnitError("UNIT_WRONG_DIMENSION", unit=unit, found=Message(f"DIM_{found}"), expected=expected,
+                        how=_how_to_write(dimension), dimension=dimension)
     # 負の指数は割り算にする（10 の負のべきは2進数で正確に表せないので、掛けると最後の桁がずれる）
     return value * 10.0**exponent if exponent >= 0 else value / 10.0 ** (-exponent)

@@ -49,13 +49,18 @@ def test_signal_table_is_found():
     assert all(len(r) == 7 for r in rows)
 
 
+def shown(ex):
+    """表示する信号（内部の印の無いもの）。内部の信号の区別は E1g（画面仕様 14章の未決17）。"""
+    return [s for s in ex.signals if not s.internal]
+
+
 @pytest.mark.parametrize("fidelity", list(MODELS))
 def test_signals_match_the_a4_table_one_to_one(fidelity):
-    """名前と並び、単位、既定で表示するか、モデルごとの有無が表と同じ。"""
+    """名前と並び、単位、既定で表示するか、モデルごとの有無が表と同じ（内部の印の無いものだけと比べる）。"""
     rows = [r for r in a4_signal_rows() if r[MODELS[fidelity]] == "出る"]
     ex = expanded(fidelity)
-    assert [s.name for s in ex.signals] == [r[1].strip("`") for r in rows]
-    for s, r in zip(ex.signals, rows, strict=True):
+    assert [s.name for s in shown(ex)] == [r[1].strip("`") for r in rows]
+    for s, r in zip(shown(ex), rows, strict=True):
         assert s.unit == ("" if r[2] == "なし" else r[2]), s.name
         assert s.shown == (r[3] == "する"), s.name
 
@@ -71,7 +76,7 @@ def test_signal_measurement_points_match_the_a4_table_and_the_netlist(fidelity):
     rows = {r[1].strip("`"): r for r in a4_signal_rows() if r[MODELS[fidelity]] == "出る"}
     ex = expanded(fidelity)
     nodes = {n for c in ex.netlist.components for n in c.nodes}
-    for s in ex.signals:
+    for s in shown(ex):
         point = rows[s.name][6]
         if s.kind == "node_voltage":
             assert point == f"節点 {s.node}" and s.node in nodes
@@ -97,7 +102,7 @@ def test_signal_measurement_points_match_the_a4_table_and_the_netlist(fidelity):
 
 def test_every_signal_has_a_description_key_in_the_dictionary_table():
     section = a4_section()
-    names = {s.name for f in MODELS for s in expanded(f).signals}
+    names = {s.name for f in MODELS for s in shown(expanded(f))}
     for name in names:
         assert f"`signal.buck_voltage_mode.{name}.desc`" in section, name
 

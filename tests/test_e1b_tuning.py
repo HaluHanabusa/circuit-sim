@@ -660,13 +660,13 @@ def test_radius_is_written_with_digits_that_agree_with_the_judgement():
                                    PidGains(0.01, 100.0, 1e-6, 2.5e-6, 3e3, 60.0, radius)))
 
     for radius in (0.99999998616, 1 - 2 * ini.STABILITY_EPS, 0.99996, 0.97):
-        m = re.search(r"極の半径 ([\d.]+)（1 未満で安定）", text(radius))
+        m = re.search(r"閉ループ極の絶対値の最大 ([\d.]+)（1 未満で安定）", text(radius))
         assert m and float(m.group(1)) < 1.0
-    assert "極の半径 0.9700（1 未満で安定）" in text(0.97)
+    assert "閉ループ極の絶対値の最大 0.9700（1 未満で安定）" in text(0.97)
     for radius in (1 + 2 * ini.STABILITY_EPS, 1.00004, 1.2):
-        m = re.search(r"極の半径 ([\d.]+)（1 以上で不安定）", text(radius))
+        m = re.search(r"閉ループ極の絶対値の最大 ([\d.]+)（1 以上で不安定）", text(radius))
         assert m and float(m.group(1)) > 1.0
-    assert "極の半径 0.99999999999999989（" in text(1 - 1.1e-16)
+    assert "閉ループ極の絶対値の最大 0.99999999999999989（" in text(1 - 1.1e-16)
 
 
 def test_largest_reachable_margin_is_not_rounded_up_to_the_target():
@@ -871,7 +871,7 @@ def _check_sentence_numbers(err, target):
     から（実装の関数を使わない）。"""
     text = str(err)
     best = err.best
-    m = re.search(r"位相余裕 (-?[\d.]+)° を取れる交差周波数が無い（取れるのは最大 (-?[\d.]+)°）", text)
+    m = re.search(r"位相余裕 (-?[\d.]+)° を取れるゲイン交差周波数が無い（取れるのは最大 (-?[\d.]+)°）", text)
     if m:
         assert float(m.group(1)) == target and float(m.group(2)) < float(m.group(1))
     if best is None:
@@ -888,9 +888,9 @@ def _check_sentence_numbers(err, target):
     r1 = best.pole_radius - 1.0
     expected = "stable" if r1 <= -EPS else ("unstable" if r1 >= EPS else "no_margin")
     assert _says(err)[1] == [expected]
-    for pattern, below in ((r"閉ループの極の半径 ([\d.]+)（1 未満で安定）", True),
-                           (r"閉ループの極の半径 ([\d.]+)（1 以上で不安定）", False),
-                           (r"極の半径が ([\d.]+)（1 以上）", False)):
+    for pattern, below in ((r"閉ループ極の絶対値の最大 ([\d.]+)（1 未満で安定）", True),
+                           (r"閉ループ極の絶対値の最大 ([\d.]+)（1 以上で不安定）", False),
+                           (r"閉ループ極の絶対値の最大が ([\d.]+)（1 以上）", False)):
         m = re.search(pattern, text)
         if m:
             assert (float(m.group(1)) < 1.0) if below else (float(m.group(1)) > 1.0)
@@ -1295,7 +1295,7 @@ def test_numbers_in_sentences_agree_with_the_judgements():
     assert err.reason == "no_stability_margin" and "位相余裕 55.04°（目標の 55.04° は満たす）" in str(err)
     _, err = _design(VIN, 470e-6, 10e-6, 15.793045736999451, 15e3, zero_damping=0.1653846153846154,
                      filter_ratio=0.0, phase_margin_deg=29.99773)
-    assert "位相余裕 29.99773° を取れる交差周波数が無い（取れるのは最大 29.9977°）" in str(err)
+    assert "位相余裕 29.99773° を取れるゲイン交差周波数が無い（取れるのは最大 29.9977°）" in str(err)
     _check_sentence_numbers(err, 29.99773)
 
     def text(pm, radius, target=TARGET, reason="unstable", body=""):
@@ -1307,7 +1307,8 @@ def test_numbers_in_sentences_agree_with_the_judgements():
                       text(long_target - 5e-7, 0.9, long_target))
     assert float(shown.group(1)) >= float(shown.group(2)) == long_target
     for radius, below in ((1.0000000013, False), (1.00004, False), (0.99999998616, True), (1 - 2e-9, True)):
-        pattern = r"極の半径 ([\d.]+)（1 未満で安定）" if below else r"極の半径 ([\d.]+)（1 以上で不安定）"
+        side = "1 未満で安定" if below else "1 以上で不安定"
+        pattern = rf"閉ループ極の絶対値の最大 ([\d.]+)（{side}）"
         shown = float(re.search(pattern, text(60.0, radius)).group(1))
         assert (shown < 1.0) if below else (shown > 1.0)
     # 理由 unstable の本文の半径も、最良の候補と同じ書き方（以前は本文だけ小数4桁で、1.0000 と書きえた）
@@ -1315,8 +1316,8 @@ def test_numbers_in_sentences_agree_with_the_judgements():
     opts = {"zero_damping": 0.1437543236478271, "filter_ratio": 0.0, "phase_margin_deg": 24.361861916713153,
             "zero_ratio": 0.9590984284499318}
     best, err = _design(*plant, 123266.3864601657, **opts)
-    body = re.search(r"極の半径が ([\d.]+)（1 以上）", str(err)).group(1)
-    candidate = re.search(r"極の半径 ([\d.]+)（1 以上で不安定）", str(err)).group(1)
+    body = re.search(r"閉ループ極の絶対値の最大が ([\d.]+)（1 以上）", str(err)).group(1)
+    candidate = re.search(r"閉ループ極の絶対値の最大 ([\d.]+)（1 以上で不安定）", str(err)).group(1)
     assert err.reason == "unstable" and body == candidate and float(body) > 1.0
     assert "180° より小さい値" in str(_design(VIN, L, C, R, 100e3, phase_margin_deg=200.0)[1])
 

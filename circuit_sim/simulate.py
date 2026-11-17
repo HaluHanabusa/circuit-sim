@@ -4,12 +4,17 @@
 スイッチ（S）やダイオード（D）を含む回路は、回路状態ごとの行列を使い回しながら進め、
 制御周期ごとに核から戻って制御器を呼ぶ。
 大きすぎる計算は配列を確保する前に断り、刻みが粗いときなどは結果の notes で知らせる。
+
+注意とエラーは番号と差し込む値で返す（messages.Message、messages.CodedError。文面は辞書が持つ）。
+計算は区切って進め（核の外。区切りは核の呼び出しの単位）、区切りごとに、進み具合の知らせ（progress）、
+中断の求め（cancel）、回路の変数の発散を確かめる。区切っても、区切らないときと結果はビット単位で同じ。
 """
 from __future__ import annotations
 
 import csv
 import math
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,9 +23,19 @@ import numpy as np
 from . import kernel
 from .control import Controller, Pwm
 from .ir import DC, Command, Netlist, Sine, Step
+from .messages import (
+    CodedError,
+    CodedKeyError,
+    CodedTypeError,
+    Message,
+    Names,
+    SimulationCancelled,
+    Value,
+)
 from .mna import CircuitError, System, build_system, describe_state, state_conductance
+from .signals import SignalInfo, describe_signals
 
-DEFAULT_STEPS_PER_PERIOD = 200   # 搬送波1周期の分割数の既定値
+DEFAULT_STEPS_PER_PERIOD = 200   # キャリア1周期の分割数の既定値
 DEFAULT_DAMPING_STEPS = 2        # 計算の先頭と不連続点の直後に入れる減衰ステップの数の既定値
 MAX_STEPS = 20_000_000           # ステップ数の上限の既定値（スコープが扱う点数の目安と同じ 2000万）
 MAX_RESULT_BYTES = 2 * 2**30     # 計算に使う配列（結果と作業用）の大きさの上限 [バイト]。8 GB の PC で、
@@ -39,18 +54,47 @@ DIODE_BAND_REL = 1e-8            # t = 0 の状態が落ち着かないとき、
 #                                  通常の判定には使わない
 SIMULTANEOUS_FLIPS = 4           # ダイオードの状態決定で、違反したものを同時に反転する回数
 _GRID_TOL = 1e-6                 # 周期が時間刻みの整数倍かどうかの判定（ステップ数に対する相対値）
+CSV_NEWLINES = ("\r\n", "\n")    # Result.to_csv の行の終わりに選べるもの（既定は CR LF。D-075、D-076）
+
+# --- 区切り（進み具合、中断、発散の確かめ）。核の外で、核を呼ぶ単位で区切る ---------------------------
+CHUNK_SECONDS = 0.02             # 1つの区切りの計算時間の目安 [s]。中断に応じるまでの遅れと、進み具合を
+#                                  知らせる間隔の上限は、ほぼこの値になる（受け入れ基準: どちらも 0.2 s 以内）
+CHUNK_STEPS_FIRST = 512          # 最初の区切りのステップ数。以後は、かかった時間から CHUNK_SECONDS に合わせる
+CHUNK_STEPS_MIN = 64
+CHUNK_STEPS_MAX = 1 << 20
+PROGRESS_SECONDS = 0.05          # 進み具合を知らせる最短の間隔 [s]（知らせる側の手間を抑える）
+SETUP_SHARE = 0.02               # 進み具合のうち、計算の準備（電源の配列など）に割り当てる分
+POST_SHARE = 0.01                # 進み具合のうち、後処理（注意の判定、信号の配列）に割り当てる分
+SETUP_BLOCK = 1 << 17            # 準備の配列を埋める単位の行数（この単位ごとに中断の求めを見る。
+#                                  1000 万ステップの計算で、1つの単位が数 ms〜十数 ms）
+DIVERGENCE_FACTOR = 1e12         # 発散とみなす大きさ: 回路の電圧（電流）の目安のこの倍（_divergence_limits）
+# 時間ステップのあいだ、numpy のあふれ（overflow）と無効の演算（invalid。inf − inf など）の警告を止める設定
+# （np.errstate に渡す）。値が倍精度をあふれるまで発散すると、核の行列の演算が1ステップごとに
+# RuntimeWarning を出す（番号の無い英語の文。python -W error では、その警告で落ちる）。有限でない値は、
+# 区切りごとの確かめ（_Monitor.check_values）と制御器の指令の確かめが番号つきのエラーで知らせるので、
+# 警告は要らない。止めるのは核の外（核を呼ぶ側）で、計算の値は変わらない。止めている範囲は、核の呼び出しと、
+# そのあいだに呼ぶもの（制御器の演算、途中で出会ったスイッチング状態の行列の用意、progress と cancel）
+_QUIET_OVERFLOW = {"over": "ignore", "invalid": "ignore"}
 
 
-class StepLimitError(ValueError):
-    """計算が大きすぎて、計算の前に断ったときのエラー。
+class StepLimitError(CodedError):
+    """計算が大きすぎて、計算の前に断ったときのエラー（番号 STEPS_OVER_LIMIT か MEMORY_OVER_LIMIT）。
 
     文面は「理由と直し方（h と t_end）」＋「simulate() の max_steps で上限を上げられること」。
-    without_api_hint は前半だけ（max_steps を渡せない仕様JSONやコマンドから使うとき）。
+    reason と without_api_hint は前半だけ（max_steps を渡せない仕様JSONやコマンドから使うとき）。
+    code と params は前半の番号と差し込む値。
     """
 
-    def __init__(self, reason: str, api_hint: str):
-        super().__init__(reason + api_hint)
-        self.without_api_hint = reason
+    def __init__(self, reason: Message, api_hint: Message):
+        super().__init__(Message("WITH_API_HINT", reason=reason, hint=api_hint))
+        self._set_message(self.message, reason.code, reason.params)
+        self.reason = reason
+        self.without_api_hint = str(reason)
+
+
+class DivergenceError(CodedError):
+    """計算の途中で、回路の変数が有限でなくなった、または発散とみなす大きさを超えた（番号 RUN_DIVERGED、
+    RUN_DIVERGED_NOT_FINITE）。params に時刻 t、変数の名前 signal、値 value。途中の結果は返さない。"""
 
 
 @dataclass
@@ -60,27 +104,42 @@ class Result:
     unknowns: list[str]
     netlist: Netlist
     h: float
-    notes: list[str] = field(default_factory=list)
+    notes: list[Message] = field(default_factory=list)   # 番号つきの注意（Message は str の一種）
     # --- スイッチを含む計算で入るもの ---
     signals: dict[str, np.ndarray] = field(default_factory=dict)   # "gate(名前)" "cmd(名前)" "on(素子ID)"
     devices: list[str] = field(default_factory=list)               # S と D の素子ID（状態の符号のビット順）
     sample_state: np.ndarray | None = None    # 各時刻の値と整合する回路状態の符号（S と D の電流に使う）
     stats: dict[str, int] = field(default_factory=dict)            # 用意した回路状態の数など
     # stats の欄: states（用意した回路状態の数）、state_changes（回路状態が変わったステップと、時刻で決まる
-    #   電源の不連続点の数）、command_changes（指令で決まる電源の値が変わった制御周期の頭の数。
+    #   電源の不連続点の数）、command_changes（指令で決まる電源の値が変わった制御周期の先頭の数。
     #   state_changes とは別に数える。どちらも、その直後を減衰ステップにする不連続点として扱う）、
-    #   retries（捨てた試行）、rescues_at_start（t = 0 でダイオードの状態が落ち着かず、違反が丸め誤差の
+    #   retries（捨てた試行）、rescues_at_start（t = 0 でダイオードの状態が確定せず、違反が丸め誤差の
     #   幅の中の状態を採った（救済した）なら 1。_initial_state を参照）
+    signal_info: dict[str, SignalInfo] = field(default_factory=dict)
+    # 名前ごとの信号の情報（単位、種類、正の向き、表示するか内部か）。names のすべてを、漏れなく持つ。
+    # simulate() は回路から分かる情報（表示と内部の区別はしない）を入れ、テンプレートの Expanded.run() が
+    # 表示する信号と内部の信号の区別を重ねる
 
     @property
     def names(self) -> list[str]:
         """[] で取り出せる波形の名前（回路の変数、ゲート信号、指令、導通状態）。"""
         return self.unknowns + list(self.signals)
 
+    @property
+    def display_names(self) -> list[str]:
+        """表示する信号の名前（内部の印の無いもの。並びは signal_info の順）。"""
+        return [n for n, s in self.signal_info.items() if not s.internal]
+
+    @property
+    def internal_names(self) -> list[str]:
+        """内部の信号の名前（画面に出さない。display_names と合わせると names のすべてになる）。"""
+        return [n for n, s in self.signal_info.items() if s.internal]
+
     def __getitem__(self, name: str) -> np.ndarray:
         """"v(out)" や "i(L1)"、"gate(q1)"、"cmd(duty)"、"on(D1)" の形で波形を取り出す。
 
-        回路の変数は、その時刻の値。スイッチやダイオードがその時刻で切り替わる場合は、切り替わる前の値。
+        回路の変数は、その時刻の値。スイッチやダイオードがその時刻で切り替わる場合と、指令で値が決まる電源が
+        その時刻で変わる場合は、変わる前の値。時刻で決まる電源がステップする場合は、変わった後の値。
         gate / cmd / on は、その時刻から次の時刻までの区間で使われた値（1 = オン）。
         最後の点は、最後の区間の値を繰り返す。
         """
@@ -89,7 +148,7 @@ class Result:
         try:
             return self.x[:, self.unknowns.index(name)]
         except ValueError:
-            raise KeyError(f"{name} は無い。使える名前: {self.names}") from None
+            raise CodedKeyError("RESULT_NO_SIGNAL", name=name, names=Names(self.names)) from None
 
     def v(self, node: str, ref: str | None = None) -> np.ndarray:
         """節点電圧。ref を指定すると2節点間の電圧。"""
@@ -107,26 +166,63 @@ class Result:
         if c.type in ("S", "D") and self.sample_state is not None:
             on = (self.sample_state >> self.devices.index(comp_id)) & 1
             return self.v(c.nodes[0], c.nodes[1]) * np.where(on == 1, 1.0 / c.r_on, 1.0 / c.r_off)
-        raise KeyError(f"{comp_id}（{c.type}）の電流はまだ取り出せない")
+        raise CodedKeyError("RESULT_NO_CURRENT", id=comp_id, type=c.type)
 
-    def to_csv(self, path: str | Path, names: list[str] | None = None) -> None:
+    def to_csv(
+        self, path: str | Path, names: list[str] | None = None, *, units: bool = False,
+        newline: str = "\r\n",
+    ) -> None:
+        """波形を CSV に書く。UTF-8、1行目が見出し、1列目が時刻、値は倍精度を失わない桁数（repr）。
+
+        書くのは、見出し1行とサンプルの行だけ（行数 = 1 + サンプルの数。画面の CSV と同じ形。D-075）。
+        注意（notes）は CSV に入れない（後ろに行を足すと、表として読む道具が時刻の列を文字列にする）。
+        注意を一緒に残すときは、別のファイルに書く（コマンドラインは <CSV の名前>.notes.txt。__main__.py）。
+
+        units   : 見出しに単位を角かっこで付ける（"t [s],v(out) [V],cmd(duty) [1]"。画面と同じ形。D-042）
+        newline : 行の終わり。"\\r\\n"（CR LF。既定。E0 から同じ。RFC 4180）か "\\n"（LF）。
+                  ほかの値は番号つきのエラー（ARG_CSV_NEWLINE。ファイルを開く前に断る）
+        """
+        if newline not in CSV_NEWLINES:
+            raise CodedError("ARG_CSV_NEWLINE", value=repr(newline))
         names = names or self.unknowns
+        if units:
+            header = ["t [s]"] + [f"{n} [{self.unit_of(n) or '1'}]" for n in names]
+        else:
+            header = ["t"] + names
+        cols = [self[n] for n in names]
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["t"] + names)
-            cols = [self[n] for n in names]
+            w = csv.writer(f, lineterminator=newline)
+            w.writerow(header)
             for k in range(len(self.t)):
                 w.writerow([repr(float(self.t[k]))] + [repr(float(c[k])) for c in cols])
 
+    def unit_of(self, name: str) -> str:
+        """信号の単位の記号（無次元は ""）。"""
+        info = self.signal_info.get(name)
+        if info is None:
+            self[name]                                         # 無い名前はここで番号つきのエラー
+            info = describe_signals(self.netlist, [name])[name]
+        return info.unit
 
-def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
+
+def render_note_line(note: Message, code: str = "CLI_NOTE", lang: str = "ja") -> str:
+    """注意1つを、番号つきの1行にする。
+
+    code は行の書き方の番号: CLI_NOTE（コマンドラインの表示。字下げつき）、NOTES_FILE_LINE（CSV と一緒に
+    書き出す注意のファイルの1行。字下げなし）。"""
+    text = note.text(lang) if isinstance(note, Message) else str(note)
+    return Message(code, text=text, code=getattr(note, "code", "")).text(lang)
+
+
+def _sample_sources(system: System, n_steps: int, h: float, notes: list[Message], tick=None):
     """電源を時間格子上の配列にする。戻り値: u_start, u_end, event, u_last
 
     u_last は、最後の格子点でちょうど電源がステップするときの、ステップした後の値（無ければ None）。
     指令で決まる電源（Command）の列は 0 のまま返す（制御周期ごとに _simulate_switched が埋める）。
+    配列は SETUP_BLOCK 行ずつ埋め、そのたびに tick() を呼ぶ（中断の求めを見る）。どの要素も、まとめて
+    埋めたときと同じ式で計算するので、値はビット単位で同じ。
     """
     m = len(system.sources)
-    t = h * np.arange(n_steps + 1)
     u_start = np.zeros((n_steps, m))
     u_end = np.zeros((n_steps, m))
     event = np.zeros(n_steps, dtype=bool)
@@ -135,28 +231,32 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
     for j, cid in enumerate(system.sources):
         w = system.netlist.component(cid).waveform
         if isinstance(w, DC):
-            u_start[:, j] = w.value
-            u_end[:, j] = w.value
+            for b0, b1 in _blocks(n_steps, tick):
+                u_start[b0:b1, j] = w.value
+                u_end[b0:b1, j] = w.value
         elif isinstance(w, Sine):
-            y = w.offset + w.amplitude * np.sin(
-                2.0 * math.pi * w.frequency * t + math.radians(w.phase_deg)
-            )
-            u_start[:, j] = y[:-1]
-            u_end[:, j] = y[1:]
+            for b0, b1 in _blocks(n_steps, tick):
+                t = h * np.arange(b0, b1 + 1)
+                y = w.offset + w.amplitude * np.sin(
+                    2.0 * math.pi * w.frequency * t + math.radians(w.phase_deg)
+                )
+                u_start[b0:b1, j] = y[:-1]
+                u_end[b0:b1, j] = y[1:]
             points = 1.0 / (w.frequency * h)
             if points < MIN_POINTS_PER_PERIOD:
-                notes.append(
-                    f"{cid}: 正弦波の1周期（{1.0 / w.frequency:.6g} s）に時間刻みが {points:.3g} 点しか無い。"
-                    "波形が折り返して、別の周波数や振幅に見える。"
-                    f"h を {1.0 / (20 * w.frequency):.3g} s 以下（1周期 20 点以上）にする"
-                )
+                notes.append(Message(
+                    "SINE_UNDERSAMPLED", id=cid, period=Value(1.0 / w.frequency, "s"), points=Value(points),
+                    h_suggest=Value(1.0 / (20 * w.frequency), "s"), h=Value(h, "s"),
+                ))
         elif isinstance(w, Step):
             ks = int(round(w.t_step / h))
             if abs(ks * h - w.t_step) > 1e-9 * h:
-                notes.append(f"{cid}: ステップ時刻 {w.t_step} を格子点 {ks * h} に丸めた")
-            k = np.arange(n_steps)
-            u_start[:, j] = np.where(k >= ks, w.final, w.initial)       # t[k] の右側の値
-            u_end[:, j] = np.where(k + 1 > ks, w.final, w.initial)      # t[k+1] の左側の値
+                notes.append(Message("STEP_TIME_ROUNDED", id=cid, t=Value(w.t_step, "s"),
+                                     t_grid=Value(ks * h, "s")))
+            for b0, b1 in _blocks(n_steps, tick):
+                k = np.arange(b0, b1)
+                u_start[b0:b1, j] = np.where(k >= ks, w.final, w.initial)       # t[k] の右側の値
+                u_end[b0:b1, j] = np.where(k + 1 > ks, w.final, w.initial)      # t[k+1] の左側の値
             if 0 < ks < n_steps and w.final != w.initial:
                 event[ks] = True
             if ks == n_steps and w.final != w.initial:
@@ -164,7 +264,7 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
         elif isinstance(w, Command):
             pass
         else:  # pragma: no cover
-            raise CircuitError(f"{cid}: 未対応の波形 {type(w).__name__}")
+            raise CircuitError("UNSUPPORTED_WAVEFORM", id=cid, kind=type(w).__name__)
     u_last = None
     if last_step:
         u_last = u_end[-1].copy()          # ほかの電源は、最後の区間の終わりの値のまま
@@ -173,27 +273,25 @@ def _sample_sources(system: System, n_steps: int, h: float, notes: list[str]):
     return u_start, u_end, event, u_last
 
 
-def _count_steps(t_end: float, h: float, max_steps: int | None, notes: list[str]) -> int:
+def _count_steps(t_end: float, h: float, max_steps: int | None, notes: list[Message]) -> int:
     """ステップ数。配列を確保する前に、大きすぎる計算を理由つきで断る。"""
     limit = MAX_STEPS if max_steps is None else max_steps
     ratio = t_end / h
     if not math.isfinite(ratio) or ratio > limit + 0.5:
         raise StepLimitError(
-            f"ステップ数が約 {ratio:.3g}（t_end / h = {t_end:.6g} s / {h:.6g} s）になり、"
-            f"上限の {limit} を超える。"
-            "時間刻み h を大きくするか、計算時間 t_end を短くする",
-            "。この大きさが本当に必要なら simulate(..., max_steps=...) で上限を上げる"
-            "（記憶量は、1ステップあたり 8 バイト × 未知数の数の数倍）",
+            Message("STEPS_OVER_LIMIT", steps=Value(ratio), t_end=Value(t_end, "s"), h=Value(h, "s"),
+                    limit=limit, t_max=Value(limit * h, "s"), h_min=Value(t_end / limit, "s")),
+            Message("STEPS_API_HINT"),
         )
     n_steps = int(round(ratio))
     if n_steps < 1:
-        raise ValueError("t_end が h より短い")
+        raise CodedError("T_END_SHORTER_THAN_H")
     if abs(ratio - n_steps) > 1e-6:
         given, used = _distinct(t_end, n_steps * h)
-        notes.append(
-            f"計算時間 t_end={given} s は時間刻み h={h:.6g} s の整数倍でないので、"
-            f"{used} s（{n_steps} ステップ）で終える"
-        )
+        notes.append(Message(
+            "T_END_ROUNDED", t_end=Value(t_end, "s", given), h=Value(h, "s"),
+            t_used=Value(n_steps * h, "s", used), n=n_steps,
+        ))
     return n_steps
 
 
@@ -240,12 +338,9 @@ def _check_result_size(
     total, result = _memory_bytes(n_steps, n_unknowns, n_sources, **switching)
     if max_steps is None and total > MAX_RESULT_BYTES:
         raise StepLimitError(
-            f"結果の配列と計算の作業用の配列が約 {total / 2**30:.1f} GB"
-            f"（{n_steps} ステップ × 未知数 {n_unknowns} 個。"
-            f"結果の配列はそのうち {result / 2**30:.1f} GB）になり、"
-            f"上限の {MAX_RESULT_BYTES / 2**30:.0f} GB を超える。"
-            "h を大きくするか t_end を短くする",
-            "。この大きさが本当に必要なら simulate(..., max_steps=...) でステップ数の上限を指定する",
+            Message("MEMORY_OVER_LIMIT", total=Value(total / 2**30, "GB"), steps=n_steps, unknowns=n_unknowns,
+                    result=Value(result / 2**30, "GB"), limit=Value(MAX_RESULT_BYTES / 2**30, "GB")),
+            Message("MEMORY_API_HINT"),
         )
 
 
@@ -260,7 +355,7 @@ def _has_unresolved_rate(rates: np.ndarray, h: float) -> bool:
 
 
 def _resolution_notes(
-    rates: np.ndarray, h: float, notes: list[str], damped: bool = True, *,
+    rates: np.ndarray, h: float, notes: list[Message], damped: bool = True, *,
     n_steps: int | None = None, limit: int = MAX_STEPS, who=None,
 ) -> None:
     """時間刻みが回路の速い成分を解像していなければ、何に対して粗いかを注意に書く。
@@ -278,43 +373,26 @@ def _resolution_notes(
         fastest = float(np.abs(decaying[k]))
         if fastest * h > MAX_STEP_PER_TIME_CONSTANT:
             tau = 1.0 / fastest
-            head = f"時間刻み h={h:.6g} s は、回路の最も速い時定数 {tau:.3g} s の {h / tau:.3g} 倍で、"
+            common = {"h": Value(h, "s"), "tau": Value(tau, "s"), "ratio": Value(h / tau),
+                      "h_suggest": Value(tau / 10, "s")}
             needed = None if n_steps is None else n_steps * h / (tau / 10)
-            if needed is not None and needed > limit:
+            if not damped:
+                notes.append(Message("STEP_COARSE_UNDAMPED", **common))
+            elif needed is not None and needed > limit:
                 ids = who(decaying[k]) if who is not None else []
-                parts = f"（{', '.join(ids)} が作る成分）" if ids else ""
-                fix = (
-                    f"この成分{parts}を見るには h を {tau / 10:.3g} s 以下にする必要があるが、"
-                    f"この計算時間では約 {needed:.2g} ステップになり、上限の {limit} を超える。"
-                    "この成分を見る必要が無ければ、対処は要らない。見るには"
-                    + (f" {', '.join(ids)} の値を見直して" if ids else "")
-                    + "時定数を大きくする（インダクタと抵抗なら L / R、コンデンサと抵抗なら R·C）"
-                )
+                code = "STEP_COARSE_OVER_LIMIT" if ids else "STEP_COARSE_OVER_LIMIT_NO_IDS"
+                notes.append(Message(code, **common, ids=Names(ids), needed=Value(needed), limit=limit))
             else:
-                fix = f"この成分を見るには h を {tau / 10:.3g} s 以下にする"
-            if damped:
-                notes.append(
-                    head + "この成分の変化は波形に現れない（計算の先頭と、電源のステップや"
-                    "スイッチの切り替えの直後は、数値振動が出ないように減衰させている）。" + fix
-                )
-            else:
-                notes.append(
-                    head + "この成分の変化は波形に現れない。"
-                    "減衰ステップを切っている（damping_steps=0）ので、"
-                    "計算の先頭と電源のステップの直後に、この成分が符号を変えながら残り、波形が振れる。"
-                    f"h を {tau / 10:.3g} s 以下にするか、damping_steps を 1 以上にする"
-                )
+                notes.append(Message("STEP_COARSE", **common))
     if ringing.size:
         omega = float(np.abs(ringing.imag).max())
         points = 2.0 * math.pi / (omega * h)
         if points < MIN_POINTS_PER_PERIOD:
             period = 2.0 * math.pi / omega
-            notes.append(
-                f"時間刻み h={h:.6g} s では、回路の振動（周期 {period:.3g} s）の"
-                f"1周期が {points:.3g} 点しか無い。"
-                "振動の周波数と減衰が正しく出ない。"
-                f"h を {period / 20:.3g} s 以下（1周期 20 点以上）にする"
-            )
+            notes.append(Message(
+                "STEP_COARSE_RINGING", h=Value(h, "s"), period=Value(period, "s"), points=Value(points),
+                h_suggest=Value(period / 20, "s"),
+            ))
 
 
 MODE_SHARE = 0.1          # 成分のエネルギー（L、C）や損失（抵抗）の最大に対して、
@@ -441,32 +519,36 @@ def _node_groups(edges: list[tuple[str, str]]):
 
 def _interruption_notes(
     system: System, out: np.ndarray, before: np.ndarray, after: np.ndarray, u: np.ndarray, h: float,
-    notes: list[str],
+    notes: list[Message], tick=None,
 ) -> None:
-    """インダクタ電流が、行き場の無いまま切り替えで遮断された点があれば注意に書く。
+    """インダクタ電流が、還流経路の無いまま切り替えで遮断された点があれば注意に書く。
 
     before[k], after[k]: ステップ k の直前と、ステップ k の回路状態。out[k] は切り替わる前の値。
     遮断されると、電流はオフ抵抗を通って1刻みで消え、オフの素子の両端に L·|Δi| / h の大きさの
     （刻みで決まる、意味の無い）電圧が1点記録される。ダイオードが電流 0 付近で切れる通常の切り替えでは、
     L·|i| / h は回路の電圧の程度に収まる。そこで L·|i| / h が電源とコンデンサの電圧の最大の
-    INTERRUPT_FACTOR 倍を超え、かつ行き場がオフの素子しか無いときだけ知らせる。
+    INTERRUPT_FACTOR 倍を超え、かつ還流経路がオフの素子しか無いときだけ知らせる。
+    長い配列の計算は SETUP_BLOCK 行ずつ行い、そのたびに tick() を呼ぶ（中断の求めを見る）。
     """
     netlist = system.netlist
-    steps = np.nonzero(before != after)[0]
+    steps = np.concatenate([np.nonzero(before[b0:b1] != after[b0:b1])[0] + b0
+                            for b0, b1 in _blocks(len(after), tick)] or [np.zeros(0, dtype=np.int64)])
     if not steps.size:
         return
     idx = {cid: i for i, cid in enumerate(system.unknowns)}
 
-    def volt(node: str) -> np.ndarray | float:
-        return 0.0 if node == netlist.ground else out[:, idx[f"v({node})"]]
+    def volt(node: str, rows=slice(None)) -> np.ndarray | float:
+        return 0.0 if node == netlist.ground else out[rows, idx[f"v({node})"]]
 
     v_ref = 0.0
-    for j, cid in enumerate(system.sources):
-        if netlist.component(cid).type == "V" and u.size:
-            v_ref = max(v_ref, float(np.abs(u[:, j]).max()))
-    for c in netlist.components:
-        if c.type == "C":
-            v_ref = max(v_ref, float(np.abs(volt(c.nodes[0]) - volt(c.nodes[1])).max()))
+    for b0, b1 in _blocks(out.shape[0], tick):
+        rows = slice(b0, b1)
+        for j, cid in enumerate(system.sources):
+            if netlist.component(cid).type == "V" and u[rows].size:
+                v_ref = max(v_ref, float(np.abs(u[rows, j]).max()))
+        for c in netlist.components:
+            if c.type == "C":
+                v_ref = max(v_ref, float(np.max(np.abs(volt(c.nodes[0], rows) - volt(c.nodes[1], rows)))))
     events = []
     for code in np.unique(after[steps]):
         forced = _forced_through_off(system, int(code))
@@ -488,17 +570,14 @@ def _interruption_notes(
         abs(float(np.asarray(volt(c.nodes[0]) - volt(c.nodes[1]))[k_next]))
         for c in netlist.components if c.id in off
     )
-    others = f"（ほかに {len(events) - 1} 回）" if len(events) > 1 else ""
-    notes.append(
-        f"時刻 t={step * h:.6g} s で、インダクタ {ind.id} の電流 {current:.3g} A の行き場が、"
-        f"オフのスイッチやダイオード（{', '.join(off)}）しか無くなり、電流が1刻みで消えた{others}。"
-        f"その直後の点のオフの素子の電圧（最大 {peak:.3g} V）は刻みの大きさで決まる見かけの値で、"
-        "実際の回路ではサージ電圧になる。還流ダイオードやスナバを入れる"
-        "（還流ダイオードがあっても、逆向きに流れていた電流は遮断される。降圧回路で出力の初期値が入力より高いときなど）"
-    )
+    more = Message("FRAG_MORE_TIMES", n=len(events) - 1) if len(events) > 1 else None
+    notes.append(Message(
+        "INDUCTOR_CURRENT_INTERRUPTED", t=Value(step * h, "s"), id=ind.id, current=Value(current, "A"),
+        off=Names(off), more=more, peak=Value(peak, "V"),
+    ))
 
 
-def _initial_value_notes(system: System, x0: np.ndarray, notes: list[str]) -> None:
+def _initial_value_notes(system: System, x0: np.ndarray, notes: list[Message]) -> None:
     """与えた初期値（ic）と、実際に始めた値が食い違っていれば注意に書く。"""
     netlist = system.netlist
     floor = 1e-9 * max(float(np.abs(x0).max(initial=0.0)), max(abs(c.ic) for c in netlist.components))
@@ -514,14 +593,12 @@ def _initial_value_notes(system: System, x0: np.ndarray, notes: list[str]) -> No
         else:
             continue
         if abs(actual - c.ic) > 1e-6 * max(abs(actual), abs(c.ic)) + floor:
-            notes.append(
-                f"{c.id}: 初期値 ic={c.ic:.6g} {unit} は回路のつなぎ方と矛盾するので、"
-                f"{actual:.6g} {unit} から始めた"
-                "（コンデンサの並列や電圧源との直結、インダクタの直列などで、初期値どうしが食い違っている）"
-            )
+            notes.append(Message(
+                "INITIAL_VALUE_ADJUSTED", id=c.id, ic=Value(c.ic, unit), actual=Value(actual, unit),
+            ))
 
 
-def _inductor_cutset_hints(netlist: Netlist) -> list[str]:
+def _inductor_cutset_hints(netlist: Netlist) -> list[Message]:
     """インダクタ（と電流源）だけで回路の残りとつながる部分（2節点以上）を探して、直し方を添える。
 
     抵抗・コンデンサ・電圧源・スイッチ・ダイオードでつながった節点を1つの部分とみなす。
@@ -552,43 +629,282 @@ def _inductor_cutset_hints(netlist: Netlist) -> list[str]:
         inductors = [c.id for c in links if c.type == "L"]
         if not inductors:
             continue
-        hints.append(
-            f"節点 {', '.join(members)} の部分は、{', '.join(c.id for c in links)} だけで"
-            "回路の残りとつながっていて、"
-            "流れ込む電流の和が 0 に縛られるので、この部分の電位が決まらない。"
-            "この部分のどこか1点と基準節点の間に、回路のほかの抵抗より十分に大きな抵抗（例 1 MΩ）を入れる"
-            "（小さいと、この抵抗に流れる電流で回路の動きが変わる）。"
-            f"この抵抗と {', '.join(inductors)} で、"
-            "時定数（インダクタンス / 抵抗）がとても短い成分ができるが、"
-            "計算では減衰させるので波形には現れない（そのことは注意に出る）"
-        )
+        hints.append(Message(
+            "HINT_INDUCTOR_CUTSET", nodes=Names(members), links=Names(c.id for c in links),
+            inductors=Names(inductors),
+        ))
     return hints
 
 
-def _explain_unsolvable(system: System, exc: CircuitError, state: str | None = None) -> CircuitError:
-    """解けない回路のエラーに、手がかり（決まらない変数、インダクタだけの節点）を添える。"""
+def _explain_unsolvable(system: System, exc: CircuitError, state=None) -> CircuitError:
+    """解けない回路のエラーに、手がかり（決まらない変数、インダクタだけの節点）を添える。
+
+    番号と差し込む値は元のエラーのもの（CIRCUIT_UNSOLVABLE など）に、手がかり hints と、スイッチを含む
+    回路では、そのときのスイッチング状態 state を足したもの。
+    """
     netlist = system.netlist
-    parts = [str(exc)]
+    hints: list[Message] = []
     names = [system.unknowns[i] for i in getattr(exc, "undetermined", [])]
     if names:
-        parts.append(f"決まらない変数: {', '.join(names)}")
+        hints.append(Message("HINT_UNDETERMINED", names=Names(names)))
     for node in netlist.nodes():
         attached = [c for c in netlist.components if node in c.nodes]
         if all(c.type in ("L", "I") for c in attached) and any(c.type == "L" for c in attached):
-            ids = ", ".join(c.id for c in attached)
+            ids = Names(c.id for c in attached)
             with_source = any(c.type == "I" for c in attached)
-            kind = "電流源とインダクタの直列" if with_source else "インダクタどうしの直列"
-            parts.append(
-                f"節点 '{node}' には {ids} しかつながっていない（{kind}）。"
-                "直列のインダクタは1つにまとめる（値は和）"
-            )
+            code = "HINT_SOURCE_INDUCTOR_SERIES" if with_source else "HINT_INDUCTORS_IN_SERIES"
+            hints.append(Message(code, node=node, ids=ids))
     cutsets = _inductor_cutset_hints(netlist)
-    text = "。".join(parts + cutsets)
-    if state is not None:
-        text = f"回路状態（{state}）で: {text}"
-        if not cutsets:
-            text += "。オフ抵抗 r_off が極端に大きいと、オフのときに節点が浮いたのと同じになって解けない"
-    return CircuitError(text)
+    hints += cutsets
+    cause = exc.message
+    if state is None:
+        message = Message("CIRCUIT_EXPLAINED", cause=cause, hints=hints)
+        params = {**exc.params, "hints": hints}
+    else:
+        r_off = None if cutsets else Message("FRAG_R_OFF_FLOATING")
+        message = Message("CIRCUIT_EXPLAINED_IN_STATE", state=state, cause=cause, hints=hints, r_off=r_off)
+        params = {**exc.params, "hints": hints, "state": state}
+    error = CircuitError(message)
+    error._set_message(message, exc.code, params)
+    return error
+
+
+class _Monitor:
+    """区切りごとの確かめ（核の外）: 発散、中断の求め、進み具合の知らせ。
+
+    計算の準備（電源の配列など。配列を SETUP_BLOCK 行ずつ埋める）と後処理（注意と信号）のあいだは tick() を、
+    核は next_check までの区間を1回の呼び出しで進め、戻ったら after(k) を呼ぶ
+    （k は計算の済んだ最後の格子点）。
+    区切りのステップ数は、1つの区切りの計算時間が CHUNK_SECONDS になるように合わせ直す
+    （区切りの位置は結果に効かないので、時間で決めても結果は同じ）。
+    progress と cancel が無くても、発散の確かめのために区切る。
+    進み具合は、準備を [0, SETUP_SHARE)、時間ステップを [SETUP_SHARE, 1 − POST_SHARE]（計算したステップ数の
+    割合）、後処理を (1 − POST_SHARE, 1) に割り当て、最後に 1 にする。
+    時間ステップの最中にも、核の外で配列を埋める所がある（制御周期ごとに、次の周期のゲート信号と指令。
+    制御周期が SETUP_BLOCK より長いと、そこでも tick() が呼ばれる）。その前に filling() で区間を知らせる。
+    そのあいだの進み具合は、時間ステップの割り当ての中に留める（後処理の値に先回りしない）。
+    """
+
+    def __init__(self, n_steps: int, h: float, progress: Callable[[float], object] | None,
+                 cancel: Callable[[], bool] | None):
+        self.n_steps, self.h = n_steps, h
+        self.progress, self.cancel = progress, cancel
+        self.out: np.ndarray | None = None
+        self.checked = 0                        # out[: checked + 1] は確かめ済み
+        self.last_k = 0                         # 前に区切った点
+        self.chunk = CHUNK_STEPS_FIRST
+        self.next_check = min(n_steps, self.chunk)
+        self.started = self.last_report = time.perf_counter()
+        self.last_check = self.started
+        self.last_fraction = 0.0
+        self.phase, self.ticks = "setup", 0
+        self.fill_from = self.fill_to = 0       # 時間ステップの最中に配列を埋めている区間（filling）
+        self._stop_if_cancelled(0)
+        if progress is not None:
+            progress(0.0)
+
+    def attach(self, out: np.ndarray, unknowns: list[str], limits: np.ndarray,
+               scales: dict[str, tuple[float, str]]) -> None:
+        """時間ステップを始める（発散を確かめる配列と大きさを受け取る）。
+
+        目安が 0 で大きさを決められない変数（limits が inf）は、倍精度の最大の有限値までを通す
+        （有限かどうかだけを見ることになる。inf は「inf 以下」に当たるので、有限の値に直しておく）。
+        """
+        self.out, self.unknowns, self.scales = out, unknowns, scales
+        self.limits = np.minimum(limits, np.finfo(float).max)
+        self.bound = float(self.limits.min())       # いちばん小さい大きさ（速い確かめに使う）
+        self.phase = "run"
+        self.last_check = time.perf_counter()
+
+    def tick(self) -> None:
+        """準備、後処理、時間ステップの最中の配列を埋める仕事の、1区切りが済んだ。
+
+        中断の求めを見て、進み具合を少し進める。時間ステップの最中（filling() で知らせた区間を埋めている
+        あいだ）は、計算の済んだ格子点 fill_from の値から、fill_to の値との中ほどまでを少しずつ進める。
+        fill_to は、次に after() が知らせる点か、埋めている区間の終わりの早いほうなので、次に知らせる値を
+        超えず、時間ステップの割り当ての外（後処理の値）にも出ない。
+        """
+        self._stop_if_cancelled(max(self.last_k, self.fill_from))
+        self.ticks += 1
+        if self.phase == "setup":
+            self._report(SETUP_SHARE * self.ticks / (self.ticks + 20))
+        elif self.phase == "run":
+            ahead = 0.5 * (self.fill_to - self.fill_from) * self.ticks / (self.ticks + 1)
+            self._report(self._run_fraction(self.fill_from + ahead))
+        else:
+            self._report(1.0 - POST_SHARE + POST_SHARE * self.ticks / (self.ticks + 5))
+
+    def filling(self, k0: int, k1: int) -> None:
+        """区間 [k0, k1) の配列を埋め始める（格子点 k0 まで計算が済んでいる）。続く tick() が、これを使う。
+
+        準備のあいだ（最初の区間。attach() の前）に呼んでもよい（tick() は準備の値を知らせ続ける）。"""
+        self.fill_from, self.fill_to = k0, max(k0, min(k1, self.next_check))
+        if self.phase == "run":
+            self.ticks = 0
+
+    def finish_run(self) -> None:
+        """時間ステップが済んだ（ここから後処理）。"""
+        self.phase, self.ticks = "post", 0
+
+    def _run_fraction(self, k: float) -> float:
+        """格子点 k まで計算が済んだときの進み具合（時間ステップの割り当ての中）。"""
+        return SETUP_SHARE + (1.0 - SETUP_SHARE - POST_SHARE) * k / self.n_steps
+
+    def after(self, k: int) -> None:
+        """格子点 k まで計算が済んだ。区切りの点に来ていれば、確かめて次の区切りを決める。"""
+        if k < self.next_check:
+            return
+        self.check_values(k)
+        now = time.perf_counter()
+        spent, steps = now - self.last_check, max(1, k - self.last_k)
+        self.last_check, self.last_k = now, k
+        self.chunk = int(min(CHUNK_STEPS_MAX, max(CHUNK_STEPS_MIN, steps * CHUNK_SECONDS / max(spent, 1e-6))))
+        self.next_check = min(self.n_steps, k + self.chunk)
+        self._stop_if_cancelled(k)
+        self._report(self._run_fraction(k), now)
+
+    def _report(self, fraction: float, now: float | None = None) -> None:
+        if self.progress is None:
+            return
+        now = time.perf_counter() if now is None else now
+        if fraction > self.last_fraction and now - self.last_report >= PROGRESS_SECONDS:
+            self.last_report, self.last_fraction = now, fraction
+            self.progress(fraction)
+
+    def check_values(self, k: int) -> None:
+        """out[checked + 1 : k + 1] に、有限でない値や発散とみなす大きさの値が無いかを確かめる。"""
+        if k <= self.checked:
+            return
+        block = self.out[self.checked + 1: k + 1]
+        # まず、全部の値の最小と最大を、いちばん小さい大きさと比べる（変数ごとに見るより 2〜15 倍速い。
+        # 発散していなければ、ここで済む）。NaN があると最小も最大も NaN で、比較が偽になる
+        if not (block.min() >= -self.bound and block.max() <= self.bound):
+            big = np.abs(block).max(axis=0)
+            if not np.all(big <= self.limits):
+                self._raise_diverged(block, self.checked + 1)
+        self.checked = k
+
+    def recheck(self, k: int) -> None:
+        """格子点 k の値を書き直したので、確かめ直す。"""
+        self.checked = min(self.checked, k - 1)
+        self.check_values(k)
+
+    def _raise_diverged(self, block: np.ndarray, k0: int) -> None:
+        bad = ~(np.abs(block) <= self.limits)
+        row = int(np.argmax(bad.any(axis=1)))
+        col = int(np.argmax(bad[row]))
+        k = k0 + row
+        name, value = self.unknowns[col], float(block[row, col])
+        unit = "V" if name.startswith("v(") else "A"
+        t = Value(k * self.h, "s")
+        if not math.isfinite(value):
+            raise DivergenceError("RUN_DIVERGED_NOT_FINITE", t=t, signal=name, k=k)
+        scale, word = self.scales[unit]
+        raise DivergenceError(
+            "RUN_DIVERGED", t=t, signal=name, value=Value(value, unit),
+            limit=Value(float(self.limits[col]), unit),
+            scale=Value(scale, unit), factor=Value(DIVERGENCE_FACTOR), kind=Message(word), k=k,
+        )
+
+    def _stop_if_cancelled(self, k: int) -> None:
+        if self.cancel is not None and self.cancel():
+            raise SimulationCancelled("RUN_CANCELLED", t=Value(k * self.h, "s"), k=k, n=self.n_steps)
+
+    def finish(self) -> None:
+        self._stop_if_cancelled(self.n_steps)
+        if self.progress is not None:
+            self.progress(1.0)
+
+
+def _blocks(n: int, tick: Callable[[], None] | None, start: int = 0):
+    """start〜n の行を SETUP_BLOCK ずつに分けた（始め、終わり）。1つ済むたびに tick() を呼ぶ。"""
+    for b0 in range(start, n, SETUP_BLOCK):
+        yield b0, min(n, b0 + SETUP_BLOCK)
+        if tick is not None:
+            tick()
+
+
+def _waveform_bound(w) -> float:
+    """電源の値の大きさの目安（指令で値が決まる電源は、指令が上下限で止まらなければ gain × 1 とみなす）。"""
+    if isinstance(w, DC):
+        return abs(w.value)
+    if isinstance(w, Step):
+        return max(abs(w.initial), abs(w.final))
+    if isinstance(w, Sine):
+        return abs(w.offset) + abs(w.amplitude)
+    if isinstance(w, Command):
+        bounds = [abs(b) for b in (w.lower, w.upper) if b is not None]
+        return abs(w.gain) * (max(bounds) if len(bounds) == 2 else max([1.0] + bounds))
+    return 0.0  # pragma: no cover
+
+
+def _divergence_limits(system: System, t_end: float) -> tuple[np.ndarray, dict[str, tuple[float, str]]]:
+    """発散とみなす大きさ（未知数ごと。電圧は V、電流は A）と、その元にした回路の目安。
+
+    目安は、電源と初期値の大きさ（S_V、S_I）から、素子の値で換算して広げたもの:
+      電流の目安 I = max(S_I, S_V / Z_min, S_V·t_end / L_min)  （抵抗やオン抵抗を流れる電流、LC の共振電流、
+                                                                 インダクタが t_end の間にためる電流）
+      電圧の目安 V = max(S_V, I·Z_max, I·t_end / C_min)        （オフ抵抗や大きな抵抗を電流 I が流れたときの
+                                                                 電圧（インダクタ電流の遮断を含む）、
+                                                                 コンデンサが t_end の間にためる電圧）
+      Z_min、Z_max は、抵抗・スイッチとダイオードのオン抵抗とオフ抵抗・√(L/C) の最小と最大
+    受動素子と、大きさに限りのある電源だけの回路では、どの変数もこの目安を大きく超えない（共振で目安の
+    Q 倍まで振れるが、上限のステップ数 2000 万の中で育つ振れは目安の約 3e7 倍まで）。その 3 万倍以上の余裕を
+    取って、目安の DIVERGENCE_FACTOR（1e12）倍を「決めた大きさ」とする。超えるのは、制御器を通した正帰還
+    （閉ループが不安定）などで指数的に育つときだけ。目安が 0（電源も初期値も 0）の変数は、
+    有限かどうかだけを見る。
+    目安を決められないとき（素子の値が極端で、√(L/C) が 0 に下あふれする、換算の途中や 1e12 倍が倍精度を
+    あふれる）も、その変数の大きさを無限大にして、有限かどうかだけを見る（見積もりで計算を止めない）。
+    """
+    netlist = system.netlist
+    s_v = s_i = 0.0
+    r_values, inductances, capacitances = [], [], []
+    for c in netlist.components:
+        if c.type == "V":
+            s_v = max(s_v, _waveform_bound(c.waveform))
+        elif c.type == "I":
+            s_i = max(s_i, _waveform_bound(c.waveform))
+        elif c.type == "C":
+            s_v = max(s_v, abs(c.ic))
+            capacitances.append(c.value)
+        elif c.type == "L":
+            s_i = max(s_i, abs(c.ic))
+            inductances.append(c.value)
+        elif c.type == "R":
+            r_values.append(c.value)
+        else:
+            r_values += [c.r_on, c.r_off]
+    z_values = list(r_values)
+    if inductances and capacitances:
+        z_values += [math.sqrt(min(inductances) / max(capacitances)),
+                     math.sqrt(max(inductances) / min(capacitances))]
+
+    def ratio(a: float, b: float) -> float:
+        """a / b。b が 0（下あふれした値）なら、決められない印の inf（0 で割る例外にしない）。"""
+        return a / b if b != 0.0 else math.inf
+
+    i = max([s_i] + ([ratio(s_v, min(z_values))] if z_values else [])
+            + ([ratio(s_v * t_end, min(inductances))] if inductances else []))
+    # √(L/C) が 0 になって i が inf（決まらない）のとき: L と C の両方がある回路なので、下の C の項が inf に
+    # なり、v も inf になる（i·Z_max が inf × 0 = NaN になっても、v は NaN や有限の値にならない）
+    v = max([s_v] + ([i * max(z_values)] if z_values else [])
+            + ([ratio(i * t_end, min(capacitances))] if capacitances else []))
+
+    def limit(scale: float) -> float:
+        """目安の DIVERGENCE_FACTOR 倍。目安が 0、決まらない（inf、NaN）、倍があふれるなら inf。"""
+        size = DIVERGENCE_FACTOR * scale
+        return size if scale > 0 and math.isfinite(size) else math.inf
+
+    limit_v, limit_i = limit(v), limit(i)
+    limits = np.array([limit_v if name.startswith("v(") else limit_i for name in system.unknowns])
+    return limits, {"V": (v, "WORD_VOLTAGE"), "A": (i, "WORD_CURRENT")}
+
+
+def _check_callbacks(progress, cancel) -> None:
+    if progress is not None and not callable(progress):
+        raise CodedTypeError("ARG_PROGRESS", value=repr(progress))
+    if cancel is not None and not callable(cancel):
+        raise CodedTypeError("ARG_CANCEL", value=repr(cancel))
 
 
 def simulate(
@@ -601,6 +917,8 @@ def simulate(
     steps_per_period: int | None = None,
     damping_steps: int = DEFAULT_DAMPING_STEPS,
     max_steps: int | None = None,
+    progress: Callable[[float], object] | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> Result:
     """ネットリストを固定刻みで計算する。
 
@@ -613,46 +931,56 @@ def simulate(
                       スイッチの無い回路では、刻みより速い成分があるときだけ入れる。
                       スイッチを含む回路では、状態が変わったステップを後退オイラーで進め、その後に入れる。
       max_steps     : ステップ数の上限（既定 2000万）。超える計算は、配列を確保する前に断る。
+      progress      : 進み具合（0〜1）を受け取る関数。計算の初めに 0、区切りごとに（PROGRESS_SECONDS
+                      より短い間隔では呼ばない）単調に増える値、最後に 1 で呼ぶ。呼ぶのは計算と同じスレッド。
+      cancel        : 引数なしで、中断するなら真を返す関数（threading.Event の is_set など）。
+                      区切りごとに呼び、真なら SimulationCancelled（番号 RUN_CANCELLED）で終わる。
+                      途中の結果は返さない。
+
+    計算の途中で回路の変数が有限でなくなるか、発散とみなす大きさ（_divergence_limits）を超えたら、
+    そこで止めて DivergenceError（番号 RUN_DIVERGED、RUN_DIVERGED_NOT_FINITE）を出す。
 
     スイッチ（S）やダイオード（D）を含む場合:
       gates            : ゲート信号（PWM）。S の gate から名前で参照する。
-      controllers      : 制御器。制御周期ごとに測定して演算し、指令は次の制御周期の頭から使う。
-      h                : 省略すると、最も速い搬送波の周期を steps_per_period で割った値。
-      steps_per_period : 搬送波1周期の分割数（既定 200）。h と同時には指定しない。
+      controllers      : 制御器。制御周期ごとに測定して演算し、指令は次の制御周期の先頭から使う。
+      h                : 省略すると、最も速いキャリアの周期を steps_per_period で割った値。
+      steps_per_period : キャリア1周期の分割数（既定 200）。h と同時には指定しない。
     """
     if not (t_end > 0 and math.isfinite(t_end)) or (h is not None and not (h > 0 and math.isfinite(h))):
-        raise ValueError("t_end と h は正の有限値が必要")
+        raise CodedError("ARG_T_END_H")
     if damping_steps < 0:
-        raise ValueError("damping_steps は 0 以上にする")
+        raise CodedError("ARG_DAMPING_STEPS")
+    _check_callbacks(progress, cancel)
 
     switching = any(c.type in ("S", "D") for c in netlist.components)
     if switching or gates or controllers:
         return _simulate_switched(
-            netlist, t_end, h, gates, controllers, steps_per_period, damping_steps, max_steps
+            netlist, t_end, h, gates, controllers, steps_per_period, damping_steps, max_steps,
+            progress, cancel,
         )
 
     commanded = [c.id for c in netlist.components if isinstance(c.waveform, Command)]
     if commanded:
-        raise ValueError(
-            f"指令で値が決まる電源 {commanded} がある。指令を出す制御器（controllers）を渡す"
-        )
+        raise CodedError("ARG_COMMAND_NEEDS_CONTROLLER", ids=Names(commanded))
     if h is None:
-        raise ValueError("スイッチの無い回路では時間刻み h が必要")
+        raise CodedError("ARG_H_REQUIRED")
     if steps_per_period is not None:
-        raise ValueError("steps_per_period を使えるのは、ゲート信号（gates）を渡すときだけ")
-    return _simulate_linear(netlist, t_end, h, damping_steps, max_steps)
+        raise CodedError("ARG_STEPS_PER_PERIOD_WITHOUT_GATES")
+    return _simulate_linear(netlist, t_end, h, damping_steps, max_steps, progress, cancel)
 
 
 def _simulate_linear(
-    netlist: Netlist, t_end: float, h: float, damping_steps: int, max_steps: int | None
+    netlist: Netlist, t_end: float, h: float, damping_steps: int, max_steps: int | None,
+    progress=None, cancel=None,
 ) -> Result:
     """スイッチの無い回路。"""
-    notes: list[str] = []
+    notes: list[Message] = []
     n_steps = _count_steps(t_end, h, max_steps, notes)
 
     system = build_system(netlist)
     _check_result_size(n_steps, len(system.unknowns), max_steps, len(system.sources))
-    u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
+    monitor = _Monitor(n_steps, h, progress, cancel)
+    u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes, monitor.tick)
 
     try:
         ops = kernel.prepare(system.E, system.G, system.B, h)
@@ -671,35 +999,50 @@ def _simulate_linear(
     n_damp = damping_steps if _has_unresolved_rate(rates, h) else 0
 
     out = np.empty((n_steps + 1, len(system.unknowns)))
-    kernel.run(
-        ops.P, ops.Q, ops.Rx, ops.Ru, x0, u_start, u_end, event, out,
-        ops.Pd, ops.Qd_start, ops.Qd_end, n_damp,
-    )
-    if u_last is not None:
-        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
-        out[n_steps] = ops.Rx @ out[n_steps] + ops.Ru @ u_last
+    out[0] = x0
+    monitor.attach(out, system.unknowns, *_divergence_limits(system, t_end))
+    # 区切りごとに核を呼ぶ（区切りの初めの値は、前の区切りの最後の値。減衰ステップの残りも引き継ぐ）
+    k, damp = 0, -1
+    with np.errstate(**_QUIET_OVERFLOW):
+        while k < n_steps:
+            k_next = monitor.next_check
+            damp = kernel.run(
+                ops.P, ops.Q, ops.Rx, ops.Ru, out[k], u_start[k:k_next], u_end[k:k_next], event[k:k_next],
+                out[k:k_next + 1], ops.Pd, ops.Qd_start, ops.Qd_end, n_damp, damp,
+            )
+            k = k_next
+            monitor.after(k)
+        if u_last is not None:
+            # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+            out[n_steps] = ops.Rx @ out[n_steps] + ops.Ru @ u_last
+            monitor.recheck(n_steps)
+    monitor.finish_run()
 
-    return Result(
-        t=h * np.arange(n_steps + 1),
+    result = Result(
+        t=_time_grid(n_steps, h, monitor.tick),
         x=out,
         unknowns=system.unknowns,
         netlist=netlist,
         h=h,
         notes=notes,
+        signal_info=describe_signals(netlist, system.unknowns),
     )
+    monitor.finish()
+    return result
 
 
 # ---------------------------------------------------------------- スイッチング
 
-def _whole_steps(period: float, h: float, what: str) -> int:
-    """周期が時間刻みの何ステップ分か。整数倍でなければエラー。"""
+def _whole_steps(period: float, h: float, gate: str | None = None) -> int:
+    """周期が時間刻みの何ステップ分か。整数倍でなければエラー。
+
+    gate はゲート信号の名前（無ければ制御周期）。"""
     ratio = period / h
     n = int(round(ratio))
     if n < 1 or abs(ratio - n) > _GRID_TOL * max(n, 1):
-        raise ValueError(
-            f"{what}（{period:.6g} s）が時間刻み h（{h:.6g} s）の整数倍になっていない。"
-            "h を周期の整数分の1にする"
-        )
+        if gate is None:
+            raise CodedError("CONTROL_PERIOD_NOT_MULTIPLE", period=Value(period, "s"), h=Value(h, "s"))
+        raise CodedError("GATE_PERIOD_NOT_MULTIPLE", name=gate, period=Value(period, "s"), h=Value(h, "s"))
     return n
 
 
@@ -759,6 +1102,28 @@ class _StateTable:
         return s
 
 
+def _time_grid(n_steps: int, h: float, tick) -> np.ndarray:
+    """時刻の格子 h·k（k = 0〜n_steps）。区切りで作る（値はまとめて作ったときと同じ）。"""
+    t = np.empty(n_steps + 1)
+    for b0, b1 in _blocks(n_steps + 1, tick):
+        t[b0:b1] = h * np.arange(b0, b1)
+    return t
+
+
+def _used_codes(table: _StateTable, code0: int, codes: np.ndarray, tick) -> np.ndarray:
+    """計算で使ったスイッチング状態の符号（昇順。np.unique と同じ）。
+
+    用意した状態が少なければ、状態ごとに「使ったか」を区切りで見る（並べ替えより速い）。"""
+    if table.count > 16:
+        return np.unique(np.concatenate([[code0], codes]))
+    seen = {int(code0)}
+    candidates = [int(c) for c in table.code[: table.count]]
+    for b0, b1 in _blocks(len(codes), tick):
+        block = codes[b0:b1]
+        seen.update(c for c in candidates if c not in seen and bool(np.any(block == c)))
+    return np.array(sorted(seen), dtype=np.int64)
+
+
 def _flip_limit(n_diodes: int) -> int:
     """1ステップの中で、ダイオードの状態の反転を何回まで試すか。"""
     return max(20, 4 * n_diodes)
@@ -809,9 +1174,8 @@ def _initial_state(
     if violation <= band:
         return best_code, best_x0, True
     raise CircuitError(
-        f"時刻 t=0 でダイオードの状態が {max_flips} 回の反転で落ち着かない。"
-        f"最後に試した状態: {describe_state(system, code)}。"
-        + _unsettled_hint(system, flipped, last, band)
+        "DIODES_NOT_SETTLED_AT_START", t=Value(0.0, "s"), flips=max_flips, state=describe_state(system, code),
+        hints=_unsettled_hint(system, flipped, last, band),
     )
 
 
@@ -829,30 +1193,24 @@ def _diode_band(x: np.ndarray, n_nodes: int) -> float:
 
 def _unsettled_hint(
     system: System, flipped: list[int], last: dict[int, float], band: float | None = None
-) -> str:
-    """ダイオードの状態が決まらないときの、手がかりと直し方。"""
+) -> list[Message]:
+    """ダイオードの状態が確定しないときの、手がかりと直し方。"""
     parts = []
     most = max(flipped, default=0)
     if most > 0:
-        detail = ", ".join(
-            f"{system.devices[j]}（最後の電圧 {last[j]:.3g} V）"
+        detail = [
+            Message("HINT_DIODE_VOLTAGE", id=system.devices[j], v=Value(last[j], "V"))
             for j, n in enumerate(flipped) if n == most and j in last
-        )
-        parts.append(f"オンとオフを繰り返したダイオード: {detail}")
+        ]
+        parts.append(Message("HINT_DIODES_FLIPPING", diodes=detail))
     ratio = max(
         (float(system.dev_g_on[j] / system.dev_g_off[j])
          for j in range(system.n_switches, len(system.devices))),
         default=0.0,
     )
-    band_text = f"（いまは ±{band:.3g} V）" if band is not None else ""
-    parts.append(
-        "オンにしてもオフにしても、ダイオードの電圧が判定と食い違い、その食い違いが丸め誤差とみなせる幅"
-        f"{band_text}より大きい。"
-        f"r_off / r_on の比（いまは最大 {ratio:.3g}）が大きいほど丸め誤差が大きくなる。"
-        "r_off を小さく（例 1e5 Ω）、または r_on を大きくして試す。"
-        "ダイオードどうしが向きをそろえずに並列・直列につながった部分が無いかも確認する"
-    )
-    return "。".join(parts)
+    band_part = Message("FRAG_BAND", band=Value(band, "V")) if band is not None else None
+    parts.append(Message("HINT_DIODES_ROUNDING", band=band_part, ratio=Value(ratio)))
+    return parts
 
 
 def _simulate_switched(
@@ -864,8 +1222,10 @@ def _simulate_switched(
     steps_per_period: int | None,
     damping_steps: int,
     max_steps: int | None,
+    progress=None,
+    cancel=None,
 ) -> Result:
-    notes: list[str] = []
+    notes: list[Message] = []
 
     # --- ゲート信号と時間刻み -------------------------------------------------
     # ゲート信号の出力。相補のゲートがあるPWMは2つ出す（反転の印つき）
@@ -873,26 +1233,24 @@ def _simulate_switched(
     gate_source = [(i, j == 1) for i, g in enumerate(gates) for j in range(len(g.outputs))]
     dup = sorted({n for n in gate_names if gate_names.count(n) > 1})
     if dup:
-        raise ValueError(f"ゲート信号の名前が重複している: {dup}")
+        raise CodedError("GATE_NAMES_DUPLICATE", names=Names(dup))
     for c in netlist.components:
         if c.type == "S" and c.gate not in gate_names:
-            raise ValueError(
-                f"{c.id}: ゲート信号 '{c.gate}' が渡されていない。渡された名前: {gate_names}"
-            )
+            raise CodedError("GATE_NOT_GIVEN", id=c.id, gate=c.gate, names=Names(gate_names))
     if h is None:
         if not gates:
-            raise ValueError("ゲート信号（gates）が無いときは、時間刻み h を指定する")
+            raise CodedError("ARG_H_REQUIRED_WITHOUT_GATES")
         n_div = DEFAULT_STEPS_PER_PERIOD if steps_per_period is None else steps_per_period
         if n_div < 2:
-            raise ValueError("steps_per_period は 2 以上にする")
+            raise CodedError("ARG_STEPS_PER_PERIOD_MIN")
         h = 1.0 / (max(g.frequency for g in gates) * n_div)
     elif steps_per_period is not None:
-        raise ValueError("h と steps_per_period は、どちらか一方だけを指定する")
+        raise CodedError("ARG_H_AND_STEPS_PER_PERIOD")
     n_steps = _count_steps(t_end, h, max_steps, notes)
-    gate_steps = [_whole_steps(1.0 / g.frequency, h, f"ゲート信号 '{g.name}' の周期") for g in gates]
+    gate_steps = [_whole_steps(1.0 / g.frequency, h, g.name) for g in gates]
     for g, n_div in zip(gates, gate_steps, strict=True):
         if n_div < 2:
-            raise ValueError(f"ゲート信号 '{g.name}': 1周期が1ステップしか無い。h を小さくする")
+            raise CodedError("GATE_PERIOD_ONE_STEP", name=g.name)
 
     # --- 回路 -----------------------------------------------------------------
     system = build_system(netlist)
@@ -906,9 +1264,16 @@ def _simulate_switched(
         n_steps, n, max_steps, len(system.sources), switched=True, n_gates=len(gate_names),
         n_commands=sum(len(c.outputs) for c in controllers if isinstance(c, Controller)), n_devices=n_dev,
     )
-    u_start, u_end, event, u_last = _sample_sources(system, n_steps, h, notes)
-    u_mid = 0.5 * (u_start + u_end)
-    source_event = event.copy()                          # 時刻で決まる電源の不連続点（指令によるものを除く）
+    monitor = _Monitor(n_steps, h, progress, cancel)
+    u_start, u_end, source_event, u_last = _sample_sources(system, n_steps, h, notes, monitor.tick)
+    u_mid = np.empty_like(u_start)
+    # 不連続点の印（核に渡す）: event は電源が不連続に変わる点（時刻で決まる電源のステップと、指令で決まる
+    # 電源の変わり目）。そのうち source_event（時刻で決まる電源のステップ）の点には変わった後の値を記録し、
+    # 指令で決まる電源だけが変わる点には、変わる直前の値を記録する（D-048）
+    event = np.empty(n_steps, dtype=bool)
+    for b0, b1 in _blocks(n_steps, monitor.tick):
+        u_mid[b0:b1] = 0.5 * (u_start[b0:b1] + u_end[b0:b1])
+        event[b0:b1] = source_event[b0:b1]
     command_event = np.zeros(n_steps + 1, dtype=bool)    # 指令で決まる電源の値が変わった点
 
     # --- 制御器と指令 ---------------------------------------------------------
@@ -918,18 +1283,17 @@ def _simulate_switched(
     ctrl_outputs: list[list[int]] = []
     for c in controllers:
         if not isinstance(c, Controller):
-            raise TypeError(
-                f"制御器 {type(c).__name__} に period / inputs / outputs / reset() / step() のどれかが無い"
-            )
-        ctrl_steps.append(_whole_steps(float(c.period), h, "制御周期"))
+            raise CodedTypeError("CONTROLLER_SHAPE", type=type(c).__name__)
+        ctrl_steps.append(_whole_steps(float(c.period), h))
         missing = [name for name in c.inputs if name not in system.unknowns]
         if missing:
-            raise ValueError(f"制御器が測る信号 {missing} が回路に無い。使える名前: {system.unknowns}")
+            raise CodedError("CONTROLLER_INPUT_UNKNOWN", names=Names(missing),
+                             available=Names(system.unknowns))
         ctrl_inputs.append([system.unknowns.index(name) for name in c.inputs])
         outs = []
         for name in c.outputs:
             if name in cmd_names:
-                raise ValueError(f"指令の名前 '{name}' が重複している")
+                raise CodedError("COMMAND_NAME_DUPLICATE", name=name)
             outs.append(len(cmd_names))
             cmd_names.append(name)
         ctrl_outputs.append(outs)
@@ -937,10 +1301,8 @@ def _simulate_switched(
     for g in gates:
         if isinstance(g.duty, str):
             if g.duty not in cmd_names:
-                raise ValueError(
-                    f"ゲート信号 '{g.name}': デューティ指令 '{g.duty}' を出す制御器が無い。"
-                    f"制御器が出す指令: {cmd_names}"
-                )
+                raise CodedError("GATE_DUTY_COMMAND_UNKNOWN", name=g.name, command=g.duty,
+                                 commands=Names(cmd_names))
             gate_cmd.append(cmd_names.index(g.duty))
         else:
             gate_cmd.append(-1)
@@ -950,23 +1312,27 @@ def _simulate_switched(
         w = netlist.component(cid).waveform
         if isinstance(w, Command):
             if w.command not in cmd_names:
-                raise ValueError(
-                    f"{cid}: 電源の値を決める指令 '{w.command}' を出す制御器が無い。"
-                    f"制御器が出す指令: {cmd_names}"
-                )
+                raise CodedError("SOURCE_COMMAND_UNKNOWN", id=cid, command=w.command,
+                                 commands=Names(cmd_names))
             commanded.append((j, cmd_names.index(w.command), w))
 
     def commands(c: Controller, values, t: float, n_out: int) -> np.ndarray:
         """制御器が返した指令を配列にして確かめる。"""
         y = np.atleast_1d(np.asarray(values, dtype=float))
         if y.shape != (n_out,):
-            raise ValueError(f"制御器が返した指令の数が outputs（{list(c.outputs)}）と合わない: {values!r}")
+            raise CodedError("CONTROLLER_OUTPUT_COUNT", outputs=Names(c.outputs), values=repr(values))
         if not np.isfinite(y).all():
-            raise ValueError(f"時刻 t={t:.6g} s で制御器の指令 {list(c.outputs)} が有限値でない: {y}")
+            if monitor.out is not None:
+                # 回路の変数が先に発散していれば、そちらを知らせる（測った値が有限でないと、指令もそうなる）
+                monitor.check_values(int(ctl[kernel.CTL_K]))
+            # signal は、有限でない最初の指令（結果の名前の形。画面の N-RUN-DIVERGED の {signal} に使う）
+            first_bad = c.outputs[int(np.argmax(~np.isfinite(y)))]
+            raise DivergenceError("CONTROLLER_COMMAND_NOT_FINITE", t=Value(t, "s"),
+                                  signal=f"cmd({first_bad})", outputs=Names(c.outputs), values=str(y))
         return y
 
     active = np.zeros(len(cmd_names))      # いま使っている指令
-    pending = np.zeros(len(cmd_names))     # 次の制御周期の頭から使う指令
+    pending = np.zeros(len(cmd_names))     # 次の制御周期の先頭から使う指令
     for c, outs in zip(controllers, ctrl_outputs, strict=True):
         active[outs] = commands(c, c.reset(), 0.0, len(outs))
     pending[:] = active
@@ -978,32 +1344,45 @@ def _simulate_switched(
     gate_out = np.zeros((n_steps + 1, len(gates)), dtype=bool)
     cmd_out = np.zeros((n_steps + 1, len(cmd_names)))
 
-    latched = np.zeros(len(gates), dtype=np.int64)     # いまの搬送波の周期のオンのステップ数
+    latched = np.zeros(len(gates), dtype=np.int64)     # いまのキャリアの周期のオンのステップ数
     carried = np.zeros(len(gates))                      # 次の周期に持ち越す丸めの余り
 
     def fill(k0: int, k1: int) -> None:
         """区間 [k0, k1) のゲート信号・指令・スイッチのビットを、いまの指令で埋める。
 
-        デューティは搬送波の周期の頭で取り込む。区間の途中から始まる周期は、取り込み済みの値を使う。
+        デューティはキャリアの周期の先頭で取り込む。区間の途中から始まる周期は、取り込み済みの値を使う。
+        周期ごとのオンのステップ数は区間でまとめて決め、ステップごとの配列は SETUP_BLOCK 行ずつ埋める
+        （制御器の無い回路では区間が計算の全体になるので、そのあいだも中断の求めを見る）。
+        最初の区間は計算の準備のうち、2つ目からの区間は時間ステップの最中（格子点 k0 まで計算が済んで
+        いる）。どちらかは monitor が知っている（進み具合を、その段階の値で知らせる）。
         """
-        k = np.arange(k0, k1)
-        cmd_out[k0:k1] = active
+        tick = None
+        if k1 - k0 > SETUP_BLOCK:
+            monitor.filling(k0, k1)
+            tick = monitor.tick
+        per_gate = []
         for g, (pwm, n_div) in enumerate(zip(gates, gate_steps, strict=True)):
             duty = pwm.duty if gate_cmd[g] < 0 else float(active[gate_cmd[g]])
             first = -(-k0 // n_div)                     # この区間の中で始まる最初の周期の番号
             n_periods = max(0, -(-k1 // n_div) - first)
             counts, carried[g] = pwm.on_counts(duty, n_div, n_periods, float(carried[g]))
-            index = k // n_div - first                  # 負なら、区間の前に始まった周期
-            n_on = np.where(index >= 0, counts[np.maximum(index, 0)] if n_periods else 0, latched[g])
+            per_gate.append((pwm, n_div, first, n_periods, counts, int(latched[g])))
             if n_periods:
                 latched[g] = counts[-1]
-            gate_out[k0:k1, g] = pwm.pattern(k, n_div, n_on)
-        code = np.zeros(k1 - k0, dtype=np.int64)
-        for j, (g, inverted) in enumerate(switch_gate):
-            on = ~gate_out[k0:k1, g] if inverted else gate_out[k0:k1, g]
-            code |= on.astype(np.int64) << j
-        sw_code[k0:k1] = code
+        for b0, b1 in (_blocks(k1, tick, k0) if tick is not None else ((k0, k1),)):
+            k = np.arange(b0, b1)
+            cmd_out[b0:b1] = active
+            for g, (pwm, n_div, first, n_periods, counts, before) in enumerate(per_gate):
+                index = k // n_div - first              # 負なら、区間の前に始まった周期
+                n_on = np.where(index >= 0, counts[np.maximum(index, 0)] if n_periods else 0, before)
+                gate_out[b0:b1, g] = pwm.pattern(k, n_div, n_on)
+            code = np.zeros(b1 - b0, dtype=np.int64)
+            for j, (g, inverted) in enumerate(switch_gate):
+                on = ~gate_out[b0:b1, g] if inverted else gate_out[b0:b1, g]
+                code |= on.astype(np.int64) << j
+            sw_code[b0:b1] = code
         # 指令で決まる電源は、区間のあいだ一定。前の区間と値が変わったら、その点を電源の不連続点にする
+        # （時刻で決まる電源のステップと重ならなければ、その点の記録は変わる直前の値のまま）
         for j, c, w in commanded:
             value = w.value(float(active[c]))
             if k0 > 0 and value != u_end[k0 - 1, j]:
@@ -1030,48 +1409,60 @@ def _simulate_switched(
     ctl[kernel.CTL_DAMP] = damping_steps      # 計算の先頭も、減衰ステップから始める
     d_pos = np.ascontiguousarray(system.dev_pos[n_sw:])
     d_neg = np.ascontiguousarray(system.dev_neg[n_sw:])
+    monitor.attach(out, system.unknowns, *_divergence_limits(system, t_end))
 
-    # --- 制御周期ごとに区切って核を呼ぶ ---------------------------------------
-    while True:
+    # --- 制御周期ごとに区切って核を呼ぶ（その中も、確かめの区切りで区切る） ----------------
+    # k_done は計算の済んだ最後の格子点（核の ctl[CTL_K] と同じ値。制御周期ごとに ctl から読み直す手間を
+    # 省くため、こちらで数える）。next_check は次の確かめの点（monitor.after() の後にだけ変わる）
+    k_done, next_check = 0, monitor.next_check
+    with np.errstate(**_QUIET_OVERFLOW):
         while True:
-            status = kernel.run_switched(
-                table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
-                table.Rx, table.Ru, table.code, table.count,
-                d_pos, d_neg, n_sw,
-                u_start, u_mid, u_end, event, sw_code,
-                x, ctl, k1,
-                damping_steps, SIMULTANEOUS_FLIPS, max_flips, DIODE_ON_VOLTAGE,
-                out, code_out,
-            )
-            if status == kernel.DONE:
+            while k_done < k1:
+                k_stop = k1 if k1 < next_check else next_check
+                status = kernel.run_switched(
+                    table.P, table.Q, table.Pb, table.Qb, table.Pd, table.Qd_start, table.Qd_end,
+                    table.Rx, table.Ru, table.code, table.count,
+                    d_pos, d_neg, n_sw,
+                    u_start, u_mid, u_end, event, source_event, sw_code,
+                    x, ctl, k_stop,
+                    damping_steps, SIMULTANEOUS_FLIPS, max_flips, DIODE_ON_VOLTAGE,
+                    out, code_out,
+                )
+                if status == kernel.DONE:
+                    k_done = k_stop            # 核は k_stop まで進んで戻る（k_done < k_stop なので）
+                    if k_done >= next_check:
+                        monitor.after(k_done)
+                        next_check = monitor.next_check
+                    continue
+                code = int(ctl[kernel.CTL_CODE])
+                if status == kernel.NEED_STATE:
+                    table.slot(code)       # 行列を用意して、同じステップからやり直す
+                    continue
+                k = int(ctl[kernel.CTL_K])
+                monitor.check_values(k)    # 値が発散していて確定しないなら、発散として知らせる
+                raise CircuitError(
+                    "DIODES_NOT_SETTLED", t=Value(k * h, "s"), k=k, flips=max_flips,
+                    state=describe_state(system, code), hints=_unsettled_hint(system, [], {}),
+                )
+            # k0 の測定値で演算する。結果は次の制御周期の先頭から使う
+            for c, m, ins, outs in zip(controllers, ctrl_steps, ctrl_inputs, ctrl_outputs, strict=True):
+                if k0 % m == 0:
+                    pending[outs] = commands(c, c.step(k0 * h, out[k0, ins].copy()), k0 * h, len(outs))
+            for m, outs in zip(ctrl_steps, ctrl_outputs, strict=True):
+                if k1 % m == 0:
+                    active[outs] = pending[outs]
+            if k1 >= n_steps:
                 break
-            code = int(ctl[kernel.CTL_CODE])
-            if status == kernel.NEED_STATE:
-                table.slot(code)       # 行列を用意して、同じステップからやり直す
-                continue
-            k = int(ctl[kernel.CTL_K])
-            raise CircuitError(
-                f"時刻 t={k * h:.6g} s（ステップ {k}）でダイオードの状態が {max_flips} 回の反転で"
-                f"落ち着かない。最後に試した状態: {describe_state(system, code)}。"
-                + _unsettled_hint(system, [], {})
-            )
-        # k0 の測定値で演算する。結果は次の制御周期の頭から使う
-        for c, m, ins, outs in zip(controllers, ctrl_steps, ctrl_inputs, ctrl_outputs, strict=True):
-            if k0 % m == 0:
-                pending[outs] = commands(c, c.step(k0 * h, out[k0, ins].copy()), k0 * h, len(outs))
-        for m, outs in zip(ctrl_steps, ctrl_outputs, strict=True):
-            if k1 % m == 0:
-                active[outs] = pending[outs]
-        if k1 >= n_steps:
-            break
-        k0, k1 = k1, next_stop(k1)
-        fill(k0, k1)
-    if u_last is not None:
-        # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
-        s_last = table.slot(int(ctl[kernel.CTL_STATE]))
-        out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
+            k0, k1 = k1, next_stop(k1)
+            fill(k0, k1)
+        if u_last is not None:
+            # 最後の格子点でちょうど電源がステップする場合も、その点にはステップした後の値を入れる
+            s_last = table.slot(int(ctl[kernel.CTL_STATE]))
+            out[n_steps] = table.Rx[s_last] @ out[n_steps] + table.Ru[s_last] @ u_last
+            monitor.recheck(n_steps)
+    monitor.finish_run()
     # 刻みが回路の速い成分を解像しているか（計算で使った回路状態ごと。スイッチの無い回路と同じ注意）
-    used = np.unique(np.concatenate([[code0], code_out[:n_steps]]))
+    used = _used_codes(table, code0, code_out[:n_steps], monitor.tick)
     rates, rate_state = _switched_rates(system, table, used)
 
     def who(lam: complex) -> list[str]:
@@ -1083,8 +1474,13 @@ def _simulate_switched(
         rates, h, notes, damped=damping_steps > 0, n_steps=n_steps,
         limit=MAX_STEPS if max_steps is None else max_steps, who=who,
     )
-    before = np.concatenate([[code0], code_out[: n_steps - 1]])
-    _interruption_notes(system, out, before, code_out[:n_steps], u_start, h, notes)
+    monitor.tick()
+    before = np.empty(n_steps, dtype=np.int64)
+    before[0] = code0
+    for b0, b1 in _blocks(n_steps - 1, monitor.tick):
+        before[b0 + 1: b1 + 1] = code_out[b0:b1]
+    _interruption_notes(system, out, before, code_out[:n_steps], u_start, h, notes, monitor.tick)
+    monitor.tick()
     # 最後の点から始まる区間は無いので、区間ごとの記録は最後の区間の値を繰り返す
     gate_out[n_steps] = gate_out[n_steps - 1]
     cmd_out[n_steps] = cmd_out[n_steps - 1]
@@ -1092,21 +1488,36 @@ def _simulate_switched(
 
     # --- 結果 -----------------------------------------------------------------
     signals: dict[str, np.ndarray] = {}
-    for name, (g, inverted) in zip(gate_names, gate_source, strict=True):
-        signals[f"gate({name})"] = (~gate_out[:, g] if inverted else gate_out[:, g]).astype(float)
-    for j, name in enumerate(cmd_names):
-        signals[f"cmd({name})"] = cmd_out[:, j].copy()
-    for j, cid in enumerate(system.devices):
-        signals[f"on({cid})"] = ((code_out >> j) & 1).astype(float)
+    for name in gate_names:
+        signals[f"gate({name})"] = np.empty(n_steps + 1)
+    for name in cmd_names:
+        signals[f"cmd({name})"] = np.empty(n_steps + 1)
+    for cid in system.devices:
+        signals[f"on({cid})"] = np.empty(n_steps + 1)
     sample_state = np.empty(n_steps + 1, dtype=np.int64)
     sample_state[0] = code0
-    sample_state[1:] = code_out[:n_steps]
+    for b0, b1 in _blocks(n_steps + 1, monitor.tick):
+        for name, (g, inverted) in zip(gate_names, gate_source, strict=True):
+            on = ~gate_out[b0:b1, g] if inverted else gate_out[b0:b1, g]
+            signals[f"gate({name})"][b0:b1] = on
+        for j, name in enumerate(cmd_names):
+            signals[f"cmd({name})"][b0:b1] = cmd_out[b0:b1, j]
+        for j, cid in enumerate(system.devices):
+            signals[f"on({cid})"][b0:b1] = (code_out[b0:b1] >> j) & 1
+        sample_state[max(b0, 1): b1] = code_out[max(b0, 1) - 1: b1 - 1]
     # 核は「回路状態が変わる、または電源が不連続」のステップを数える。指令の変化だけによるものを分けて数える
-    state_changed = code_out[:n_steps] != sample_state[:n_steps]
-    only_command = command_event[:n_steps] & ~source_event[:n_steps] & ~state_changed
+    only_command = 0
+    for b0, b1 in _blocks(n_steps, monitor.tick):
+        state_changed = code_out[b0:b1] != sample_state[b0:b1]
+        only_command += int(np.count_nonzero(command_event[b0:b1] & ~source_event[b0:b1] & ~state_changed))
+    t_grid = _time_grid(n_steps, h, monitor.tick)
 
-    return Result(
-        t=h * np.arange(n_steps + 1),
+    gate_switches: dict[str, list[str]] = {}
+    for c in netlist.components:
+        if c.type == "S":
+            gate_switches.setdefault(c.gate, []).append(c.id)
+    result = Result(
+        t=t_grid,
         x=out,
         unknowns=system.unknowns,
         netlist=netlist,
@@ -1117,9 +1528,12 @@ def _simulate_switched(
         sample_state=sample_state,
         stats={
             "states": table.count,
-            "state_changes": int(ctl[kernel.CTL_CHANGES]) - int(np.count_nonzero(only_command)),
+            "state_changes": int(ctl[kernel.CTL_CHANGES]) - only_command,
             "command_changes": int(np.count_nonzero(command_event)),
             "retries": int(ctl[kernel.CTL_RETRIES]),
             "rescues_at_start": int(rescued_at_start),
         },
+        signal_info=describe_signals(netlist, system.unknowns + list(signals), gate_switches),
     )
+    monitor.finish()
+    return result

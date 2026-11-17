@@ -1,4 +1,4 @@
-"""時刻で決まる区分一定の値（指令値の段差、負荷の段差など）と、それを指令として出す制御器。"""
+"""時刻で決まる区分一定の値（指令値のステップ、負荷ステップなど）と、それを指令として出す制御器。"""
 from __future__ import annotations
 
 import math
@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+
+from ..messages import CodedError
 
 TIME_TOL = 1e-6          # 時刻の比較の許容（制御周期に対する比）。格子の時刻 k·h の丸め誤差を吸収する
 
@@ -21,9 +23,9 @@ class Schedule:
         times = [t for t, _ in self.changes]
         values = [self.initial] + [v for _, v in self.changes]
         if not all(math.isfinite(v) for v in values) or not all(math.isfinite(t) and t >= 0 for t in times):
-            raise ValueError(f"区分一定の値の時刻と値は有限値にする（時刻は 0 以上）: {self}")
+            raise CodedError("SCHEDULE_NOT_FINITE", schedule=repr(self))
         if any(b < a for a, b in zip(times, times[1:], strict=False)):
-            raise ValueError(f"区分一定の値の切り替えの時刻は昇順に並べる: {times}")
+            raise CodedError("SCHEDULE_ORDER", times=str(times))
 
     @classmethod
     def constant(cls, value: float) -> Schedule:
@@ -43,7 +45,7 @@ class Schedule:
 class ScheduleController:
     """時刻で決まる指令を出す制御器（Controller の口。測る信号は無い）。
 
-    指令は次の制御周期の頭から使われる（1サンプル遅れ）ので、時刻 t の演算では t + period の値を返す。
+    指令は次の制御周期の先頭から使われる（1サンプル遅れ）ので、時刻 t の演算では t + period の値を返す。
     こうすると、指令は予定の時刻（制御周期の格子に切り上げた時刻）ちょうどに変わる。
     """
 

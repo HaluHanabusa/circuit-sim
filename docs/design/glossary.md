@@ -217,20 +217,32 @@ PO の問い（2026-11-16）「電気、電子の専門用語はきちんと押�
 
 ## 9. エンジンの注意とエラーの文で直すもの（`circuit_sim/` の中）
 
-場所は統合前の E1b の行。E1g（注意とエラーを番号と辞書にする作業）で、辞書の日本語を作るときに直す（D-063 の7）。E1g の受け入れ基準2は「既存の受け入れ試験が見ている日本語の文面を変えない」なので、文面を見ている試験の直しも E1g の範囲に入れ、E1g の検証担当が直す（D-063 の7）。
+**片付いた（E1g、2026-11-16）。** 下の 10 行を、注意とエラーの辞書（`circuit_sim/messages.py` の日本語）と、初期ゲインの設計の文（`tuning/initial.py`）で直した。ほかに、D-063 の言い換え（「回路状態」→「スイッチング状態（回路状態）」、「モデルの精度」→「モデルの種類」、「搬送波」→「キャリア」）を、解けない回路のエラー（`CIRCUIT_EXPLAINED_IN_STATE`）とコードの説明にも入れた。英語の文面は 11章と各表の英語の列にそろえた（time step、stop time、load step、integer multiple、freewheeling path、aliasing、switching state、gain crossover frequency）。試験 `tests/test_e1g_messages.py` が、辞書の日本語に直す前の言葉が残っていないことを確かめる。
 
-| # | 場所 | いまの文 | 直す案 |
-|---|---|---|---|
-| 1 | `simulate.py`（インダクタ電流の遮断の注意） | 電流…の行き場が、オフのスイッチやダイオード…しか無くなり | 「還流経路が無くなり（残るのはオフのスイッチやダイオード…だけ）」 |
-| 2 | `simulate.py`（正弦波の点数の注意） | 波形が折り返して、別の周波数や振幅に見える | 「エイリアシング（折り返し）で、別の周波数や振幅に見える」 |
-| 3 | `simulate.py`（ステップ数の上限、終了時刻の丸めなど。3か所）、`templates/t0.py`（既定の終了時刻を短くした注意） | 計算時間 t_end、既定の計算時間 | 「終了時刻 t_end」「既定の終了時刻」（画面と同じ語） |
-| 4 | `simulate.py`（ダイオードの状態のエラー。2か所） | 状態が…落ち着かない | 「状態が…確定しない」 |
-| 5 | `templates/buck.py`（4つの文） | 負荷の段差、段差は波形に現れない | 「負荷ステップ」「ステップは波形に現れない」 |
-| 6 | `templates/buck.py`（ステップの時刻の注意） | 次のスイッチング周期の頭…に合わせた | 「次のスイッチング周期の先頭」 |
-| 7 | `templates/items.py`（版 0.1 の注意） | 出どころは「記載なし」 | 「出典は「記載なし」」 |
-| 8 | `tuning/initial.py`（失敗の理由の4つの文） | 交差周波数 | 「ゲイン交差周波数」 |
-| 9 | `tuning/initial.py`（不安定、安定の余裕なし、最良の候補の文） | 閉ループの極の半径 | 「閉ループ極の絶対値の最大」 |
-| 10 | `control/pwm.py`、`templates/legs.py`（未対応のエラー） | 未対応の搬送波、未対応のモデルの精度 | 「未対応のキャリア」「未対応のモデルの種類」 |
+直す前の文面を見ている受け入れ試験は、E1g の実装では直さず（落ちたまま）、E1g の検証担当が直す（D-063 の7）。E1g の実装の時点で、用語の是正で落ちるのは次の 11 件（直す前の言葉を新しい言葉に置き換えた写しでは、どれも元の結果に戻ることを確かめた）。
+
+| 受け入れ試験 | 見ている言葉 → 直した言葉 |
+|---|---|
+| `test_e1a_units_limits.py::test_c14_slowly_decaying_oscillation_shortens_the_default_time_and_says_so` | 「計算時間」→「終了時刻」 |
+| `test_e1b_extreme_inputs.py::test_huge_load_agrees_with_150_digit_reference`（6 件） | 「閉ループの極の半径」→「閉ループ極の絶対値の最大」 |
+| `test_e1b_near_unit_circle.py::test_radius_shown_as_below_one_when_it_says_below_one` | 「極の半径」→「閉ループ極の絶対値の最大」 |
+| `test_e1c_followups.py::test_x_interruption_example_of_the_review_is_noted` | 遮断の注意を探す言葉「行き場」→「還流経路」（`interruption_notes`） |
+| `test_e1c_followups.py::test_x_normal_turn_off_in_current_driven_circuit_is_not_an_interruption`、`test_e1c_recheck.py::test_leakage_through_low_off_resistance_is_not_an_interruption` | 同じ「行き場」。xfail(strict) の試験で、注意を探せなくなって XPASS になる。言葉を直すと、もとの xfail に戻る（製品の軽微な不具合は残っている。xfail の印は外さない） |
+
+用語の是正とは別に、E1g の仕様が決めた変更（コマンドラインの CSV の注意の行、D-048 の記録の決まり）で期待値が古くなった受け入れ試験が 2 件あった。どちらも片付いた: CSV の注意の行は D-075 でやめたので、`test_e1a_units_limits.py::test_c14_cli_reports_the_limit_in_one_line` は元の期待のまま通る。D-048 の 1 件（`test_e1b_recheck.py::test_average_leg_is_a_command_source_with_the_on_resistance_in_series`）は、検証担当が期待値を改めた（`docs/verification/E1g-verifier.md`）。
+
+| # | 場所 | 直す前の文 | 直した文 | E1g で直した番号（`circuit_sim/messages.py`） |
+|---|---|---|---|---|
+| 1 | `simulate.py`（インダクタ電流の遮断の注意） | 電流…の行き場が、オフのスイッチやダイオード…しか無くなり | 「還流経路が無くなり（残るのはオフのスイッチやダイオード…だけ）」 | `INDUCTOR_CURRENT_INTERRUPTED` |
+| 2 | `simulate.py`（正弦波の点数の注意） | 波形が折り返して、別の周波数や振幅に見える | 「エイリアシング（折り返し）で、別の周波数や振幅に見える」 | `SINE_UNDERSAMPLED` |
+| 3 | `simulate.py`（ステップ数の上限、終了時刻の丸めなど。3か所）、`templates/t0.py`（既定の終了時刻を短くした注意） | 計算時間 t_end、既定の計算時間 | 「終了時刻 t_end」「既定の終了時刻」（画面と同じ語） | `STEPS_OVER_LIMIT`、`T_END_ROUNDED`、`STEP_COARSE_OVER_LIMIT`（「この終了時刻では」）、`DEFAULT_T_END_SHORTENED`。コマンドラインの「終了時刻:」（`CLI_SUMMARY`） |
+| 4 | `simulate.py`（ダイオードの状態のエラー。2か所） | 状態が…落ち着かない | 「状態が…確定しない」 | `DIODES_NOT_SETTLED_AT_START`、`DIODES_NOT_SETTLED` |
+| 5 | `templates/buck.py`（4つの文） | 負荷の段差、段差は波形に現れない | 「負荷ステップ」「ステップは波形に現れない」 | `LOAD_STEP_SAME`、`LOAD_STEP_TOO_SMALL`、`STEP_AFTER_END` |
+| 6 | `templates/buck.py`（ステップの時刻の注意） | 次のスイッチング周期の頭…に合わせた | 「次のスイッチング周期の先頭」 | `LOAD_STEP_SNAPPED` |
+| 7 | `templates/items.py`（版 0.1 の注意） | 出どころは「記載なし」 | 「出典は「記載なし」」 | `SPEC_LEGACY_CONTROL`、`SPEC_LEGACY_CONTROL_INFERRED`（「単位と出典を確かめて」も） |
+| 8 | `tuning/initial.py`（失敗の理由の4つの文） | 交差周波数 | 「ゲイン交差周波数」 | `tuning/initial.py` の失敗の文（範囲の外の文の「ゲイン交差周波数」を含む） |
+| 9 | `tuning/initial.py`（不安定、安定の余裕なし、最良の候補の文） | 閉ループの極の半径 | 「閉ループ極の絶対値の最大」 | `tuning/initial.py` の最良の候補の文、理由 `unstable`・`no_stability_margin` の文 |
+| 10 | `control/pwm.py`、`templates/legs.py`（未対応のエラー） | 未対応の搬送波、未対応のモデルの精度 | 「未対応のキャリア」「未対応のモデルの種類」 | `CARRIER_UNKNOWN`、`FIDELITY_UNKNOWN` |
 
 ## 10. 文書とコードの説明で直すもの
 
@@ -292,3 +304,6 @@ PO の問い（2026-11-16）「電気、電子の専門用語はきちんと押�
 
 - 2026-11-16（control-engineer、S1）: 初版。
 - 2026-11-16（ux-designer、S1 の読み合わせ）: D-063 の決めごとを反映した（1.2、1.3、2〜4章、7章、8章、9章、13章）。ほかの文書で使っていて表に無かった語を足した（高分解能 PWM、評価関数と ITAE、周期平均の振れ、表示定義、お知らせ、7章のアプリの起動と安全の言葉）。D-056 の「起動の番号」は D-050 のポート（「起動の番号（ポート）」）と紛れるので、「起動コード」と呼ぶことにした。10章に、`CLAUDE.md`・`architecture.md`・`roadmap.md` に残る表記を足した。
+- 2026-11-16（solver-engineer、E1g）: 9章（エンジンの注意とエラーの文で直すもの）を片付けた。直した文の番号の列を足した。
+- 2026-11-16（solver-engineer、E1g の引き継ぎ）: 9章に、用語の是正で落ちる受け入れ試験の一覧（11 件）を書いた。
+- 2026-11-17（solver-engineer、E1g の差し戻しの直し）: 9章の、期待値が古くなった受け入れ試験 2 件の文を、片付いた形に直した（参照先の `basic-design.md` 15.3 の行を消したため）。

@@ -3,36 +3,41 @@
 回路（スイッチングモデル）:
     V1（Vin）─ in ─ S1（上）─ sw ─ L1 ─ out ─┬─ R1（R_load）─ 0
                       S2（下）: sw ─ 0       ├─ [R_esr ─ cap ─] C1 ─ 0   （C_esr があるとき）
-                                             └─ 負荷の段差: R2 ─ ld ─ S3 ─ 0（R_load_step があるとき）
+                                             └─ 負荷ステップ: R2 ─ ld ─ S3 ─ 0（R_load_step があるとき）
     S1 と S2 は相補のゲート（デッドタイム0）。S1 のデューティが制御器の指令 duty。
 平均モデル: S1 と S2 を、電圧源 Vleg = duty × Vin とオン抵抗 Rleg の直列（0 ─ Vleg ─ sw_avg ─ Rleg ─ sw）に
 置き換える（V1 は使わない。D-038。legs.py）。
 
 制御: 制御周期ごとに v(out) を測り、偏差 Vref − v(out) にPIDを掛けてデューティ指令にする
-（control/blocks.py の Pid。出力の上下限は d_min〜d_max、積分の飽和を防ぐ処理つき）。
-指令は次の制御周期の頭から使われ、PWMは搬送波の周期の頭で取り込む（演算1サンプル＋保持0.5サンプルの遅れ）。
-制御周期は搬送波の周期の整数倍にする（f_sw / f_ctrl が整数）。
+（control/blocks.py の Pid。出力の上下限は d_min〜d_max、アンチワインドアップつき）。
+指令は次の制御周期の先頭から使われ、
+PWMはキャリアの周期の先頭で取り込む（演算遅れ 1 制御周期＋保持 0.5 サンプル）。
+制御周期はキャリアの周期の整数倍にする（f_sw / f_ctrl が整数）。
 """
 from __future__ import annotations
 
 import math
 
 from ..control import Pid, PidController, Pwm, Schedule, ScheduleController
-from ..ir import DC, Component, Netlist, Spec
-from .items import Item, SignalInfo, read_items
+from ..ir import DC, DEFAULT_R_ON, Component, Netlist, Spec
+from ..messages import CodedError, Message, Names, Value
+from .items import Display, FixedValue, Item, SignalInfo, read_items
 from .legs import HalfBridgeLeg
 from .t0 import Expanded
 
-SWITCHING_STEPS_PER_PERIOD = 200   # スイッチングモデルの、搬送波1周期の分割数（エンジンの既定と同じ）
-AVERAGE_STEPS_PER_PERIOD = 10      # 平均モデルの、搬送波1周期の分割数。レグの電圧は周期ごとに一定なので、
-#                                    LC の共振（基準の回路で搬送波の43周期）を十分に解像し、
+SWITCHING_STEPS_PER_PERIOD = 200   # スイッチングモデルの、キャリア1周期の分割数（エンジンの既定と同じ）
+AVERAGE_STEPS_PER_PERIOD = 10      # 平均モデルの、キャリア1周期の分割数。レグの電圧は周期ごとに一定なので、
+#                                    LC の共振（基準の回路でキャリアの43周期）を十分に解像し、
 #                                    ステップ数はスイッチングモデルの 1/20
 DEFAULT_LC_PERIODS = 20            # 既定の計算時間: LC の共振の周期のこの倍（基準の回路で 8.6 ms）。
-#                                    起動や段差の過渡が収まる目安。段差があれば、最後の段差の時刻に足す
+#                                    起動やステップの過渡が収まる目安。ステップがあれば、
+#   最後のステップの時刻に足す
 FILTER_PER_PERIOD = 0.25           # Tf を省略したときの微分のフィルタの時定数（制御周期に対する比）
-LOAD_GATE = "q_load"               # 負荷の段差のスイッチのゲート信号と指令の名前
+LOAD_GATE = "q_load"               # 負荷ステップのスイッチのゲート信号と指令の名前
 LOAD_COMMAND = "load"
 DUTY_COMMAND = "duty"              # PID が出すデューティの指令の名前
+LEG_R_ON = DEFAULT_R_ON            # レグのスイッチ S1・S2 のオン抵抗（平均モデルの Rleg も同じ値）[Ω]。仕様の
+#                                    項目ではなく、テンプレートが決める値。表示定義（DISPLAY）で画面に渡す
 POSITIVE_ITEMS = ("Vin", "L", "C", "R_load", "R_load_step", "f_sw", "f_ctrl")     # 0 より大きい
 NON_NEGATIVE_ITEMS = ("C_esr", "Kp", "Ki", "Kd", "Tf", "t_load_step", "t_ref_step")  # 0 以上
 
@@ -74,6 +79,34 @@ AVERAGE_SIGNALS = _COMMON_SIGNALS + (
     SignalInfo("i(Vleg)", "A", False, "element_current", element="Vleg", positive=("sw_avg", "0")),
 )
 
+# 内部の信号（画面に出さない。付録A.4 の内部の信号の表）。結果に出るかは、モデルと省略できる項目で変わる
+SWITCHING_INTERNAL = (
+    SignalInfo("on(S1)", "", False, "conduction", element="S1", internal=True),
+    SignalInfo("on(S2)", "", False, "conduction", element="S2", internal=True),
+)
+AVERAGE_INTERNAL = (
+    SignalInfo("v(sw_avg)", "V", False, "node_voltage", node="sw_avg", internal=True),
+)
+LOAD_STEP_INTERNAL = (
+    SignalInfo("v(ld)", "V", False, "node_voltage", node="ld", internal=True),
+    SignalInfo("gate(q_load)", "", False, "gate", gate="q_load", element="S3", internal=True),
+    SignalInfo("cmd(load)", "", False, "command", command="load", internal=True),
+    SignalInfo("on(S3)", "", False, "conduction", element="S3", internal=True),
+)
+ESR_INTERNAL = (
+    SignalInfo("v(cap)", "V", False, "node_voltage", node="cap", internal=True),
+)
+
+# 表示定義のうちエンジンの側が決めるもの（画面仕様 12章の D2、14章の未決18）
+DISPLAY = Display(
+    template="buck_voltage_mode",
+    items=ITEMS,
+    fidelities=("switching", "average"),
+    default_fidelity="switching",
+    signals={"switching": SWITCHING_SIGNALS, "average": AVERAGE_SIGNALS},
+    values=(FixedValue("r_on", LEG_R_ON, "ohm", ("S1", "S2", "Rleg")),),
+)
+
 
 def _check_values(p: dict[str, float]) -> None:
     positive = [k for k in POSITIVE_ITEMS if k in p and p[k] <= 0]
@@ -81,35 +114,31 @@ def _check_values(p: dict[str, float]) -> None:
     if positive or non_negative:
         parts = []
         if positive:
-            parts.append(f"{'、'.join(positive)} は 0 より大きくする")
+            parts.append(Message("RANGE_POSITIVE", names=Names(positive)))
         if non_negative:
-            parts.append(f"{'、'.join(non_negative)} は 0 以上にする")
-        raise ValueError("値が範囲の外の項目がある。" + "。".join(parts))
+            parts.append(Message("RANGE_NON_NEGATIVE", names=Names(non_negative)))
+        raise CodedError("VALUES_OUT_OF_RANGE", parts=parts, positive=Names(positive),
+                         non_negative=Names(non_negative))
     if not (0.0 <= p["d_min"] < p["d_max"] <= 1.0):
-        raise ValueError(
-            f"デューティの上下限は 0 ≦ d_min < d_max ≦ 1 にする（d_min {p['d_min']:g}、d_max {p['d_max']:g}）"
-        )
+        raise CodedError("DUTY_LIMITS_ORDER", d_min=Value(p["d_min"]), d_max=Value(p["d_max"]))
     ratio = p["f_sw"] / p["f_ctrl"]
     if abs(ratio - round(ratio)) > 1e-9 * ratio or round(ratio) < 1:
-        raise ValueError(
-            f"スイッチング周波数 f_sw（{p['f_sw']:g} Hz）は、制御周波数 f_ctrl（{p['f_ctrl']:g} Hz）の"
-            "整数倍にする（制御周期をスイッチング周期の整数倍にする）"
-        )
+        raise CodedError("FSW_NOT_MULTIPLE", f_sw=Value(p["f_sw"], "Hz"), f_ctrl=Value(p["f_ctrl"], "Hz"),
+                         ratio=Value(ratio))
     if "R_load_step" in p and p["R_load_step"] == p["R_load"]:
-        raise ValueError(
-            "R_load_step が R_load と同じ値。負荷の段差を入れないなら、"
-            "R_load_step と t_load_step を空欄にする"
-        )
+        raise CodedError("LOAD_STEP_SAME")
 
 
-def _load(p: dict[str, float], t_sw: float, notes: list[str]) -> tuple[list[Component], list, list[Pwm]]:
-    """負荷（と負荷の段差）。段差は、並列の抵抗 R2 をスイッチ S3 で入れる（または切る）。
+def _load(p: dict[str, float], t_sw: float, notes: list[Message]) -> tuple[list[Component], list, list[Pwm]]:
+    """負荷（と負荷ステップ）。ステップは、並列の抵抗 R2 をスイッチ S3 で入れる（または切る）。
 
-    R_load > R_load_step（重くなる）: R1 = R_load、R2 = R_load·R_new / (R_load − R_new) を段差の時刻に入れる。
-    R_load < R_load_step（軽くなる）: R1 = R_new、R2 = R_load·R_new / (R_new − R_load) を段差の時刻に切る。
+    R_load > R_load_step（重くなる）: R1 = R_load、
+    R2 = R_load·R_new / (R_load − R_new) をステップの時刻に入れる。
+    R_load < R_load_step（軽くなる）: R1 = R_new、
+    R2 = R_load·R_new / (R_new − R_load) をステップの時刻に切る。
     R2 からは S3 のオン抵抗を引く（オンのとき合成がちょうど目標の値になる）。オフのときは S3 のオフ抵抗
     （1 MΩ）が R2 と直列に残り、負荷が約 R / 1 MΩ（基準の回路で 6 ppm）だけ重く見える。
-    段差の時刻はスイッチング周期の頭に切り上げる（スイッチは時刻で決まる指令を出す制御器が動かす）。
+    ステップの時刻はスイッチング周期の先頭に切り上げる（スイッチは時刻で決まる指令を出す制御器が動かす）。
     R2 が S3 のオン抵抗以下になる（R_load と R_load_step の小さいほうが、ほぼオン抵抗以下）と作れない。
     """
     r_load = p["R_load"]
@@ -122,11 +151,8 @@ def _load(p: dict[str, float], t_sw: float, notes: list[str]) -> tuple[list[Comp
     r_extra = r_load * r_new / abs(r_load - r_new) - switch.r_on
     if r_extra <= 0:
         small = "R_load_step" if heavier else "R_load"
-        raise ValueError(
-            f"{small}（{min(r_load, r_new):g} Ω）が小さすぎて、負荷の段差を作れない。段差は、並列の抵抗を"
-            f"スイッチ（オン抵抗 {switch.r_on:g} Ω）で入れたり切ったりして作るので、{small} はオン抵抗より"
-            "十分大きくする"
-        )
+        raise CodedError("LOAD_STEP_TOO_SMALL", key=small, r=Value(min(r_load, r_new), "ohm"),
+                         r_on=Value(switch.r_on, "ohm"))
     comps = [
         Component(id="R1", type="R", nodes=("out", "0"), value=r_base),
         Component(id="R2", type="R", nodes=("out", "ld"), value=r_extra),
@@ -135,18 +161,16 @@ def _load(p: dict[str, float], t_sw: float, notes: list[str]) -> tuple[list[Comp
     on_before, on_after = (0.0, 1.0) if heavier else (1.0, 0.0)
     snapped = math.ceil(t_step / t_sw - 1e-6) * t_sw
     if abs(snapped - t_step) > 1e-9 * t_sw:
-        notes.append(
-            f"負荷の段差の時刻 {t_step:.6g} s を、次のスイッチング周期の頭 {snapped:.6g} s に"
-            "合わせた（切り上げ）"
-        )
+        notes.append(Message("LOAD_STEP_SNAPPED", symbol="t_load_step", t=Value(t_step, "s"),
+                             t_grid=Value(snapped, "s"), t_sw=Value(t_sw, "s")))
     ctrl = ScheduleController(Schedule(on_before, ((snapped, on_after),)), LOAD_COMMAND, period=t_sw)
     gate = Pwm(name=LOAD_GATE, frequency=1.0 / t_sw, duty=LOAD_COMMAND)
     return comps, [ctrl], [gate]
 
 
 def buck_voltage_mode(spec: Spec) -> Expanded:
-    """仕様（層A）→ 層B ＋ ゲート信号 ＋ 制御器 ＋ 表示する信号。精度は spec.simulation.fidelity。"""
-    notes: list[str] = []
+    """仕様（層A）→ 層B ＋ ゲート信号 ＋ 制御器 ＋ 信号の情報。モデルの種類は spec.simulation.fidelity。"""
+    notes: list[Message] = []
     p = read_items(spec, ITEMS, notes)
     _check_values(p)
     fidelity = spec.simulation.fidelity or "switching"
@@ -154,18 +178,13 @@ def buck_voltage_mode(spec: Spec) -> Expanded:
 
     # --- 電力の部分 -------------------------------------------------------------
     leg = HalfBridgeLeg(positive="in", negative="0", output="sw", duty=DUTY_COMMAND, frequency=p["f_sw"],
-                        v_dc=p["Vin"])
+                        v_dc=p["Vin"], r_on=LEG_R_ON)
     leg_parts, gates = leg.expand(fidelity)
     comps = []
     if fidelity == "switching":
         comps.append(Component(id="V1", type="V", nodes=("in", "0"), waveform=DC(value=p["Vin"])))
     else:
-        notes.append(
-            "平均モデルで計算した。スイッチ S1・S2 を、電圧「デューティ × Vin」の電源と"
-            "オン抵抗に置き換えている。"
-            "入力の電源にインピーダンスが無いことを前提にしているので、入力側にインピーダンスがある回路や、"
-            "入力の電流を見たいときは、スイッチングモデルで計算する"
-        )
+        notes.append(Message("AVERAGE_MODEL_USED"))
     comps += leg_parts
     comps.append(Component(id="L1", type="L", nodes=("sw", "out"), value=p["L"]))
     if p.get("C_esr", 0.0) > 0.0:
@@ -174,10 +193,7 @@ def buck_voltage_mode(spec: Spec) -> Expanded:
     else:
         comps.append(Component(id="C1", type="C", nodes=("out", "0"), value=p["C"]))
         if "C_esr" not in p:
-            notes.append(
-                "C_esr（出力コンデンサの等価直列抵抗）の値が無いので、ESR は計算に入れていない"
-                "（0 Ω として計算した）"
-            )
+            notes.append(Message("ESR_OMITTED"))
     load_parts, load_ctrls, load_gates = _load(p, t_sw, notes)
     comps += load_parts
     netlist = Netlist(components=comps)
@@ -188,22 +204,18 @@ def buck_voltage_mode(spec: Spec) -> Expanded:
     else:
         t_filter = FILTER_PER_PERIOD * t_ctrl
         if p["Kd"] > 0:
-            notes.append(
-                f"Tf（微分のフィルタの時定数）の値が無いので、制御周期の {FILTER_PER_PERIOD:g} 倍"
-                f"（{t_filter:.3g} s）とした"
-            )
+            notes.append(Message("TF_DEFAULTED", ratio=Value(FILTER_PER_PERIOD), tf=Value(t_filter, "s")))
     pid = Pid(p["Kp"], p["Ki"], p["Kd"], period=t_ctrl, t_filter=t_filter, lower=p["d_min"], upper=p["d_max"])
     changes = ((p["t_ref_step"], p["Vref_step"]),) if "Vref_step" in p else ()
     reference = Schedule(p["Vref"], changes)
     controller = PidController(
         pid, measure="v(out)", output=DUTY_COMMAND, reference=reference, initial_output=p["d_min"]
     )
-    for v in [p["Vref"]] + [v for _, v in changes]:
+    for key, v in [("Vref", p["Vref"])] + [("Vref_step", v) for _, v in changes]:
         if v > p["d_max"] * p["Vin"] or v < p["d_min"] * p["Vin"]:
-            notes.append(
-                f"出力電圧の指令値 {v:g} V は、デューティの上下限で出せる範囲（{p['d_min'] * p['Vin']:g}〜"
-                f"{p['d_max'] * p['Vin']:g} V。損失を除く）の外なので、出力はこの値に届かない"
-            )
+            notes.append(Message("REFERENCE_OUT_OF_RANGE", symbol=key, value=Value(v, "V"),
+                                 low=Value(p["d_min"] * p["Vin"], "V"),
+                                 high=Value(p["d_max"] * p["Vin"], "V")))
 
     # --- 計算の時間と刻み -------------------------------------------------------
     steps = SWITCHING_STEPS_PER_PERIOD if fidelity == "switching" else AVERAGE_STEPS_PER_PERIOD
@@ -216,9 +228,16 @@ def buck_voltage_mode(spec: Spec) -> Expanded:
         t_end = math.ceil((last + DEFAULT_LC_PERIODS * t_lc) / t_ctrl) * t_ctrl    # 制御周期の整数倍
     for key in ("t_load_step", "t_ref_step"):
         if key in p and p[key] >= t_end:
-            notes.append(f"{key}（{p[key]:g} s）が終了時刻（{t_end:g} s）以降なので、段差は波形に現れない")
+            notes.append(Message("STEP_AFTER_END", key=key, symbol=key, t=Value(p[key], "s"),
+                                 t_end=Value(t_end, "s")))
 
-    signals = list(SWITCHING_SIGNALS if fidelity == "switching" else AVERAGE_SIGNALS)
+    # 表示する信号（付録A.4 の表の順）と、この回路の内部の信号
+    signals = list(SWITCHING_SIGNALS + SWITCHING_INTERNAL if fidelity == "switching"
+                   else AVERAGE_SIGNALS + AVERAGE_INTERNAL)
+    if "R_load_step" in p:
+        signals += LOAD_STEP_INTERNAL
+    if p.get("C_esr", 0.0) > 0.0:
+        signals += ESR_INTERNAL
     return Expanded(
         netlist, t_end, h, probes=["v(out)", "i(L1)"], notes=notes,
         gates=gates + load_gates, controllers=[controller] + load_ctrls,

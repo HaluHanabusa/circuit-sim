@@ -244,10 +244,10 @@ class GainDesignError(ValueError):
             margin = _margin_text(best.phase_margin_deg, target_deg)       # 受け入れと同じ判定
             radius = _radius_text(best.pole_radius)
             stability = {
-                "stable": f"閉ループの極の半径 {radius}（1 未満で安定）",
-                "no_margin": (f"閉ループの極の半径 {radius}（1 との差が {STABILITY_EPS:g} より小さく、"
+                "stable": f"閉ループ極の絶対値の最大 {radius}（1 未満で安定）",
+                "no_margin": (f"閉ループ極の絶対値の最大 {radius}（1 との差が {STABILITY_EPS:g} より小さく、"
                               "安定の余裕が無い）"),
-                "unstable": f"閉ループの極の半径 {radius}（1 以上で不安定）",
+                "unstable": f"閉ループ極の絶対値の最大 {radius}（1 以上で不安定）",
             }[stability_of(best.pole_radius)]
             message += (
                 f" 最良の候補: Kp {best.kp:.4g} 1/V、Ki {best.ki:.4g} 1/(V·s)、Kd {best.kd:.4g} s/V、"
@@ -836,12 +836,16 @@ def _check_arguments(values: dict) -> dict[str, float]:
         if q_load < Q_MIN:                     # 今の値は、境目と見分けられる桁まで書く（D-066）
             shown, limit, _ = _compare_text(q_load, Q_MIN, "<", 3, significant=True)
             bad.append(f"負荷の Q = r_load·√(capacitance/inductance) は {limit} 以上にする"
-                       f"（現在 {shown}。負荷がほぼ短絡で、ループのゲインが交差周波数のまわりで"
-                       "平らになり、交差周波数が丸めで動く）")
+                       f"（現在 {shown}。負荷がほぼ短絡で、ループのゲインがゲイン交差周波数のまわりで"
+                       "平らになり、ゲイン交差周波数が丸めで動くので、位相余裕の判定を信頼できない）。"
+                       "r_load を大きくするか、capacitance を大きく、または inductance を小さくする")
         if f_ratio > F_RATIO_MAX:
             shown, limit, _ = _compare_text(f_ratio, F_RATIO_MAX, ">", 3, significant=True)
             bad.append(f"制御周波数と LC の共振周波数の比 f_ctrl/f0 = 2π·f_ctrl·√(inductance·capacitance) は "
-                       f"{limit} 以下にする（現在 {shown}）")
+                       f"{limit} 以下にする（現在 {shown}。制御周波数が LC の共振に比べて高すぎ、"
+                       f"どのゲインでも閉ループの遅い極が 1 との差 {STABILITY_EPS:g} の中に来るので、"
+                       "安定かどうかを丸めと見分けられない）。"
+                       "f_ctrl を下げるか、inductance か capacitance を小さくして f0 を上げる")
         head = "設計の引数の組み合わせが範囲の外。"
     if bad:
         target = _as_real(values.get("phase_margin_deg"))
@@ -918,8 +922,8 @@ def buck_voltage_mode_pid(
     if theta_hi <= 1.05 * a:
         raise fail(
             "margin_not_reached",
-            f"LC の共振（{f0:.4g} Hz）が、交差周波数を探す範囲の上端（{f_hi:.4g} Hz）より上にあるので、"
-            "共振の上に交差周波数を置けない。制御周波数を上げる。",
+            f"LC の共振（{f0:.4g} Hz）が、ゲイン交差周波数を探す範囲の上端（{f_hi:.4g} Hz）より上にあるので、"
+            "共振の上にゲイン交差周波数を置けない。制御周波数を上げる。",
             None,
         )
 
@@ -959,7 +963,7 @@ def buck_voltage_mode_pid(
             "margin_not_reached",
             f"制御周波数 {f_ctrl:g} Hz では、LC の共振（{f0:.4g} Hz）より上の "
             f"{1.05 * f0:.4g}〜{f_hi:.4g} Hz に、"
-            f"位相余裕 {shown_target}° を取れる交差周波数が無い（取れるのは最大 {largest}°）。"
+            f"位相余裕 {shown_target}° を取れるゲイン交差周波数が無い（取れるのは最大 {largest}°）。"
             "制御周波数を上げるか、目標の位相余裕を下げる。",
             best,
         )
@@ -970,8 +974,8 @@ def buck_voltage_mode_pid(
         best = candidate(float(grid[-1]))
         raise fail(
             "crossover_at_search_edge",
-            f"位相余裕が {target_text}° 以上の区間が、交差周波数を探す範囲の上端（{f_hi:.4g} Hz）まで"
-            "続くので、交差周波数を決められない。",
+            f"位相余裕が {target_text}° 以上の区間が、ゲイン交差周波数を探す範囲の上端（{f_hi:.4g} Hz）まで"
+            "続くので、ゲイン交差周波数を決められない。",
             best,
         )
     lo, hi = float(grid[i]), float(grid[i + 1])
@@ -990,22 +994,23 @@ def buck_voltage_mode_pid(
     if not meets_target(gains.phase_margin_deg, phase_margin_deg):
         raise fail(
             "margin_below_target",
-            f"設計した交差周波数（{gains.f_cross:.4g} Hz）のほかに、位相余裕が目標の {target_text}° に"
-            "届かない交差周波数がある。",
+            f"設計したゲイン交差周波数（{gains.f_cross:.4g} Hz）のほかに、位相余裕が目標の {target_text}° に"
+            "届かないゲイン交差周波数がある。",
             gains,
         )
     stability = stability_of(gains.pole_radius)
     if stability == "unstable":
         raise fail(
             "unstable",
-            f"位相余裕は目標を満たすが、離散時間の閉ループの極の半径が {_radius_text(gains.pole_radius)}"
-            "（1 以上）で、閉ループが不安定になる。",
+            "位相余裕は目標を満たすが、離散時間の閉ループ極の絶対値の最大が"
+            f" {_radius_text(gains.pole_radius)}（1 以上）で、閉ループが不安定になる。",
             gains,
         )
     if stability == "no_margin":
         raise fail(
             "no_stability_margin",
-            f"位相余裕は目標を満たすが、離散時間の閉ループの極の半径が {_radius_text(gains.pole_radius)} で、"
+            "位相余裕は目標を満たすが、離散時間の閉ループ極の絶対値の最大が"
+            f" {_radius_text(gains.pole_radius)} で、"
             f"1 との差が {STABILITY_EPS:g} より小さい（いちばん遅い応答の時定数が、制御周期の "
             f"{1 / STABILITY_EPS:,.0f} 倍を超える）。丸めで安定か不安定かが変わる範囲なので、安定とは"
             "言えない（安定の余裕が無い）。"

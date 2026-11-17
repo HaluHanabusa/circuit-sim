@@ -145,7 +145,8 @@ def test_huge_load_agrees_with_150_digit_reference(case):
         assert ("は満たす）" in msg) == (ref_pm >= target - MEETS_TOL)
         assert ("足りない）" in msg) == (ref_pm < target - MEETS_TOL)
         assert "（1 未満で安定）" in msg                         # どの例も参照の半径は 1 − 1e-9 以下
-        shown = float(re.search(r"閉ループの極の半径 ([\d.]+)（1 未満で安定）", msg).group(1))
+        # E1g（D-063）: 「閉ループの極の半径」→「閉ループ極の絶対値の最大」
+        shown = float(re.search(r"閉ループ極の絶対値の最大 ([\d.]+)（1 未満で安定）", msg).group(1))
         assert shown < 1.0
 
 

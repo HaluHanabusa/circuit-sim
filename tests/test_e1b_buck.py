@@ -218,9 +218,10 @@ def test_c6_command_is_used_from_the_next_control_period(fidelity):
         assert on == [100] * 6 + [60] * 4
     else:
         # レグの電源の電圧 v(sw_avg) が d·Vin。スイッチの節点 v(sw) は、オン抵抗の電圧降下だけ低い
+        # 変わり目 6T の点は、変わる直前の値（指令で値が決まる電源の記録の決まり。D-048。E1g）
         v_src = res["v(sw_avg)"]
-        assert np.allclose(v_src[: 6 * steps], 0.5 * VIN, rtol=0, atol=1e-9)
-        assert np.allclose(v_src[6 * steps: -1], 0.3 * VIN, rtol=0, atol=1e-9)
+        assert np.allclose(v_src[: 6 * steps + 1], 0.5 * VIN, rtol=0, atol=1e-9)
+        assert np.allclose(v_src[6 * steps + 1: -1], 0.3 * VIN, rtol=0, atol=1e-9)
         r_on = ex.netlist.component("Rleg").value
         assert np.allclose(res["v(sw)"], v_src - r_on * res["i(L1)"], rtol=0, atol=1e-9)
     for j, (t, v) in enumerate(ex.controllers[0].seen):

@@ -14,12 +14,13 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .ir import Netlist
+from .messages import CodedError, SwitchState
 
 MAX_DEVICES = 62   # 状態の符号を 64 ビット整数に収める
 
 
-class CircuitError(ValueError):
-    """回路として解けないときのエラー。"""
+class CircuitError(CodedError):
+    """回路として解けないときのエラー（番号つき。messages.CodedError）。"""
 
 
 def _no_index() -> np.ndarray:
@@ -71,13 +72,9 @@ def state_conductance(system: System, code: int, off_scale: float = 1.0) -> np.n
     return G
 
 
-def describe_state(system: System, code: int) -> str:
-    """回路状態を人が読める形にする（エラーメッセージ用）。"""
-    if not system.devices:
-        return "（スイッチなし）"
-    return ", ".join(
-        f"{cid}={'オン' if (code >> j) & 1 else 'オフ'}" for j, cid in enumerate(system.devices)
-    )
+def describe_state(system: System, code: int) -> SwitchState:
+    """スイッチング状態（回路状態）を、エラーの文に差し込む値にする（文字列にすると「S1=オン, D1=オフ」）。"""
+    return SwitchState(tuple(system.devices), int(code))
 
 
 def build_system(netlist: Netlist) -> System:
@@ -142,9 +139,7 @@ def build_system(netlist: Netlist) -> System:
     n_switches = len(switching)
     switching += [c for c in netlist.components if c.type == "D"]
     if len(switching) > MAX_DEVICES:
-        raise CircuitError(
-            f"スイッチとダイオードが {len(switching)} 個ある。扱えるのは合わせて {MAX_DEVICES} 個まで"
-        )
+        raise CircuitError("TOO_MANY_DEVICES", n=len(switching), max=MAX_DEVICES)
 
     unknowns = [f"v({name})" for name in nodes] + [f"i({cid})" for cid in branches]
     return System(
