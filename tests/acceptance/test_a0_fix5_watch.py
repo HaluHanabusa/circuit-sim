@@ -24,13 +24,13 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import a0_fake_browser as fake
+import a0_marked
 import acceptance_watch as watch
 import pytest
 
@@ -86,13 +86,6 @@ def alive(pid: int) -> bool:
         return stat.rsplit(")", 1)[1].split()[0] != "Z"
     except (OSError, IndexError):
         return True
-
-
-def stop_pid(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGTERM if WINDOWS else signal.SIGKILL)
-    except OSError:
-        pass
 
 
 def wait_gone(pid: int, timeout: float = 10.0) -> bool:
@@ -415,8 +408,8 @@ def test_marked_app_is_found_even_after_its_parent_is_gone_and_others_are_left_a
         for proc in (other_run, not_an_app):
             proc.kill()
             proc.wait(timeout=20)
-        if grandchild is not None:
-            stop_pid(grandchild)
+        if grandchild is not None:     # 印で確かめてから止める（D-078。8回目の検証で直した）
+            a0_marked.kill_if_marked(grandchild, environ=f"{watch.MARK_VAR}={token}")
 
 
 @pytest.mark.skipif(WINDOWS or shutil.which("ps") is None,
@@ -596,8 +589,10 @@ def test_watch_fails_the_tests_that_leave_processes_and_stops_them(tmp_path):
         assert "起動した所: tests/acceptance/test_inner.py::test_02_leaves_a_process_behind" in text, text
         assert "この実行から生まれたアプリ本体は残っていない" in text, text
     finally:
+        # 印（内側の実行の環境変数）で確かめてから止める（D-078。8回目の検証で直した）。印を読めない OS では
+        # 止めない（どれも 120 秒で自分で終わる眠るだけのプロセスで、内側の見張りが止めているはず）
         for pid in pids.values():
-            stop_pid(pid)
+            a0_marked.kill_if_marked(pid, environ=f"A0_INNER_OUT={out}")
 
 
 def test_watch_fails_the_run_when_an_app_is_left_at_the_end(tmp_path):
@@ -625,7 +620,10 @@ def test_watch_fails_the_run_when_an_app_is_left_at_the_end(tmp_path):
         else:
             assert "止めていない（たぶんこの実行のアプリ本体" in text and alive(orphan), text
     finally:
-        stop_pid(orphan)
+        # 印で確かめてから止める（D-078。8回目の検証で直した）。Linux は内側の実行の環境変数と引数、
+        # ほかの OS は引数（コードに書き込んだ、控えのファイルの名前）
+        a0_marked.kill_if_marked(orphan, environ=f"A0_INNER_OUT={out}" if LINUX else None,
+                              command="orphan-app.pid")
 
 
 def test_watch_reports_apps_that_were_running_before_and_leaves_them_alone(tmp_path):

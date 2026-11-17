@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+import a0_marked as marked
 import acceptance_watch as watch
 import pytest
 
@@ -237,18 +238,22 @@ def running_command(pid: int) -> str | None:
     return None
 
 
-def gone_or_killed(pid: int, wait: float = 5.0) -> str | None:
+def gone_or_killed(pid: int, wait: float = 5.0, environ: str | None = None) -> str | None:
     """pid のアプリ本体が wait 秒のうちに終わっていれば None。動いていたら、止めて、コマンドラインを返す。
 
     止めるのは、コマンドラインがアプリ本体のもの（circuit_sim）だけ（番号が使い回されていても、ほかの
-    プロセスを止めない）。"""
+    プロセスを止めない）。Linux では、環境変数の印 environ（"名前=値"）も、止める直前に確かめる（D-078。
+    レビュー 8回目の軽微3 と同じ所。8回目の検証で直した）。"""
     deadline = time.monotonic() + wait
     while True:
         command = running_command(pid)
         if command is None or "circuit_sim" not in command:
             return None
         if time.monotonic() > deadline:
-            watch.kill_pid(pid)
+            if marked.LINUX and environ is not None:
+                marked.kill_if_marked(pid, environ=environ, command="circuit_sim")
+            else:
+                watch.kill_pid(pid)
             return command
         time.sleep(0.2)
 
@@ -315,7 +320,7 @@ def test_apps_started_by_the_app_tests_die_when_the_harness_kills_the_check(tmp_
         pid = int((out / "app.pid").read_text(encoding="utf-8"))
         cycle.kill_tree(check)      # 時間切れ・中断のときの、ハーネスの止め方
         check.wait(timeout=30)
-        left = gone_or_killed(pid)
+        left = gone_or_killed(pid, environ=f"A0V6_OUT={out}")
         pid = None
         assert left is None, (
             f"ハーネスが確認を止めた後も、試験が起動したアプリ本体が動いていた（止めた）: {left}"
@@ -329,4 +334,4 @@ def test_apps_started_by_the_app_tests_die_when_the_harness_kills_the_check(tmp_
             check.kill()
             check.wait(timeout=30)
         if pid is not None:
-            gone_or_killed(pid, wait=0.0)
+            gone_or_killed(pid, wait=0.0, environ=f"A0V6_OUT={out}")

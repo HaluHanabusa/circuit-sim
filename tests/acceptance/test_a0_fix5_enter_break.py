@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import a0_fake_browser as fake
+import a0_marked as marked
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -180,8 +181,12 @@ def test_enter_gives_a_new_url_while_the_browser_command_is_still_running(tmp_pa
         (tmp_path / "browser.stop").write_text("stop", encoding="utf-8")
         app.stop()
         if pid_file.exists():       # 身代わりのブラウザを残さない（印を見て自分で終わるが、念のため止める）
+            # 番号は、身代わりが終わって受け取られた後なら使い回されうるので、印（Linux は環境変数、どの OS
+            # でも引数の場所）で確かめてから止める（D-078。8回目の検証で直した）
             with contextlib.suppress(OSError, ValueError):
-                os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGTERM)
+                marked.kill_if_marked(int(pid_file.read_text(encoding="utf-8")),
+                                      environ=f"A0V5_OUT={tmp_path}" if marked.LINUX else None,
+                                      command=f"{tmp_path.name}/{script.name}")
 
 
 # ------------------------------------------------------------------ 2. 偽のブラウザが失敗したとき

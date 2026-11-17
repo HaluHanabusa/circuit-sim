@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import a0_fake_browser as fake
+import a0_marked as marked
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -249,8 +250,12 @@ def stop_all(app: Running, tmp_path: Path) -> None:
         while not (tmp_path / "browser.done").exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         if not (tmp_path / "browser.done").exists():
+            # 番号は、身代わりが終わって受け取られた後なら使い回されうるので、印（Linux は環境変数、どの OS
+            # でも引数の場所）で確かめてから止める（D-078。8回目の検証で直した）
             with contextlib.suppress(OSError, ValueError):
-                os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGTERM)
+                marked.kill_if_marked(int(pid_file.read_text(encoding="utf-8")),
+                                      environ=f"A0V6_OUT={tmp_path}" if marked.LINUX else None,
+                                      command=f"{tmp_path.name}/browser.py")
 
 
 def wait_for(path: Path, app: Running, what: str) -> None:
