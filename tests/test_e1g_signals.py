@@ -333,6 +333,15 @@ def test_cli_reports_a_failed_export_in_one_line(tmp_path, capsys):
     assert captured.err.count("\n") == 1 and captured.err.startswith("ファイルに書き出せません: ")
     assert "out.csv.notes.txt" in captured.err
     assert captured.out.splitlines()[-1] == f"波形を書き出しました: {csv_path}" and csv_path.exists()
+    # 注意の無い計算で、前の書き出しの注意のファイル（ここでは、同じ名前のフォルダ）を消せない:
+    # 残っているものが今回の CSV の注意ではないことを、1行で知らせる
+    assert cli_main([str(write_spec(tmp_path, rc_dict())), "--csv", str(csv_path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.count("\n") == 1 and "out.csv.notes.txt" in captured.err
+    assert captured.err.startswith(
+        "今回の計算に注意は無いのに、前の書き出しの注意のファイルが残っていて、消せません: ")
+    assert "今回の CSV の注意ではない" in captured.err and "消しました" not in captured.out
+    assert captured.out.splitlines()[-1] == f"波形を書き出しました: {csv_path}"
 
 
 # ------------------------------------------------------------------ 表示に使う値

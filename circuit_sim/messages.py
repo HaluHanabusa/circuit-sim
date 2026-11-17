@@ -979,6 +979,12 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "今回の計算に注意は無いので、前の書き出しで残っていた注意のファイルを消しました: {path}",
         "This run has no warnings, so the warnings file left by an earlier export was removed: {path}",
     ),
+    "CLI_NOTES_REMOVE_FAILED": (
+        "今回の計算に注意は無いのに、前の書き出しの注意のファイルが残っていて、消せません: {detail}。"
+        "今回の CSV の注意ではないので、手で消してください",
+        "This run has no warnings, but the warnings file left by an earlier export can't be removed: "
+        "{detail}. It doesn't belong to this CSV, so remove it by hand",
+    ),
     "CLI_WRITE_FAILED": ("ファイルに書き出せません: {detail}", "Can't write the file: {detail}"),
     # CSV と一緒に書き出す注意のファイル（<CSV の名前>.notes.txt）の1行
     "NOTES_FILE_LINE": ("[{code}] 注意: {text}", "[{code}] Warning: {text}"),

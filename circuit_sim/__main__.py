@@ -12,7 +12,8 @@
     UTF-8（BOM なし）、1行1件、「[番号] 注意: 文」、行の終わりは CSV と同じ CR LF。書いた場所を表示する。
   - 注意が無ければ、注意のファイルは書かない。前の書き出しの注意のファイルが同じ名前で残っていたら、
     消して、消したことを表示する（残すと、今回の CSV の注意に見えるため）。
-  - 書き出せないとき（場所が無い、書き込めないなど）は、理由を1行で標準エラーに出し、終了コード 2。
+  - 書き出せないとき（場所が無い、書き込めないなど）と、残っていた注意のファイルを消せないときは、
+    理由を1行で標準エラーに出し、終了コード 2。
   - CSV を標準出力に出す形は無い（--csv - は「-」という名前のファイルに書く）。
 
 仕様ファイルは UTF-8 で読む（先頭の BOM は無視する）。画面への出力は、UTF-8 でない端末
@@ -106,9 +107,15 @@ def main(argv: list[str] | None = None) -> int:
         print(render_note_line(note, "CLI_NOTE", LANG))
     if args.csv:
         try:
-            _export(args.csv, res, ex.probes)
+            stale = _export(args.csv, res, ex.probes)
         except OSError as exc:
             return _fail(_say("CLI_WRITE_FAILED", detail=str(exc)))
+        if stale is not None:
+            try:
+                stale.unlink()
+            except OSError as exc:
+                return _fail(_say("CLI_NOTES_REMOVE_FAILED", detail=str(exc)))
+            print(_say("CLI_NOTES_REMOVED", path=str(stale)))
     return 0
 
 
@@ -117,8 +124,10 @@ def notes_path(csv_path: Path) -> Path:
     return csv_path.with_name(csv_path.name + NOTES_SUFFIX)
 
 
-def _export(csv_path: Path, res, names: list[str]) -> None:
-    """波形を CSV に、注意を注意のファイルに書き出して、書いた場所を表示する（決まりは冒頭の説明）。"""
+def _export(csv_path: Path, res, names: list[str]) -> Path | None:
+    """波形を CSV に、注意を注意のファイルに書き出して、書いた場所を表示する（決まりは冒頭の説明）。
+
+    戻り値: 注意が無いのに残っている、前の書き出しの注意のファイル（呼び出し側が消す）。無ければ None。"""
     res.to_csv(csv_path, names, units=True)
     print(_say("CLI_CSV_WRITTEN", path=str(csv_path)))
     target = notes_path(csv_path)
@@ -127,9 +136,8 @@ def _export(csv_path: Path, res, names: list[str]) -> None:
         # 行の終わりは CSV と同じ CR LF（OS によらず、同じバイト列になる）
         target.write_text("".join(line + "\r\n" for line in lines), encoding="utf-8", newline="")
         print(_say("CLI_NOTES_WRITTEN", count=len(lines), path=str(target)))
-    elif target.exists() or target.is_symlink():
-        target.unlink()
-        print(_say("CLI_NOTES_REMOVED", path=str(target)))
+        return None
+    return target if target.exists() or target.is_symlink() else None
 
 
 if __name__ == "__main__":
