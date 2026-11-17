@@ -18,13 +18,12 @@
    - 一覧の途中の例外: 一時停止したものを、止まったまま残さない（7回目の中1。直った）
    - 止める順: root を先に一時停止する、一覧に載った子だけを一時停止する、SIGKILL は一時停止が済んで
      から子から先に、一時停止したものだけに送る、木の外に送らない
-   - 軽微（xfail(strict)。8回目の問題1）: os.kill が合図を届けた後に出す例外。CPython の os.kill は、合図を
-     送った後に、待っている合図を処理する（Python 3.13.18 で確かめた: Ctrl+C を立ててから、自分の子に
-     os.kill(子, SIGSTOP) を呼ぶと、子は一時停止し、os.kill は KeyboardInterrupt を出す）。だから、後始末の
-     最中の Ctrl+C は、os.kill の中から出うる。一時停止を届けた直後に出ると、その番号は「一時停止したもの」に
-     控えられず、止まったまま残る。SIGKILL を送っている途中に出ると（最初の例外でも）、残りに SIGKILL が
-     送られない（部品の説明は「さらに例外（3 回目の Ctrl+C など）」と書き、最初の例外でも起こることを
-     書いていない）。
+   - os.kill が合図を届けた後に出す例外（8回目の問題1。b3c5b73 で直った。9回目の検証で xfail(strict) の印を
+     外し、後退を見張る試験にした）。CPython の os.kill は、合図を送った後に、待っている合図を処理する
+     （Python 3.13.18 で確かめた: Ctrl+C を立ててから、自分の子に os.kill(子, SIGSTOP) を呼ぶと、子は一時停止
+     し、os.kill は KeyboardInterrupt を出す）。だから、後始末の最中の Ctrl+C は、os.kill の中から出うる。
+     直す前は、一時停止を届けた直後に出ると、その番号は「一時停止したもの」に控えられず、止まったまま残った。
+     SIGKILL を送っている途中に出ると（最初の例外でも）、残りに SIGKILL が送られなかった。
 4. 受け入れ試験の後始末の、印の確かめ（a0_marked。レビュー 8回目の中1・軽微3 に合わせて、番号から止める
    後始末を、印で確かめてから送る形にそろえた）が、印を持つものだけを自分のものと見る。合図は送らない。
 """
@@ -352,29 +351,23 @@ def test_kill_posix_tree_stops_first_and_kills_only_what_it_stopped_children_fir
     assert not tree.left_stopped(), tree.events
 
 
-SURFACING = pytest.mark.xfail(strict=True, reason=(
-    "軽微（A0 の検証 8回目の問題1）: os.kill が合図を届けた後に出す例外（CPython の os.kill は、送った後に"
-    "待っている合図を処理する）。一時停止を届けた直後なら、その番号は控えられずに止まったまま残る。SIGKILL を"
-    "送っている途中なら、最初の例外でも、残りに SIGKILL が送られない"
-))
-
-
 @only_posix
 @pytest.mark.parametrize("where", [
-    pytest.param(("stop", 1), id="after-stopping-root", marks=SURFACING),
-    pytest.param(("stop", 2), id="after-stopping-child-a", marks=SURFACING),
-    pytest.param(("stop", 3), id="after-stopping-child-b", marks=SURFACING),
-    pytest.param(("stop", 4), id="after-stopping-grandchild", marks=SURFACING),
-    pytest.param(("kill", 1), id="after-the-first-sigkill", marks=SURFACING),
-    pytest.param(("kill", 2), id="after-the-second-sigkill", marks=SURFACING),
-    pytest.param(("kill", 3), id="after-the-third-sigkill", marks=SURFACING),
+    pytest.param(("stop", 1), id="after-stopping-root"),
+    pytest.param(("stop", 2), id="after-stopping-child-a"),
+    pytest.param(("stop", 3), id="after-stopping-child-b"),
+    pytest.param(("stop", 4), id="after-stopping-grandchild"),
+    pytest.param(("kill", 1), id="after-the-first-sigkill"),
+    pytest.param(("kill", 2), id="after-the-second-sigkill"),
+    pytest.param(("kill", 3), id="after-the-third-sigkill"),
     pytest.param(("kill", 4), id="after-the-last-sigkill"),
 ])
 def test_an_interrupt_surfacing_from_os_kill_leaves_nothing_stopped(monkeypatch, where):
     """os.kill が合図を届けた後に例外が出ても（後始末の最中の Ctrl+C が、os.kill の中で KeyboardInterrupt に
-    なる形）、一時停止したものを、止まったまま残さない。
+    なる形）、一時停止したものを、止まったまま残さない。例外は出し直す（消さない）。
 
-    最後の SIGKILL の後（after-the-last-sigkill）は、いまでも残らない（比べのため）。"""
+    8回目の問題1 の後退を見張る（9回目の検証で xfail(strict) の印を外した。直す前の 8aea404 では、最後の
+    SIGKILL の後のほかの 7 通りで、一時停止したものが残った）。"""
     tree = FakeTree(interrupt=where)
     raised = run_kill_posix_tree(monkeypatch, tree)
     assert raised == f"{where[1]} 回目の {where[0]}", (raised, tree.events)
